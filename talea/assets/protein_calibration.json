@@ -1,0 +1,33 @@
+{
+  "formulation": "esmplusplus_layer_spectrum_v0",
+  "fusion": "unweighted mean of per-layer length-residual z scores",
+  "length_fit": "development controls only",
+  "parameters": {
+    "13": {
+      "control_residual_mean": -5.145795606199139e-16,
+      "control_residual_sd_population": 0.4654357365390194,
+      "intercept": -1.5680729453875353,
+      "layer_zero_based": 13,
+      "length_transform": "log2",
+      "n_development_controls": 126,
+      "score_transform": "log1p",
+      "slope": 0.3823929328582363
+    },
+    "35": {
+      "control_residual_mean": 5.797831350820262e-16,
+      "control_residual_sd_population": 0.6862005629169438,
+      "intercept": 0.05260675507192767,
+      "layer_zero_based": 35,
+      "length_transform": "log2",
+      "n_development_controls": 126,
+      "score_transform": "log1p",
+      "slope": 0.36519503505387063
+    }
+  },
+  "selected_layers_zero_based": [
+    13,
+    35
+  ],
+  "selection_rule": "zero-based layer with maximum development AUROC plus zero-based layer with maximum development average precision",
+  "selection_set": "development only"
+}

@@ -1,0 +1,58 @@
+{
+  "fit_set": "development hard controls only",
+  "formulation": "esmplusplus_local_layers13_35_v0",
+  "fusion": "mean of layer residual z scores",
+  "layers_zero_based": [
+    13,
+    35
+  ],
+  "parameters": {
+    "13": {
+      "coefficients": [
+        2.158720679746129,
+        -0.2504254356322197,
+        0.13924942981209207
+      ],
+      "control_protein_mean_residual_range": [
+        -0.8412972184667089,
+        0.8979643850586656
+      ],
+      "features": [
+        "intercept",
+        "log2_window_size",
+        "log2_protein_length"
+      ],
+      "layer_zero_based": 13,
+      "n_control_proteins": 126,
+      "n_control_windows": 7111,
+      "protein_weighting": "each control protein has total weight one",
+      "score_transform": "log1p",
+      "weighted_residual_mean": 1.0092455971473446e-14,
+      "weighted_residual_sd": 0.6144965263271002
+    },
+    "35": {
+      "coefficients": [
+        0.585353298958061,
+        0.29916087281772025,
+        -0.011673907915075506
+      ],
+      "control_protein_mean_residual_range": [
+        -1.0618175180321454,
+        2.011433529546854
+      ],
+      "features": [
+        "intercept",
+        "log2_window_size",
+        "log2_protein_length"
+      ],
+      "layer_zero_based": 35,
+      "n_control_proteins": 126,
+      "n_control_windows": 7111,
+      "protein_weighting": "each control protein has total weight one",
+      "score_transform": "log1p",
+      "weighted_residual_mean": 2.524611912822221e-14,
+      "weighted_residual_sd": 0.8527484477123943
+    }
+  },
+  "primary_call": "best fused ESM++ window seed extended only by an overlapping physical period ridge"
+}

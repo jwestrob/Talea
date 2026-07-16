@@ -1,0 +1,19 @@
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+
+# User inputs and generated predictions
+*.partial
+*.audit.json
+predictions*.jsonl
+
+# Hugging Face and model caches belong outside the repository
+.cache/
+huggingface/

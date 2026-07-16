@@ -1,0 +1,79 @@
+{
+  "status": "end-to-end canonical-only operational refit after the CATH v0 lockbox was opened; use for future inference and post-opening sensitivity analyses",
+  "frozen_at_utc": "2026-07-15T17:50:00Z",
+  "canonical_sequence_policy": {
+    "alphabet": "ACDEFGHIKLMNPQRSTVWY",
+    "maximum_noncanonical_residues": 0,
+    "masking_or_imputation": false,
+    "development_records_excluded": [
+      "2icr_A",
+      "5wlc_LN",
+      "7o23_A"
+    ]
+  },
+  "registration": {
+    "attention_layer_zero_based": 35,
+    "call_field": "wedge_call",
+    "extension_fraction": 0.5,
+    "phase_step": 1.0,
+    "minimum_terminal_fraction": 0.45,
+    "edge_cv_penalty": 0.1
+  },
+  "topology_score": {
+    "definition": "minimum negative log terminal-to-adjacent attention ratio over all period-consistent boundary pairs containing the frozen Pangu wedge core",
+    "candidate_count_correction": {
+      "input": "log1p(candidate_count)",
+      "coefficient": -0.15026100676567108,
+      "intercept": 1.9926971248378704,
+      "residual_sd": 1.00835834215746,
+      "no_call_corrected_score": -3.093771604258835,
+      "fit_population": "124 canonical development hard controls with operational registrations"
+    },
+    "development_control_standardization": {
+      "mean": -0.0491074857818862,
+      "sd": 1.0647266240851263
+    }
+  },
+  "frozen_pangu_standardization": {
+    "development_control_mean": 5.28677630773884e-18,
+    "development_control_sd": 0.8535312263357575
+  },
+  "fusion": {
+    "definition": "unweighted mean of development-control-standardized frozen Pangu and candidate-corrected topology",
+    "topology_weight": 0.5,
+    "frozen_pangu_weight": 0.5,
+    "fitted_on_positive_labels": false
+  },
+  "development_maximum_5pct_fpr_thresholds": {
+    "candidate_corrected_topology": 2.1651463634819783,
+    "equal_weight_fusion": 1.1703829877093834,
+    "frozen_pangu": 1.3183183098159608
+  },
+  "development_sources": {
+    "operational_evaluation": "results/registered_unit_topology_v0/operational_all_controls_canonical_v2/metrics.json",
+    "operational_evaluation_sha256": "12df6c52d8585439e7860ff9f474d090986401effb7de7ceca2fb8ae0bb1e840",
+    "predicted_registrations": "results/registered_unit_topology_v0/predicted_registration_all_controls_canonical_v2/predicted_registrations.jsonl",
+    "predicted_registrations_sha256": "eae160576cc85b2d03c8899dbc5781b79076ff1912044b92ece0e835aab6880e",
+    "selected_records": "data/processed/registered_unit_truth_canonical_v1/selected_records.jsonl",
+    "selected_records_sha256": "04e43020c13c2612ea56e7584a07e08a3695b95d64980c7575cb8ce3f0865306",
+    "fine_scale_local_calibration": "results/native_context_v0/local_attention_finescale_canonical_v1/local_window_calibration.json",
+    "fine_scale_local_calibration_sha256": "f3d71c4fbbbeb109e4f66f73470e3e00601fa47a8ae64d9a4498f649a8ba1945",
+    "esmplusplus_calibration": "results/esmplusplus_frozen_canonical_v1/calibration.json",
+    "esmplusplus_calibration_sha256": "a7cb5f64183e395de4c8f8c7e07932e0a75a34634d6858e7a4ad63db37e61614",
+    "canonical_development_manifest_sha256": "e5c19ef2bc3eca467690d6b38f49d207f93ae05a611d73dba4df876c85443b8c",
+    "canonical_development_fasta_sha256": "677e363cbc60847ba9f9418333531e696d3d88eeb3c3488d81510cea06cf48b6",
+    "noncanonical_exclusion_ids_sha256": "de724220dd5ba1bc288fd144b5b8a9b254ac463c3ddd4f047027600fe14edd41",
+    "development_fused_windows_sha256": "02f0fa6afe4796aeb2343c7d267b8f6832ea3a2cd972b9826eb20bc4f16c9b1b",
+    "confirmation_fused_windows_sha256": "cd8803a75534e3c9d133c5d0e2fd0fa2bf083d988481d66e7441bc7c83f814c9",
+    "development_wedge_calls_sha256": "9560dc52f358e4ed0647b591d54d80d0f40fad4a1b927fcfa70a5e2f3eda62eb",
+    "confirmation_wedge_calls_sha256": "2803d733cdc00d09838e30296b13c7374e3f65ea335c90b7af4af427f0c89900",
+    "wedge_config_sha256": "4edd145d136bc4ef1a654568e2d28b5fd2d67b09b7db8814ea4d2456d7b2e081"
+  },
+  "guardrails": [
+    "No sequence containing a residue outside ACDEFGHIKLMNPQRSTVWY may enter inference, calibration, evaluation, ranking, clustering, or export.",
+    "No RepeatsDB unit or region coordinates enter an operational score.",
+    "No positive-label-fitted fusion weight is used.",
+    "The canonical fine-scale calibration was refit before regenerating wedge calls and registrations.",
+    "This refit occurred after CATH v0 unblinding and is not a replacement untouched external benchmark."
+  ]
+}

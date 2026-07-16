@@ -1,0 +1,9 @@
+*.json text eol=lf
+*.jsonl text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.fasta text eol=lf
+*.faa text eol=lf
+*.joblib binary
+*.pt binary

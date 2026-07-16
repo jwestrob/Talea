@@ -1,0 +1,36 @@
+{
+  "status": "frozen after developmental short-protein evaluation and before any long-protein wedge evaluation",
+  "frozen_at_utc": "2026-07-14T23:15:49Z",
+  "development_exposure": "Synthetic tests, a deterministic 64-record short-protein pilot, and one full 509-record developmental run; no long-protein wedge outputs had been generated or inspected.",
+  "layers_zero_based": [
+    13,
+    35
+  ],
+  "layer_fusion": "mean after within-layer diagonal normalization",
+  "maximum_separation": 256,
+  "diagonal_baseline_quantile": 0.25,
+  "diagonal_z_clip": 8.0,
+  "period_candidates": {
+    "minimum_window_size": 96,
+    "top_n": 8,
+    "alias_multipliers": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "minimum_period": 5.0,
+    "maximum_period": 80.0,
+    "quantization": 0.5
+  },
+  "interval_widths": {
+    "start": 96,
+    "stop_inclusive": 512,
+    "step": 32
+  },
+  "wedge": {
+    "tolerance": 1,
+    "max_harmonics": 8,
+    "min_harmonics": 2,
+    "interharmonic_controls": true
+  }
+}

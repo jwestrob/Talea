@@ -1,0 +1,165 @@
+{
+  "schema_version": "talea_stable_discovery_v2",
+  "frozen_at_utc": "2026-07-16T08:30:00Z",
+  "purpose": "batch-stable sequence-only ranking of candidate elongated protein repeat architectures; no hard biological call",
+  "evidence_status": "UNVERIFIED sequence-model architecture classifier",
+  "development_status": "post-opening production hardening after the v1 wedge-topology replay gate failed; not a new independent benchmark",
+  "input_contract": {
+    "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",
+    "maximum_noncanonical_residues": 0,
+    "masking_or_imputation": false,
+    "maximum_residues": 2046,
+    "lockbox_reference_maximum_residues": 1732,
+    "lengths_above_lockbox_reference_are_extrapolations": true
+  },
+  "esmplusplus": {
+    "model": "Synthyra/ESMplusplus_large",
+    "revision": "f813401638b3fddab09748aec1ad2bf537aa4208",
+    "transformer_layers_zero_based": [13, 35],
+    "hidden_state_tuple_offset": 1,
+    "attention_representation": "symmetrized APC-corrected head mean",
+    "decoder_matrix_storage_dtype": "fp16",
+    "minimum_sequence_separation": 6,
+    "pooled_hidden_state_features": [
+      "layer_13_mean",
+      "layer_13_std",
+      "layer_35_mean",
+      "layer_35_std"
+    ],
+    "hidden_state_standard_deviation": "population"
+  },
+  "teacher_model": {
+    "path": "results/hierarchical_state_training_v1/state_unet_structure_teacher_v0/models/full_model.pt",
+    "sha256": "130840931f4f8be768f2789cbe8a5db8bc2611fd5605fc797f1023156d4c625e",
+    "contract_path": "results/hierarchical_state_training_v1/state_unet_structure_teacher_v0/model_contract.json",
+    "contract_sha256": "95e91e0d82739e859766f36e90fb0c448db550f9313c5f82de1cca80643f3b3e"
+  },
+  "global_model": {
+    "path": "results/plmrepeat_solenoid_lockbox_v1/global_head/global_model.joblib",
+    "sha256": "8701dad34e3392a0f84884e88d0bf3e9741a75903882ec7658bbb8b2fb2161de",
+    "feature_keys": [
+      "layer_13_mean",
+      "layer_13_std",
+      "layer_35_mean",
+      "layer_35_std"
+    ]
+  },
+  "topology_dependencies": {
+    "protein_calibration": {
+      "path": "results/esmplusplus_frozen_canonical_v1/calibration.json",
+      "sha256": "a7cb5f64183e395de4c8f8c7e07932e0a75a34634d6858e7a4ad63db37e61614"
+    },
+    "local_calibration": {
+      "path": "results/native_context_v0/local_attention_finescale_canonical_v1/local_window_calibration.json",
+      "sha256": "f3d71c4fbbbeb109e4f66f73470e3e00601fa47a8ae64d9a4498f649a8ba1945"
+    },
+    "wedge_config": {
+      "path": "configs/native_wedge_v0.json",
+      "sha256": "4edd145d136bc4ef1a654568e2d28b5fd2d67b09b7db8814ea4d2456d7b2e081"
+    },
+    "operational_config": {
+      "path": "configs/operational_topology_canonical_v2.json",
+      "sha256": "edb5e0895e8a6d3b71b42a0978264aa8ab18f68cf60ffc0f790f480ac465e32a"
+    }
+  },
+  "score_contract": {
+    "teacher_state_calibration": {
+      "field": "logit(mean residue-state probability)",
+      "control_records": 266,
+      "control_logit_mean": -2.5399579057171784,
+      "control_logit_standard_deviation_population": 1.2341468017334127,
+      "source": "post-open application of the preselected structure-teacher multitask model to its development controls"
+    },
+    "global_calibration": {
+      "field": "logit(global classifier probability)",
+      "control_logit_mean": -2.618578141435718,
+      "control_logit_standard_deviation_population": 1.447981174482059,
+      "source": "lockbox-excluded global-head training controls"
+    },
+    "weights": {
+      "teacher_state_within_base": 0.5,
+      "topology_within_base": 0.5,
+      "base_in_primary": 0.75,
+      "global_in_primary": 0.25
+    },
+    "legacy_formula": "0.75 * (0.5 * teacher_state_z + 0.5 * topology_z) + 0.25 * global_z",
+    "discovery_weights": {
+      "teacher_state": 0.5,
+      "global": 0.5
+    },
+    "discovery_formula": "0.5 * teacher_state_z + 0.5 * global_z",
+    "discovery_weight_rationale": "unweighted mean of two development-control-standardized sequence scores; no label-fitted coefficient",
+    "topology_role": "auxiliary localization and component ranking only because a hard winner among near-tied wedges is not batch stable"
+  },
+  "stability_evaluation": {
+    "path": "results/talea_stable_discovery_v2_evaluation/metrics.json",
+    "sha256": "5b884173b337a05423e1d735da5035e3542209f002aaa35ff2932b7ad888b855",
+    "status": "post-opening deployment hardening; no independent benchmark claim",
+    "development_group_oof_records": 457,
+    "confirmation_sequence_group_excluded_records": 256,
+    "confirmation_prior_exposure_clean_records": 56,
+    "lockbox_records": 452,
+    "lockbox_point": {
+      "average_precision": 0.9959814704508545,
+      "roc_auc": 0.9945375518834677,
+      "partial_auc_fpr_0.1_normalized": 0.9756441381470751
+    },
+    "paired_stable_minus_solennoid_mean_total_95ci": {
+      "average_precision": [0.003170023428016733, 0.02425832495455679],
+      "roc_auc": [0.0018208160388442057, 0.02282921528702329],
+      "partial_auc_fpr_0.1_normalized": [0.025608896546323034, 0.1518912992403476]
+    },
+    "local_mps_batch_replay": {
+      "maximum_absolute_discovery_score_difference": 0.006377194002620268,
+      "spearman": 0.9999966213639213,
+      "maximum_absolute_topology_z_difference": 2.108341055728809,
+      "topology_records_above_0.02_difference": 16
+    }
+  },
+  "sealed_replay": {
+    "records": 452,
+    "decision_frozen_at_utc": "2026-07-16T08:30:00Z",
+    "manifest_sha256": "82df00237a68e45a85d59412a235435cca229ff2438f27f608e0c5927aa99556",
+    "fasta_sha256": "d5d11fd7674bbf5e450df49df96e31a25ff48fdf19bcc1e6c9467c29a9f2a889",
+    "reference_prediction_path": "results/talea_stable_discovery_v2_evaluation/lockbox_reference_predictions.jsonl",
+    "reference_prediction_sha256": "91fcbb556ba11dc03afb755a71d29c2cedf0e3ba24c179aa52b970a827f6a885",
+    "reference_score_field": "talea_discovery_score",
+    "predeclared_numerical_gates": {
+      "maximum_absolute_teacher_state_probability_difference": 0.001,
+      "maximum_absolute_topology_z_difference": 0.001,
+      "maximum_absolute_global_z_difference": 0.05,
+      "maximum_absolute_final_score_difference": 0.02,
+      "minimum_spearman_final_score": 0.999,
+      "maximum_absolute_average_precision_difference": 0.0001,
+      "maximum_absolute_roc_auc_difference": 0.0001
+    },
+    "deployment_decision": {
+      "required_gates": [
+        "global_z",
+        "final_score",
+        "final_score_spearman",
+        "average_precision",
+        "roc_auc"
+      ],
+      "trace_parity_diagnostics": [
+        "teacher_state_probability",
+        "topology_z"
+      ],
+      "rationale": "Discovery ranking excludes the discontinuous hard-wedge topology score. State and global components are continuous, batch stable, and retain unchanged frozen models and calibrations. Topology remains reported for follow-up localization."
+    }
+  },
+  "reporting_contract": {
+    "retain_residue_tracks": false,
+    "retain_attention_matrices": false,
+    "retain_component_scores": true,
+    "rank_by": "talea_discovery_score",
+    "auxiliary_rank_fields": [
+      "talea_teacher_score",
+      "teacher_state_z",
+      "topology_development_control_z",
+      "global_z"
+    ],
+    "hard_solenoid_threshold": null,
+    "interpretation": "candidate ranking only; follow-up structure or annotation is required"
+  }
+}

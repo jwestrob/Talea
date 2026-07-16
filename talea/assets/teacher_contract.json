@@ -1,0 +1,62 @@
+{
+  "advancement_gate": {
+    "cath_status_before_gate": "untouched for this branch",
+    "expected_development_records": 457,
+    "expected_exposure_clean_confirmation_records": 56,
+    "rule": "advance to exactly one no refit CATH diagnostic only when candidate minus head mean baseline AP is nonnegative for development state mean and exposure clean confirmation state plus topology"
+  },
+  "attention": {
+    "central_size": 64,
+    "layers_zero_based": [
+      13,
+      35
+    ],
+    "normalization_clip": 8.0,
+    "normalization_quantile": 0.95,
+    "representation": "head_mean",
+    "tile_size": 128
+  },
+  "device": "cuda",
+  "evidence_status": "UNVERIFIED sequence-only multitask model output",
+  "fold_group_field": "state_homology_group",
+  "generated_at_utc": "2026-07-16T05:23:47.188975+00:00",
+  "heads_per_layer": [
+    1,
+    1
+  ],
+  "input_channels": 3,
+  "loss": {
+    "state_weight": 1.0,
+    "state_weighting": "equal total residue weight per protein and equal total protein weight between positive and non-solenoid classes",
+    "structure_teacher_weight": 0.25,
+    "teacher_target": "five-class soft probabilities with coordinate-ambiguous residues masked",
+    "teacher_weighting": "equal total residue weight per eligible structure-teacher protein"
+  },
+  "model": {
+    "base_channels": 8,
+    "batch_size": 16,
+    "epochs": 20,
+    "full_model_epochs": 20,
+    "learning_rate": 0.001,
+    "reversal_augmentation": true,
+    "seed": 20260715,
+    "weight_decay": 0.0001
+  },
+  "output": {
+    "primary_protein_score": "mean_probability",
+    "state_threshold": 0.5
+  },
+  "schema_version": "talea_residue_teacher_multitask_v0",
+  "teacher": {
+    "class_names": [
+      "non_solenoid",
+      "beta",
+      "alpha_beta",
+      "alpha",
+      "beta_propeller_or_beta_sandwich"
+    ],
+    "eligible_records": 240,
+    "eligible_training_source": "repeatsdb_development",
+    "ineligible_solennoid_training_records": 217
+  }
+}
