@@ -85,13 +85,14 @@ One ESM++ pass supplies both branches:
 1. **Residue-state branch.** Attention from zero-based transformer layers 13
    and 35 is symmetrized, average-product corrected, rectified, and averaged
    across heads. A compact two-dimensional U-Net reads the two attention
-   channels plus normalized sequence position in 128-residue tiles.
+   channels plus a valid pair mask in 128 residue tiles.
    Predictions are reconstructed from each tile's central 64-residue diagonal.
    The mean elongated-state probability is logit-transformed and standardized
    against frozen development controls.
 2. **Global branch.** Residue-wise means and population standard deviations of
    hidden states from the same two layers are passed through a frozen
-   standardization, whitened 64-component PCA, and balanced logistic head.
+   standardization, whitened 64-component PCA, and sample-weighted logistic
+   head.
    Its probability is likewise logit-transformed and standardized against
    frozen controls.
 3. **Auxiliary topology branch.** Multi-scale attention spectra propose repeat
@@ -106,7 +107,9 @@ standardized protein views:
 Talea_discovery = 0.5 × teacher_state_z + 0.5 × global_z
 ```
 
-No coefficient in this fusion was fit to the evaluation cohort.
+No coefficient in this fusion was fit to the evaluation cohort. The 50:50
+formulation was nevertheless selected after that cohort had been opened; see
+[What “post-opening” means here](#what-post-opening-means-here).
 
 ### Why layers 13 and 35?
 
@@ -331,9 +334,10 @@ tile or truncate them.
 ## Benchmark
 
 The principal comparator cohort contains 452 canonical proteins: 226
-elongated/open-repeat positives and 226 reviewed hard controls. It contains
-one representative per sensitive homology group, and resampling is performed
-over those groups rather than treating related sequences as independent.
+elongated/open-repeat positives and 226 reviewed alternative-repeat controls.
+It contains one representative per sensitive homology group, and resampling is
+performed over those groups rather than treating related sequences as
+independent.
 
 SOLeNNoID received chain-specific experimental coordinates. Talea received
 amino-acid sequence only.
@@ -341,10 +345,20 @@ amino-acid sequence only.
 | Evaluation | Talea AP | Talea AUROC | Talea normalized pAUROC at FPR 0.1 |
 |---|---:|---:|---:|
 | Original sealed Talea score | 0.991 | 0.988 | 0.953 |
-| Stable discovery v2 | 0.99598 | 0.99454 | 0.97564 |
+| Stable discovery v2 | 0.996 | 0.995 | 0.976 |
 
-The fixed SOLeNNoID mean-total comparator reached AP 0.98371, AUROC 0.98308,
-and normalized pAUROC 0.89623.
+The SOLeNNoID mean-total comparator reached AP 0.984, AUROC 0.983, and
+normalized pAUROC 0.896. Mean-total probability was fixed before lockbox
+inference as the stronger comparator summary observed in prior development;
+the published majority-class fraction is retained in the benchmark bundle as
+a secondary summary. SOLeNNoID was run from official repository commit
+`87c13fefdd6acd7cb43831979d89fd11e437716f`.
+
+These labels come from the same RepeatsDB elongated-open-repeat ontology used
+to define Talea's target during development. The cohort is therefore a
+favorable or “home-field” task for Talea relative to a comparator developed
+under a different solenoid definition. It supports competitiveness on this
+task, not universal superiority across repeat ontologies.
 
 For the **original sealed Talea score**, Talea minus SOLeNNoID was +0.007 AP
 with a 95% homology-group paired interval of [-0.003, +0.019], and +0.005
@@ -358,6 +372,34 @@ bootstrap replicates gave Talea-minus-SOLeNNoID intervals entirely above zero:
 - AP: [+0.00317, +0.02426]
 - AUROC: [+0.00182, +0.02283]
 - normalized pAUROC: [+0.02561, +0.15189]
+
+A post-opening sensitivity analysis reweighted the frozen state and global
+outputs without refitting. RepeatsDB AP remained between 0.994 and 0.996 for
+state weights from 0.30 to 0.70; on CATH S20 the same interval produced AP
+0.799–0.810. The equal fusion lies on a broad plateau rather than at a narrow
+RepeatsDB-specific optimum.
+
+A score-blind structural-exposure audit compared every comparator structure
+with the complete union of the 457 residue-state/teacher structures and 1,200
+global-head training structures before classifier scores were joined:
+
+| Maximum Foldseek TM score | Positive/control | Sealed Talea AP | v2 AP | SOLeNNoID AP |
+|---|---:|---:|---:|---:|
+| < 0.50 | 22/19 | 0.975 | 0.987 | 0.979 |
+| < 0.60 | 33/35 | 0.948 | 0.980 | 0.951 |
+| < 0.70 | 67/63 | 0.973 | 0.985 | 0.961 |
+
+Paired intervals crossed zero at every structural threshold. The rankings are
+therefore robust after removing structurally close evaluation proteins, but
+the reduced cohorts do not establish a structurally disjoint Talea advantage.
+
+A separate post-opening subtype diagnostic found strong released-score ranking
+for all four RepeatsDB elongated-open topologies. The smallest subgroup,
+beta-hairpin repeats, contained only six proteins and remains imprecisely
+estimated. Five-fold out-of-fold baselines reached AP 0.565 from length, 0.622
+from SEG low-complexity fraction, 0.797 from amino-acid composition, and 0.798
+from composition plus length, compared with 0.996 for released v2 on the same
+cohort.
 
 ### What “post-opening” means here
 
@@ -384,14 +426,35 @@ This distinction is statistical, not semantic: unchanged components and
 non-fitted equal weights reduce the opportunity for overfitting, but they do
 not make an opened evaluation set new again.
 
+### CATH S20 transfer diagnostic
+
+The exact released score was also reconstructed without refitting on 819 CATH
+S20 domain sequences: 91 positive domains and 728 length-matched controls. The
+positive set is narrow, with 80 of 91 records classified as alpha horseshoes.
+
+| Cohort | Talea AP | SOLeNNoID AP | Paired Talea minus SOLeNNoID 95% interval |
+|---|---:|---:|---:|
+| All CATH S20 domains | 0.810 | 0.754 | [-0.011, 0.123] |
+| All-training-unions TM-disjoint | 0.413 | 0.355 | [-0.098, 0.218] |
+
+CATH labels and earlier comparator results had already been opened during
+method development. This is a post-opening, no-refit transfer diagnostic, not
+independent validation. The point estimates are competitive, the paired
+intervals do not distinguish the methods, and the lower absolute performance
+under structural and ontology shift is an important scope limit.
+
 ## Limitations
 
 - Talea ranks candidates; it does not make curated structural or biological
   calls.
 - No universal score threshold has been calibrated for arbitrary sequence
   collections. Score distributions can shift with proteome composition.
-- The current comparator contains 226 positives and 226 hard controls, one per
-  sensitive homology group. A new independent cohort is still needed to
+- Average precision on the balanced comparator does not predict precision at
+  the lower and unknown prevalence of elongated open repeats in natural
+  proteomes.
+- The current comparator contains 226 positives and 226 alternative-repeat
+  controls, one per sensitive homology group. A new independent cohort is still
+  needed to
   confirm stable v2 because this cohort had already been opened when v2 was
   formulated.
 - Candidate periods can have harmonic or subharmonic aliases. Treat the
