@@ -337,7 +337,11 @@ The principal comparator cohort contains 452 canonical proteins: 226
 elongated/open-repeat positives and 226 reviewed alternative-repeat controls.
 It contains one representative per sensitive homology group, and resampling is
 performed over those groups rather than treating related sequences as
-independent.
+independent. Prospectively, comparator groups represented in the
+RepeatsDB-derived residue-state training branch were removed, along with exact
+sequence and PDB identities to either residue-state source. Remote homology
+against the second residue-state source was not jointly recomputed before the
+cohort was opened.
 
 SOLeNNoID received chain-specific experimental coordinates. Talea received
 amino-acid sequence only.
@@ -379,14 +383,35 @@ state weights from 0.30 to 0.70; on CATH S20 the same interval produced AP
 0.799–0.810. The equal fusion lies on a broad plateau rather than at a narrow
 RepeatsDB-specific optimum.
 
+A score-blind post-opening MMseqs2 audit compared the complete comparator with
+the full Talea training sequence union: 457 residue-state records and the exact
+1,200 global-head records. Qualifying links required at least 20% identity,
+E-value at most 1e-3, and at least 50% coverage of the shorter sequence. The
+union linked 141 comparator proteins. After excluding them, 151 positives and
+160 controls remained; sealed Talea, released v2, and SOLeNNoID reached AP
+0.989, 0.994, and 0.990. The paired Talea-minus-SOLeNNoID intervals were
+[-0.010, +0.007] for the sealed score and [-0.002, +0.010] for released v2.
+Both cross zero. This sensitivity repairs the scope of the original firewall;
+it does not turn the known cohort into new validation.
+
+A separate score-blind repair recomputed homology between the two residue-state
+training sources. Sixty-one cross-source links collapsed the 457 records into
+315 intact validation components. Corrected out-of-fold AP was 0.960 without
+the structural teacher and 0.959 with it; the paired difference interval was
+[-0.014, +0.013]. Thus the residue-state signal survives the repaired
+firewall, but the teacher is not claimed to improve out-of-fold ranking. The
+released full model was not refit or altered by this audit.
+
 A score-blind structural-exposure audit compared every comparator structure
-with the complete union of the 457 residue-state/teacher structures and 1,200
-global-head training structures before classifier scores were joined:
+with the complete union of the 457 residue-state/teacher structures, 1,200
+global-head training structures, and all 348 published SOLeNNoID development
+structures before classifier scores were joined. Five positive comparator
+chains exactly match PDB-and-chain identifiers in the SOLeNNoID archive:
 
 | Maximum Foldseek TM score | Positive/control | Sealed Talea AP | v2 AP | SOLeNNoID AP |
 |---|---:|---:|---:|---:|
 | < 0.50 | 22/19 | 0.975 | 0.987 | 0.979 |
-| < 0.60 | 33/35 | 0.948 | 0.980 | 0.951 |
+| < 0.60 | 33/34 | 0.948 | 0.980 | 0.951 |
 | < 0.70 | 67/63 | 0.973 | 0.985 | 0.961 |
 
 Paired intervals crossed zero at every structural threshold. The rankings are
@@ -435,7 +460,11 @@ positive set is narrow, with 80 of 91 records classified as alpha horseshoes.
 | Cohort | Talea AP | SOLeNNoID AP | Paired Talea minus SOLeNNoID 95% interval |
 |---|---:|---:|---:|
 | All CATH S20 domains | 0.810 | 0.754 | [-0.011, 0.123] |
-| All-training-unions TM-disjoint | 0.413 | 0.355 | [-0.098, 0.218] |
+| Exact all-training-unions TM < 0.60 | 0.440 | 0.419 | [-0.139, 0.180] |
+
+The exact structural filter covers the 457-structure Talea state/teacher
+union, the 348-structure published SOLeNNoID development archive, and the
+1,200-structure released Talea global-head collection.
 
 CATH labels and earlier comparator results had already been opened during
 method development. This is a post-opening, no-refit transfer diagnostic, not
