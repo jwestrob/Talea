@@ -80,8 +80,10 @@ kernel's transient score matrices.
 against ~3.7 s of CPU postprocess — the pipeline is roughly **99% CPU**. Two
 consequences: (i) `sdpa` mode's 1.53× on the forward (0.038 s → 0.025 s) is worth
 well under 1% end to end, and (ii) raising `square_budget` to exploit the freed
-VRAM buys little until postprocessing is parallelized. The VRAM headroom's real
-value is removing OOM risk at the length ceiling, not speed.
+VRAM buys little *while the pipeline is serial* — but 1.33× once postprocessing
+is parallelized, as the throughput table above shows. The VRAM headroom is what
+makes that larger budget affordable, so its value is both OOM headroom at the
+length ceiling and a real throughput lever in the parallel configuration.
 
 **GPU concordance.** A four-record CUDA/fp16 CLI run is byte-identical between
 trees under `manual`: sha256 `0451e1e24c948930a38b9b5701dfe3ba0cfdee0db0cf2131b59c64a006725b7b`.
