@@ -87,6 +87,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "pin cuDNN to deterministic convolution algorithms. Talea's GPU "
+            "results otherwise vary between processes: the teacher UNet's "
+            "conv2d picks a different cuDNN algorithm per process, and the "
+            "logit/z transform amplifies ~2e-4 of probability into ~4e-2 of "
+            "teacher_state_z. Changes results relative to prior runs."
+        ),
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help=(
@@ -131,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         dtype=args.dtype,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
+        deterministic=args.deterministic,
     )
     completed = 0
     try:
@@ -173,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
+        "deterministic": args.deterministic,
         "model_loaded_seconds": predictor.loaded_seconds,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",

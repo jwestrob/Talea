@@ -29,6 +29,34 @@ Measured gains:
 | `best_harmonic_comb`, L=1024 | 26.1 ms | 1.65 ms | 15.9× |
 | Peak forward VRAM, L=2046 (H200, measured) | 5.78 GB | 179 MB | **32.2×** |
 | Peak forward+matrix VRAM, L=2046 | 6.06 GB | 453 MB | 13.4× |
+| **End-to-end throughput, 96 records (H200, 16 CPU)** | **1.01 prot/s** | **4.77 prot/s** | **4.7×** |
+
+End-to-end (job 1161569), 96 records with a GVDB-like length mix, H200 +
+16 CPUs, model-load time excluded:
+
+| configuration | prot/s | vs reference |
+|---|---:|---:|
+| reference, thread × 4 (old default) | 1.01 | 1.00× |
+| dev, thread × 1 | 2.66 | 2.63× |
+| dev, process × 2 | 2.91 | 2.88× |
+| dev, process × 4 | 3.21 | 3.18× |
+| dev, process × 8 | 3.54 | 3.51× |
+| dev, process × 16 | 3.22 | 3.19× (oversubscribed: 16 workers + parent on 16 CPUs) |
+| dev, process × 8, `--square-budget 16e6` | 4.72 | 4.67× |
+| dev, process × 8, `--square-budget 64e6` | 4.77 | **4.72×** |
+
+Two things to read off this. Pool scaling saturates around 8 workers and then
+regresses — partly oversubscription, partly Amdahl: the teacher stage runs
+serially in the parent and is 12–16% of per-record CPU time, capping pool
+speedup near 6×. And **raising `square_budget` is worth 1.33×** (3.58 → 4.72)
+once postprocessing is parallelized — which corrects an earlier assessment in
+this document that it "buys little"; that was true only while the pipeline was
+serial. The freed VRAM is what makes the larger budget affordable.
+
+Caveat on the benchmark set: these are random sequences, which produce fewer
+candidate periods and so less wedge/registration work than genuine repeat
+proteins. Real solenoid-rich input will spend proportionally more time in
+postprocessing, which should *favour* the parallel configurations further.
 
 ---
 
@@ -57,6 +85,103 @@ value is removing OOM risk at the length ceiling, not speed.
 
 **GPU concordance.** A four-record CUDA/fp16 CLI run is byte-identical between
 trees under `manual`: sha256 `0451e1e24c948930a38b9b5701dfe3ba0cfdee0db0cf2131b59c64a006725b7b`.
+That result does **not** generalize to larger runs — see the next section.
+
+---
+
+## GPU reproducibility: a property of Talea, not of this branch (job 1161570)
+
+A 96-record run showed every configuration producing a different SHA-256,
+including two runs of an identical configuration. The obvious reading — that
+this branch broke something — is wrong. The control settles it:
+
+**Three runs of the unmodified `Talea_repo`, identical flags, identical input:**
+
+| comparison | records differing | worst relative delta |
+|---|---:|---:|
+| ref run1 vs run2 | 54/96 | 3.81e-2 (`teacher_state_z`) |
+| ref run1 vs run3 | 65/96 | 3.82e-2 |
+| **dev run1 vs run2** | 83/96 | **3.76e-3** |
+| ref run1 vs dev run1 | 73/96 | 3.96e-2 |
+
+**The reference implementation is not reproducible on GPU.** Same code, same
+input, same flags, three runs, three different outputs, disagreeing by up to
+~3.8% on `teacher_state_z`. The cross-tree disagreement (3.96e-2) is the same
+order as the reference's disagreement with itself (3.82e-2), so at this sample
+size the two trees are indistinguishable from run-to-run noise.
+
+Two corollaries worth attention independently of any optimization:
+
+1. **Dev appears *more* stable than reference** — 3.76e-3 vs 3.81e-2, an order
+   of magnitude tighter, though from only two runs. A plausible mechanism is C8:
+   the reference calls `torch.cuda.empty_cache()` twice per batch, churning the
+   allocator and so the cuBLAS workspace state that kernel selection depends on.
+   Removing it may have removed a nondeterminism source. Not yet confirmed.
+
+2. **Results depend on batch composition.** Same tree, `--square-budget` 4e6 vs
+   1.6e7: **96/96 records differ, 11 structurally** (different registration unit
+   counts), worst relative delta **11.94**. Batching is not a performance-only
+   knob — it changes reported values. This has direct consequences for the
+   sharded screens: a 64-shard run and a single-pass run over the same proteins
+   will not agree, and neither will two shardings.
+
+**What this means for the concordance claims here.** CPU/fp32 is deterministic
+(verified: `Talea_repo` run twice, identical), so it is the correct environment
+for bit-exactness validation, and there the branch is byte-identical. On GPU,
+byte-identity is not achievable by anyone — including the reference against
+itself — so the honest claim is bounded: *the difference between trees is the
+same order as the reference's own run-to-run variation.*
+
+**What this means for the science.** Published Talea scores are not exactly
+reproducible from a GPU re-run, and score≥2 calls sitting within ~4% of the
+threshold could flip between runs. Rank order should be largely stable, but that
+is an assumption worth testing rather than assuming. The deployment contract's
+"sealed_replay" language should be read against this.
+
+### Localizing it (jobs 1161571–1161576)
+
+Ruled out, each by direct measurement rather than reasoning:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| fp16 split-k GEMM reductions | `allow_fp16_reduced_precision_reduction=False` | still varies |
+| TF32 / cuDNN algorithm choice | `allow_tf32=False`, `cudnn.deterministic=True` | still varies |
+| Within-process instability | 3 passes in one process (job 1161572) | **bit-identical** |
+| ESM++ forward across processes | fixed batch, 3 processes (job 1161573) | **bit-identical**, incl. raw attention, pooled hidden, and the APC matrices |
+| CPU postprocess across processes | 3 processes × 2 thread settings | **bit-identical** |
+
+So the ESM++ forward, the matrix construction, and the entire CPU postprocess
+are all deterministic — within a process and across processes.
+
+**Confirmed cause (job 1161576): the teacher UNet.** Comparing three separate
+processes on one H200, every ESM++ tensor is bit-identical while the teacher
+output is not:
+
+| tensor | across processes |
+|---|---|
+| `last_hidden`, `raw_attn13/35`, `hidden13/35` | identical, max\|Δ\| 0 |
+| APC matrices `mat{0,1,2}_{13,35}` | identical, max\|Δ\| 0 |
+| **`teacher_state{0,1,2}`** | **differ, max\|Δ\| 1.4e-4 – 2.7e-4** |
+| **`teacher_class{0,1,2}`** | **differ, max\|Δ\| 1.9e-4 – 3.8e-4** |
+
+`torch.conv2d` dispatches to cuDNN, which selects an algorithm per process;
+different algorithms accumulate differently. ~2e-4 of probability then becomes
+~3.8e-2 of `teacher_state_z`, because `standardized_probability_z` applies a
+logit and divides by a control standard deviation — a large amplification of a
+small perturbation.
+
+**Mitigation, and its limit.** With `torch.use_deterministic_algorithms(True)`
+plus `cudnn.deterministic=True` and a fixed cuBLAS workspace, two of the three
+records became bit-identical across processes and the third shrank from 2.7e-4
+to 5.2e-6 — roughly 50× tighter, but still not exact. Exposed as
+**`--deterministic`** (C10), opt-in: it changes results relative to every run
+made so far, including the frozen artifacts, which were themselves produced
+without it.
+
+Note the practical asymmetry this already establishes: **a single run is
+internally consistent**, so within-run comparisons and rankings are sound. It is
+*re-running* that does not reproduce. For the 64-shard GVDB screen, each shard
+is a separate process, so shard boundaries are also potential discontinuities.
 
 ---
 
@@ -242,6 +367,12 @@ slowdown, and both are recorded because they are easy to reintroduce:
 
 **Numerics.** Bit-exact — worker output is asserted identical to a direct
 `process_attention_record` call, and the pooled result identical to serial.
+
+### C10. `--deterministic` — `talea/inference.py`, `talea/cli.py`
+
+Pins cuDNN to deterministic convolution algorithms, addressing the teacher-UNet
+nondeterminism established above. Opt-in; see the GPU reproducibility section
+for the measurement and the residual 5.2e-6 it does not remove.
 
 ### C8. `empty_cache()` / `gc.collect()` no longer per batch — `talea/inference.py`
 

@@ -74,6 +74,31 @@ def resolve_dtype(
 POSTPROCESS_MODES = ("thread", "process")
 
 
+def enable_deterministic_convolution() -> None:
+    """Pin cuDNN to deterministic convolution algorithms.
+
+    Talea's GPU results are not reproducible between processes, and the cause is
+    narrow. Measured across three separate processes on one H200 (job 1161576),
+    every ESM++ stage is bit-identical -- raw attention, pooled hidden states,
+    ``last_hidden_state``, and the APC matrices all compare exactly equal. The
+    only stage that varies is the teacher UNet, whose ``torch.conv2d`` calls let
+    cuDNN pick an algorithm per process; the state track differed by 1.4e-4 to
+    3.8e-4 between runs.
+
+    That looks negligible until it passes through ``standardized_probability_z``,
+    where a logit transform divided by a control standard deviation turns ~2e-4
+    of probability into ~3.8e-2 of ``teacher_state_z``.
+
+    Enabling this made two of three test records bit-identical across processes
+    and shrank the third from 2.7e-4 to 5.2e-6, so it is a large improvement
+    rather than a guarantee. It is opt-in because it changes results relative to
+    every run made so far -- including the frozen artifacts, which were
+    themselves produced without it.
+    """
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def postprocess_pool_context():
     """Multiprocessing context for the postprocess pool.
 
@@ -226,8 +251,12 @@ class TaleaPredictor:
         dtype: str = "auto",
         trust_remote_code: bool = False,
         local_files_only: bool = False,
+        deterministic: bool = False,
     ):
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        self.deterministic = bool(deterministic)
+        if self.deterministic:
+            enable_deterministic_convolution()
         self.deployment = load_deployment()
         self.assets: RuntimeAssets = verified_runtime_assets(self.deployment)
         self.device = resolve_device(device)
