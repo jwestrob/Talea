@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 
 import numpy as np
 from scipy.ndimage import median_filter
@@ -148,7 +149,115 @@ def best_harmonic_comb(
     excess_floor: float = 1.0,
     significance_z: float = 2.5,
 ) -> HarmonicCall:
-    """Score candidate fundamentals by repeated peaks at integer harmonics."""
+    """Score candidate fundamentals by repeated peaks at integer harmonics.
+
+    The expensive part of the original loop was the per-harmonic tolerance-window
+    maxima -- tens of thousands of tiny ``np.max`` calls per protein.  Those are
+    replaced by one linear-time sliding maximum of width
+    ``2 * tolerance_bins + 1`` plus a single gather.
+
+    The per-fundamental reduction stays a loop **on purpose**.  ``np.dot`` uses
+    BLAS ``ddot``, whose SIMD-paired summation order no vectorized NumPy
+    reduction reproduces: measured against ``np.dot``, ``np.sum(a * b)`` and
+    ``np.einsum`` differ in the last bit for 17-48% of random length<=8 inputs,
+    and a grouped mat-vec differs by up to 5e-15.  Those last bits matter here
+    because real attention spectra produce exact ties between adjacent
+    fundamentals, and a flipped tie changes the selected period -- an O(1e-3)
+    change in downstream scores, not an O(1e-16) one.  Slicing a row of the
+    gathered array is bit-identical to ``np.dot`` on a contiguous copy, so the
+    loop below reproduces the reference exactly.
+
+    ``_best_harmonic_comb_reference`` retains the original implementation and is
+    asserted equivalent in tests/test_concordance.py.
+    """
+    maximum_frequency_bin = len(spectral_z) - 1
+    minimum_bin = max(min_cycles, int(math.ceil(signal_length / max_period)))
+    maximum_bin = min(
+        maximum_frequency_bin,
+        int(math.floor(signal_length / min_period)),
+    )
+    empty = HarmonicCall(0.0, -1.0, -1, 0, 0, tuple(), 0.0)
+    if maximum_bin < minimum_bin or maximum_frequency_bin < 1:
+        return empty
+
+    values = np.asarray(spectral_z, dtype=np.float64)
+    windowed = np.full(maximum_frequency_bin + 1, -np.inf, dtype=np.float64)
+    bins = np.arange(1, maximum_frequency_bin + 1)
+    for shift in range(-tolerance_bins, tolerance_bins + 1):
+        source = np.clip(bins + shift, 1, maximum_frequency_bin)
+        np.maximum(windowed[1:], values[source], out=windowed[1:])
+
+    fundamentals = np.arange(minimum_bin, maximum_bin + 1)
+    tested = np.minimum(max_harmonics, maximum_frequency_bin // fundamentals)
+    keep = tested >= 2
+    if not np.any(keep):
+        return empty
+    fundamentals = fundamentals[keep]
+    tested = tested[keep]
+
+    harmonics = np.arange(1, max_harmonics + 1)
+    centers = np.clip(
+        harmonics[None, :] * fundamentals[:, None], 1, maximum_frequency_bin
+    )
+    gathered = windowed[centers]
+    excess_all = np.maximum(0.0, gathered - excess_floor)
+    significant_all = np.cumsum(gathered >= significance_z, axis=1)
+
+    weights_by_count = _harmonic_weights(max_harmonics)
+    best_index = -1
+    best_key: tuple[float, int] | None = None
+    best_score = 0.0
+    for index in range(len(fundamentals)):
+        count = int(tested[index])
+        weight_values, weight_norm = weights_by_count[count]
+        score = float(np.dot(excess_all[index, :count], weight_values) / weight_norm)
+        n_significant = int(significant_all[index, count - 1])
+        key = (score, n_significant)
+        if best_key is None or key > best_key:
+            best_key, best_index, best_score = key, index, score
+
+    count = int(tested[best_index])
+    return HarmonicCall(
+        score=best_score,
+        period=float(signal_length / fundamentals[best_index]),
+        frequency_bin=int(fundamentals[best_index]),
+        n_harmonics=int(significant_all[best_index, count - 1]),
+        n_harmonics_tested=count,
+        harmonic_z=tuple(float(value) for value in gathered[best_index, :count]),
+        spectral_scale=0.0,
+    )
+
+
+@lru_cache(maxsize=None)
+def _harmonic_weights(max_harmonics: int) -> tuple[tuple[np.ndarray, float], ...]:
+    """Per-count harmonic weight vectors and their norms, built as in the loop.
+
+    Indexed by harmonic count. Entry ``k`` holds ``[1/sqrt(1) .. 1/sqrt(k)]``
+    and ``np.linalg.norm`` of it, matching the reference construction exactly.
+    """
+    table = []
+    for count in range(max_harmonics + 1):
+        weights = np.asarray(
+            [1.0 / math.sqrt(harmonic) for harmonic in range(1, count + 1)],
+            dtype=np.float64,
+        )
+        norm = float(np.linalg.norm(weights)) if count else 1.0
+        table.append((weights, norm))
+    return tuple(table)
+
+
+def _best_harmonic_comb_reference(
+    spectral_z: np.ndarray,
+    signal_length: int,
+    min_period: float = 5.0,
+    max_period: float = 250.0,
+    min_cycles: int = 3,
+    max_harmonics: int = 8,
+    tolerance_bins: int = 1,
+    excess_floor: float = 1.0,
+    significance_z: float = 2.5,
+) -> HarmonicCall:
+    """Original per-fundamental loop, retained as the concordance oracle."""
     maximum_frequency_bin = len(spectral_z) - 1
     minimum_bin = max(min_cycles, int(math.ceil(signal_length / max_period)))
     maximum_bin = min(

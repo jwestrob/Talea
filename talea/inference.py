@@ -19,11 +19,13 @@ from packaging.version import Version
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_assets
+from talea.capture import selective_capture
 from talea.io import SequenceRecord
 from talea.model import AttentionStateTeacherUNet
 from talea.production import (
     compose_talea_score,
     global_head_probabilities,
+    pooled_hidden_features_for_layers,
     pooled_hidden_features_for_record,
     roundtrip_attention_storage,
     summarize_teacher_prediction,
@@ -67,27 +69,59 @@ def resolve_dtype(
     return name, values[name]
 
 
+_SEPARATION_MASK_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def near_diagonal_mask(
+    sequence_length: int, minimum_separation: int, device: torch.device
+) -> torch.Tensor:
+    """Cached boolean mask selecting residue pairs closer than the minimum.
+
+    Rebuilding this per call allocated two int64 ``L x L`` temporaries -- 64 MB
+    at L=2046 -- on every layer of every record. The mask depends only on
+    (length, separation, device), so it is built once and reused.
+    """
+    key = (int(sequence_length), int(minimum_separation), str(device))
+    cached = _SEPARATION_MASK_CACHE.get(key)
+    if cached is None:
+        positions = torch.arange(sequence_length, device=device)
+        cached = (positions[:, None] - positions[None, :]).abs() < minimum_separation
+        _SEPARATION_MASK_CACHE[key] = cached
+    return cached
+
+
 def apc_head_mean(
     layer_attention: torch.Tensor,
     indices: torch.Tensor,
     sequence_length: int,
     minimum_separation: int,
+    storage_dtype: torch.dtype | None = None,
 ) -> np.ndarray:
-    """Symmetrize, APC-correct, head-average, and crop one attention layer."""
+    """Symmetrize, APC-correct, head-average, and crop one attention layer.
 
-    attention = 0.5 * (layer_attention + layer_attention.transpose(-1, -2))
-    attention = attention.index_select(1, indices).index_select(2, indices)
+    The crop precedes the symmetrization: both operations are elementwise over
+    the same index set, so the result is unchanged, but every subsequent
+    reduction then runs over ``L x L`` rather than the padded ``T x T``.
+
+    ``storage_dtype`` casts on the accelerator before the host transfer. The
+    frozen contract stores these matrices as fp16, so casting first halves the
+    transfer without changing the stored representation.
+    """
+
+    attention = layer_attention.index_select(1, indices).index_select(2, indices)
+    attention = 0.5 * (attention + attention.transpose(-1, -2))
     row = attention.sum(dim=-1, keepdim=True)
     column = attention.sum(dim=-2, keepdim=True)
     total = attention.sum(dim=(-1, -2), keepdim=True) + 1e-12
     attention = torch.relu(attention - (row * column) / total).mean(dim=0)
     if minimum_separation > 0:
-        positions = torch.arange(sequence_length, device=attention.device)
-        separation = (positions[:, None] - positions[None, :]).abs()
         attention = attention.masked_fill(
-            separation < minimum_separation, 0.0
+            near_diagonal_mask(sequence_length, minimum_separation, attention.device),
+            0.0,
         )
     attention.fill_diagonal_(0.0)
+    if storage_dtype is not None and attention.dtype != storage_dtype:
+        attention = attention.to(storage_dtype)
     result = attention.to("cpu", dtype=torch.float32).numpy()
     if result.shape != (sequence_length, sequence_length):
         raise ValueError("cropped attention matrix does not match sequence length")
@@ -276,10 +310,24 @@ class TaleaPredictor:
         *,
         square_budget: int = 4_000_000,
         maximum_batch: int = 64,
-        postprocess_workers: int = 4,
+        postprocess_workers: int = 1,
         progress: bool = False,
+        capture_mode: str = "manual",
+        cache_clear_interval: int = 0,
     ) -> Iterator[dict]:
-        """Yield predictions in length-sorted order without retaining matrices."""
+        """Yield predictions in length-sorted order without retaining matrices.
+
+        ``postprocess_workers`` defaults to 1: the postprocessing is dominated
+        by many small NumPy calls that hold the GIL, so a thread pool convoys
+        rather than scales (measured 0.57x at four workers). See
+        perf/bench_threads.py.
+
+        ``capture_mode`` selects the attention-capture strategy in
+        talea.capture; "manual" preserves the frozen numerics exactly.
+
+        ``cache_clear_interval`` of 0 never calls empty_cache(); calling it per
+        batch returns blocks to the driver and forces later reallocation.
+        """
 
         values = list(records)
         if not values:
@@ -294,9 +342,21 @@ class TaleaPredictor:
         storage_dtype = self.deployment["esmplusplus"].get(
             "decoder_matrix_storage_dtype", "fp32"
         )
+        device_storage_dtype = {
+            "fp16": torch.float16,
+            "fp32": None,
+        }.get(storage_dtype)
+        minimum_separation = int(
+            self.deployment["esmplusplus"]["minimum_sequence_separation"]
+        )
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=postprocess_workers
-        ) as pool, torch.inference_mode():
+        ) as pool, torch.inference_mode(), selective_capture(
+            self.esm_model,
+            self.expected_layers,
+            self.expected_layers,
+            mode=capture_mode,
+        ) as capture:
             for batch_index, batch in enumerate(batches, start=1):
                 tokenized = self.tokenizer(
                     [record.sequence for record in batch],
@@ -316,16 +376,17 @@ class TaleaPredictor:
                     for key, value in tokenized.items()
                     if key != "special_tokens_mask"
                 }
+                capture.reset()
                 model_output = self.esm_model(
                     **model_inputs,
-                    output_attentions=True,
-                    output_hidden_states=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
                     return_dict=True,
                 )
-                if model_output.attentions is None:
-                    raise RuntimeError("ESM++ returned no attentions")
-                if model_output.hidden_states is None:
-                    raise RuntimeError("ESM++ returned no hidden states")
+                capture.finalize(model_output.last_hidden_state)
+                capture.require()
+                attentions = capture.attentions
+                hidden_states = capture.hidden_states
                 compact = []
                 pooled_rows = []
                 for batch_position, record in enumerate(batch):
@@ -343,22 +404,19 @@ class TaleaPredictor:
                     matrices = {
                         layer: roundtrip_attention_storage(
                             apc_head_mean(
-                                model_output.attentions[layer][batch_position],
+                                attentions[layer][batch_position],
                                 indices,
                                 record.length,
-                                int(
-                                    self.deployment["esmplusplus"][
-                                        "minimum_sequence_separation"
-                                    ]
-                                ),
+                                minimum_separation,
+                                storage_dtype=device_storage_dtype,
                             ),
                             storage_dtype,
                         )
                         for layer in self.expected_layers
                     }
                     pooled_rows.append(
-                        pooled_hidden_features_for_record(
-                            model_output.hidden_states,
+                        pooled_hidden_features_for_layers(
+                            hidden_states,
                             indices,
                             batch_position,
                             self.expected_layers,
@@ -377,9 +435,16 @@ class TaleaPredictor:
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )
-                del model_output, tokenized, model_inputs, special, attention_mask
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+                capture.reset()
+                del (
+                    model_output,
+                    tokenized,
+                    model_inputs,
+                    special,
+                    attention_mask,
+                    attentions,
+                    hidden_states,
+                )
                 for (record, matrices, future), global_probability in zip(
                     compact, global_probabilities, strict=True
                 ):
@@ -432,11 +497,16 @@ class TaleaPredictor:
                     }
                     completed += 1
                 del compact, pooled_rows, global_probabilities
-                gc.collect()
-                if self.device.type == "mps":
-                    torch.mps.empty_cache()
-                elif self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+                # empty_cache() returns blocks to the driver and forces later
+                # cudaMalloc; gc.collect() walks every generation. Both were
+                # unconditional per batch. Interval 0 disables them entirely,
+                # which is correct once the 36-layer attention tuple is gone.
+                if cache_clear_interval and batch_index % cache_clear_interval == 0:
+                    gc.collect()
+                    if self.device.type == "mps":
+                        torch.mps.empty_cache()
+                    elif self.device.type == "cuda":
+                        torch.cuda.empty_cache()
                 if progress:
                     print(
                         f"Talea: batch {batch_index}/{len(batches)}; "

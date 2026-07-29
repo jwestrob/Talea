@@ -49,7 +49,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--postprocess-workers",
         type=int,
-        default=max(1, min(4, os.cpu_count() or 1)),
+        default=1,
+        help=(
+            "postprocessing threads (default 1). The work is many small NumPy "
+            "calls that hold the GIL, so additional threads convoy rather than "
+            "scale; four workers measured 0.57x of one."
+        ),
+    )
+    parser.add_argument(
+        "--capture-mode",
+        choices=("manual", "sdpa"),
+        default="manual",
+        help=(
+            "attention capture strategy. 'manual' keeps every layer on the "
+            "kernel the frozen run used and is numerically identical; 'sdpa' "
+            "lets the 34 uncaptured layers use the fast backend, which is "
+            "faster but not bit-identical."
+        ),
+    )
+    parser.add_argument(
+        "--cache-clear-interval",
+        type=int,
+        default=0,
+        help=(
+            "call gc.collect()/empty_cache() every N batches (0 = never). "
+            "Only needed if sharing a GPU with another process."
+        ),
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -106,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
                 maximum_batch=args.maximum_batch,
                 postprocess_workers=args.postprocess_workers,
                 progress=not args.quiet,
+                capture_mode=args.capture_mode,
+                cache_clear_interval=args.cache_clear_interval,
             ):
                 handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
                 completed += 1
@@ -132,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
         "model_revision": deployment["esmplusplus"]["revision"],
         "device": str(predictor.device),
         "dtype": predictor.dtype_name,
+        "capture_mode": args.capture_mode,
+        "postprocess_workers": args.postprocess_workers,
         "model_loaded_seconds": predictor.loaded_seconds,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",

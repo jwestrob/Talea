@@ -82,6 +82,39 @@ def pooled_hidden_features_for_record(
     return features
 
 
+def pooled_hidden_features_for_layers(
+    hidden_states: Mapping[int, torch.Tensor],
+    residue_indices: torch.Tensor,
+    batch_position: int,
+    transformer_layer_indices: Sequence[int],
+) -> dict[str, np.ndarray]:
+    """Pool from a sparse {layer: tensor} capture instead of the full tuple.
+
+    Arithmetically identical to ``pooled_hidden_features_for_record``; it only
+    changes how the layer's tensor is located. The caller is responsible for
+    supplying the same tensor that ``hidden_states[layer + 1]`` would have
+    yielded -- see talea.capture.resolve_hidden_state_sources.
+    """
+
+    indices = residue_indices.to(dtype=torch.long)
+    if indices.ndim != 1 or not len(indices):
+        raise ValueError("residue indices must be a non-empty vector")
+    features: dict[str, np.ndarray] = {}
+    for layer_index in transformer_layer_indices:
+        layer = int(layer_index)
+        if layer not in hidden_states:
+            raise KeyError(f"hidden state for transformer layer {layer} not captured")
+        state = hidden_states[layer]
+        if not 0 <= batch_position < state.shape[0]:
+            raise IndexError("batch position is outside the hidden-state batch")
+        residues = state[batch_position].index_select(0, indices).to(torch.float32)
+        features[f"layer_{layer}_mean"] = residues.mean(dim=0).cpu().numpy()
+        features[f"layer_{layer}_std"] = residues.std(
+            dim=0, unbiased=False
+        ).cpu().numpy()
+    return features
+
+
 def flatten_global_features(
     features: Mapping[str, np.ndarray], feature_keys: Sequence[str]
 ) -> np.ndarray:
