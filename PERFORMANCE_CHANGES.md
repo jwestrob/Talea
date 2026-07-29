@@ -241,18 +241,32 @@ qualitatively:
 | `wedge_call.score` | 12.78 | 10.47 |
 
 A 1e-6 perturbation selected a different period candidate and therefore a
-different repeat registration. A score-ranked screen would not notice; anything
-consuming `period`, `n_units`, or `registration.units` — copy-number variation,
-period stability, unit extraction for alignments — would get different biology.
+different repeat registration.
 
-Given that the forward is ~1% of wall time, `sdpa` buys under 1% end to end for
-that risk. It is retained as an opt-in flag for score-only ranking, and should
-not be used otherwise. **This also stands as an independent observation about
-Talea itself:** the wedge period call can be near-degenerate between aliased
-candidates, so period- and unit-derived quantities are less stable than the
-discovery score. That is a property of the method, not of this branch — the
-reference implementation is equally susceptible to it under any input
-perturbation.
+**Corrected 2026-07-29 — sdpa is not measurably less accurate.** The paragraph
+above was written from that single 4-record run and over-read it. A 120-record
+benchmark against constructed ground truth (job 1161577, see
+`../perf/PERIOD_RECOVERY_BENCHMARK.md`) puts the two modes level:
+
+| mode | exact period | 2× alias | median \|log2 err\| |
+|---|---:|---:|---:|
+| manual | 62/120 | 41 | 0.044 |
+| sdpa | 59/120 | 42 | 0.074 |
+
+Head to head: manual closer on 3, sdpa closer on 3, **tied on 114**. The
+ankyrin case was one draw from a noisy process, not a demonstration that sdpa
+degrades calls.
+
+`manual` remains the default, but for **reproducibility, not accuracy**: it is
+bit-identical to the frozen reference and sdpa is not, and sdpa's forward
+speedup is worth <1% end to end, so there is nothing to trade for.
+
+What that benchmark did establish is a property of Talea itself, present equally
+in the reference: **the period call aliases upward in ~34% of cases** (41/120
+exactly 2×, 0/120 at 0.5×), which halves the reported unit count. It is driven
+by array length and, counterintuitively, is *worse* for low-divergence repeats.
+See the benchmark note; it bears on period- and unit-derived analyses regardless
+of which capture mode is used.
 
 ### C2. `diagonal_mean_profile` — `talea/attention.py`
 
