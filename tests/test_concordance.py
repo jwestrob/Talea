@@ -320,3 +320,70 @@ def test_hidden_state_source_resolution_reproduces_the_frozen_offset():
 def test_hidden_state_source_resolution_rejects_out_of_range():
     with pytest.raises(ValueError):
         resolve_hidden_state_sources((36,), n_blocks=36)
+
+
+# ------------------------------------------------------- L6: postprocess pool
+def test_postprocess_worker_module_stays_free_of_torch():
+    """The worker's import graph is a performance contract, not a detail.
+
+    talea.inference costs 16.06 s to import cold (torch + transformers) against
+    1.13 s for talea.topology. When the worker entry point lived in
+    talea.inference, every spawned worker paid that and the process pool ran at
+    0.27x of serial. Importing torch here would silently reintroduce it.
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "talea" / "postprocess_pool.py"
+    ).read_text()
+    for banned in ("import torch", "import transformers", "from talea.inference"):
+        assert banned not in source, f"{banned} would re-inflate worker startup"
+    for banned in ("talea.production", "talea.model", "talea.artifacts"):
+        assert banned not in source, f"{banned} transitively imports torch"
+
+
+def test_postprocess_pool_context_never_preloads_main():
+    """Preloading __main__ is multiprocessing's default and breaks REPL callers."""
+    from talea.inference import postprocess_pool_context
+
+    context = postprocess_pool_context()
+    assert context.get_start_method() in ("forkserver", "spawn")
+    assert "fork" != context.get_start_method(), (
+        "plain fork after CUDA initialization is unsafe"
+    )
+
+
+def test_postprocess_worker_requires_initialization():
+    import talea.postprocess_pool as pool_module
+
+    saved = pool_module._CONFIGS
+    pool_module._CONFIGS = None
+    try:
+        with pytest.raises(RuntimeError, match="not initialized"):
+            pool_module.run_record(({}, {}, ()))
+    finally:
+        pool_module._CONFIGS = saved
+
+
+def test_worker_entry_point_reproduces_direct_call():
+    """run_record must be arithmetically identical to process_attention_record."""
+    import talea.postprocess_pool as pool_module
+
+    task = build_task(300, seed=77)
+    direct = process_attention_record(task)
+    configs = {
+        key: task[key]
+        for key in (
+            "protein_calibration",
+            "local_calibration",
+            "wedge_config",
+            "operational_config",
+        )
+    }
+    saved = pool_module._CONFIGS
+    pool_module.initialize_worker(configs)
+    try:
+        viaworker = pool_module.run_record(
+            (task["metadata"], task["matrices"], task["window_sizes"])
+        )
+    finally:
+        pool_module._CONFIGS = saved
+    assert direct == viaworker

@@ -27,8 +27,36 @@ Measured gains:
 | CPU postprocess, L=1000 | 3.31 s | 1.33 s | 2.48× |
 | CPU postprocess, L=2046 | 7.93 s | 3.68 s | 2.16× |
 | `best_harmonic_comb`, L=1024 | 26.1 ms | 1.65 ms | 15.9× |
-| Retained attention VRAM, L=2046 | 5.06 GB | 288 MB | −4.78 GB |
-| Retained hidden-state VRAM | 166 MB | 9 MB | −157 MB |
+| Peak forward VRAM, L=2046 (H200, measured) | 5.78 GB | 179 MB | **32.2×** |
+| Peak forward+matrix VRAM, L=2046 | 6.06 GB | 453 MB | 13.4× |
+
+---
+
+## GPU measurements (H200, job 1161567)
+
+`torch.cuda.max_memory_allocated` over the ESM++ forward, batch of 1, fp16:
+
+| L | reference | manual | reduction |
+|---:|---:|---:|---:|
+| 256 | 116.1 MB | 9.0 MB | 12.8× |
+| 512 | 414.4 MB | 16.8 MB | 24.7× |
+| 1024 | 1500.0 MB | 53.0 MB | 28.3× |
+| 1732 | 4199.3 MB | 133.0 MB | 31.6× |
+| 2046 | 5780.8 MB | 179.3 MB | 32.2× |
+
+The predicted attention-tuple saving was 5.06 GB; the measured forward-peak drop
+at L=2046 is 5.60 GB, the balance being the hidden-state tuple and the manual
+kernel's transient score matrices.
+
+**The forward is not the bottleneck.** At L=2046 the forward takes 0.038 s
+against ~3.7 s of CPU postprocess — the pipeline is roughly **99% CPU**. Two
+consequences: (i) `sdpa` mode's 1.53× on the forward (0.038 s → 0.025 s) is worth
+well under 1% end to end, and (ii) raising `square_budget` to exploit the freed
+VRAM buys little until postprocessing is parallelized. The VRAM headroom's real
+value is removing OOM risk at the length ceiling, not speed.
+
+**GPU concordance.** A four-record CUDA/fp16 CLI run is byte-identical between
+trees under `manual`: sha256 `0451e1e24c948930a38b9b5701dfe3ba0cfdee0db0cf2131b59c64a006725b7b`.
 
 ---
 
@@ -66,12 +94,38 @@ asserted in tests and verified against the model's own tuples in
 `perf/validate_capture.py`. Attention indexing has no such offset —
 `attentions[i]` is block `i`.
 
-**C1-risk.** `sdpa` mode changes the kernel for 34 layers whose outputs feed the
-two that are captured, so scores drift. Measured on the 3-record set:
-attention max|Δ| 2.5e-6, hidden max|Δ| 4.2e-5, `talea_discovery_score` changing
-in the 5th–6th decimal (e.g. 1.917449468755 → 1.917468308181). That is far below
-any calling threshold but is **not** reproducible against frozen artifacts. Use
-`manual` for anything that must match published numbers.
+**C1-risk — `sdpa` mode is not recommended, and the reason is not the score.**
+Changing the kernel for the 34 uncaptured layers perturbs their outputs by
+~1e-6 (attention) and ~4e-5 (hidden). On the primary score that is invisible:
+`talea_discovery_score` moves in the 5th–6th decimal, far below any threshold.
+
+But the *auxiliary* outputs are not that stable. On a GPU/fp16 run over four
+records (job 1161567), the `ank_like_repeat` record — a 29-aa ankyrin motif
+repeated eight times, the most biologically realistic case in the set — changed
+qualitatively:
+
+| field | reference | sdpa |
+|---|---:|---:|
+| `talea_discovery_score` | 2.9854223191 | 2.9856440605 |
+| `registration.n_units` | **6** | **4** |
+| `registration.period` | **42.5** | **63.5** |
+| `registration.phase_offset` | 31.0 | 51.0 |
+| `wedge_call.period` | 42.5 | 63.5 |
+| `wedge_call.score` | 12.78 | 10.47 |
+
+A 1e-6 perturbation selected a different period candidate and therefore a
+different repeat registration. A score-ranked screen would not notice; anything
+consuming `period`, `n_units`, or `registration.units` — copy-number variation,
+period stability, unit extraction for alignments — would get different biology.
+
+Given that the forward is ~1% of wall time, `sdpa` buys under 1% end to end for
+that risk. It is retained as an opt-in flag for score-only ranking, and should
+not be used otherwise. **This also stands as an independent observation about
+Talea itself:** the wedge period call can be near-degenerate between aliased
+candidates, so period- and unit-derived quantities are less stable than the
+discovery score. That is a property of the method, not of this branch — the
+reference implementation is equally susceptible to it under any input
+perturbation.
 
 ### C2. `diagonal_mean_profile` — `talea/attention.py`
 
@@ -161,6 +215,33 @@ The storage contract is already fp16 (`decoder_matrix_storage_dtype`), but the
 matrix was transferred as fp32 and quantized on the host. Casting first halves
 the transfer (16 MB → 8 MB per matrix per layer at L=2046). Bit-exact — asserted
 equal to the host-side round trip, since both are IEEE round-to-nearest-even.
+
+### C9. Process-based postprocessing — `talea/postprocess_pool.py` (new)
+
+**Problem.** C4 works around the GIL convoy by defaulting to one worker; it does
+not let Talea use more than one core for the ~99% of wall time spent in
+postprocessing.
+
+**Change.** `--postprocess-mode process` runs postprocessing in a
+`ProcessPoolExecutor`. Two details make the difference between a speedup and a
+slowdown, and both are recorded because they are easy to reintroduce:
+
+1. **The worker module must not import torch.** The first implementation put the
+   worker entry point in `talea.inference`, whose cold import costs **16.06 s**
+   (torch + transformers) against **1.13 s** for `talea.topology`. Every worker
+   paid it, and the pool ran at **0.27×** of serial. Moving the entry point to
+   the torch-free `talea/postprocess_pool.py` and preloading it took the same
+   benchmark to **3.46×** on four workers. `tests/test_concordance.py` asserts
+   the module's import graph stays clean.
+2. **`forkserver`, not `spawn` or `fork`.** The forkserver is launched as a fresh
+   interpreter, so workers never inherit the parent's CUDA context (plain `fork`
+   after CUDA init is unsafe), and preloading the worker module means each worker
+   forks from it almost for free. The preload list is deliberately *not*
+   `['__main__']` — that is multiprocessing's default and it breaks any caller
+   whose `__main__` is not importable, e.g. a REPL or a heredoc.
+
+**Numerics.** Bit-exact — worker output is asserted identical to a direct
+`process_attention_record` call, and the pooled result identical to serial.
 
 ### C8. `empty_cache()` / `gc.collect()` no longer per batch — `talea/inference.py`
 

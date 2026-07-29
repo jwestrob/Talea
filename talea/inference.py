@@ -6,6 +6,7 @@ import concurrent.futures
 import gc
 import hashlib
 import json
+import multiprocessing
 import os
 import sys
 import time
@@ -22,6 +23,7 @@ from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_ass
 from talea.capture import selective_capture
 from talea.io import SequenceRecord
 from talea.model import AttentionStateTeacherUNet
+from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
     global_head_probabilities,
@@ -67,6 +69,27 @@ def resolve_dtype(
     if name not in values:
         raise ValueError(f"unsupported inference dtype: {name}")
     return name, values[name]
+
+
+POSTPROCESS_MODES = ("thread", "process")
+
+
+def postprocess_pool_context():
+    """Multiprocessing context for the postprocess pool.
+
+    ``forkserver`` where available: the server is a fresh interpreter (so it
+    never inherits the parent's CUDA context) that preloads the torch-free
+    worker module once, after which each worker forks from it almost for free.
+    ``spawn`` elsewhere -- correct but pays the import per worker.
+    """
+    if "forkserver" in multiprocessing.get_all_start_methods():
+        context = multiprocessing.get_context("forkserver")
+        # Deliberately NOT ['__main__']: preloading the caller's main module is
+        # the default, is unnecessary here, and breaks callers whose __main__ is
+        # not importable (a REPL or a heredoc).
+        context.set_forkserver_preload(["talea.postprocess_pool"])
+        return context
+    return multiprocessing.get_context("spawn")
 
 
 _SEPARATION_MASK_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
@@ -314,13 +337,21 @@ class TaleaPredictor:
         progress: bool = False,
         capture_mode: str = "manual",
         cache_clear_interval: int = 0,
+        postprocess_mode: str = "thread",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
 
-        ``postprocess_workers`` defaults to 1: the postprocessing is dominated
-        by many small NumPy calls that hold the GIL, so a thread pool convoys
-        rather than scales (measured 0.57x at four workers). See
+        ``postprocess_workers`` defaults to 1 because the default
+        ``postprocess_mode="thread"`` cannot scale: the postprocessing is
+        dominated by many small NumPy calls that hold the GIL, so a thread pool
+        convoys rather than parallelizes (measured 0.52x at four workers). See
         perf/bench_threads.py.
+
+        ``postprocess_mode="process"`` sidesteps the GIL entirely and is the
+        way to use more than one core. It is spawn-based, so workers never
+        inherit the parent's CUDA context; the cost is a one-off interpreter
+        start per worker plus pickling each record's matrices (8-16 MB at
+        maximum length, against seconds of compute).
 
         ``capture_mode`` selects the attention-capture strategy in
         talea.capture; "manual" preserves the frozen numerics exactly.
@@ -335,6 +366,8 @@ class TaleaPredictor:
         self._validate_records(values)
         if postprocess_workers < 1:
             raise ValueError("postprocess worker count must be positive")
+        if postprocess_mode not in POSTPROCESS_MODES:
+            raise ValueError(f"unsupported postprocess mode: {postprocess_mode}")
         ordered = sorted(values, key=lambda value: (value.length, value.record_id))
         batches = list(make_batches(ordered, square_budget, maximum_batch))
         completed = 0
@@ -349,9 +382,18 @@ class TaleaPredictor:
         minimum_separation = int(
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
         )
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=postprocess_workers
-        ) as pool, torch.inference_mode(), selective_capture(
+        if postprocess_mode == "process":
+            pool_context = concurrent.futures.ProcessPoolExecutor(
+                max_workers=postprocess_workers,
+                mp_context=postprocess_pool_context(),
+                initializer=initialize_worker,
+                initargs=(self.configs,),
+            )
+        else:
+            pool_context = concurrent.futures.ThreadPoolExecutor(
+                max_workers=postprocess_workers
+            )
+        with pool_context as pool, torch.inference_mode(), selective_capture(
             self.esm_model,
             self.expected_layers,
             self.expected_layers,
@@ -422,15 +464,21 @@ class TaleaPredictor:
                             self.expected_layers,
                         )
                     )
-                    future = pool.submit(
-                        process_attention_record,
-                        {
-                            "metadata": record.metadata(),
-                            "matrices": matrices,
-                            "window_sizes": window_sizes,
-                            **self.configs,
-                        },
-                    )
+                    if postprocess_mode == "process":
+                        future = pool.submit(
+                            run_record,
+                            (record.metadata(), matrices, window_sizes),
+                        )
+                    else:
+                        future = pool.submit(
+                            process_attention_record,
+                            {
+                                "metadata": record.metadata(),
+                                "matrices": matrices,
+                                "window_sizes": window_sizes,
+                                **self.configs,
+                            },
+                        )
                     compact.append((record, matrices, future))
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows

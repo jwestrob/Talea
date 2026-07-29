@@ -57,6 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--postprocess-mode",
+        choices=("thread", "process"),
+        default="thread",
+        help=(
+            "how to parallelize postprocessing. 'thread' cannot scale past one "
+            "worker (GIL); use 'process' with --postprocess-workers > 1 to "
+            "actually use more cores."
+        ),
+    )
+    parser.add_argument(
         "--capture-mode",
         choices=("manual", "sdpa"),
         default="manual",
@@ -133,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                 progress=not args.quiet,
                 capture_mode=args.capture_mode,
                 cache_clear_interval=args.cache_clear_interval,
+                postprocess_mode=args.postprocess_mode,
             ):
                 handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
                 completed += 1
@@ -161,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         "dtype": predictor.dtype_name,
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
+        "postprocess_mode": args.postprocess_mode,
         "model_loaded_seconds": predictor.loaded_seconds,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",
