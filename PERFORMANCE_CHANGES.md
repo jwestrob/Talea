@@ -261,12 +261,13 @@ degrades calls.
 bit-identical to the frozen reference and sdpa is not, and sdpa's forward
 speedup is worth <1% end to end, so there is nothing to trade for.
 
-What that benchmark did establish is a property of Talea itself, present equally
-in the reference: **the period call aliases upward in ~34% of cases** (41/120
-exactly 2×, 0/120 at 0.5×), which halves the reported unit count. It is driven
-by array length and, counterintuitively, is *worse* for low-divergence repeats.
-See the benchmark note; it bears on period- and unit-derived analyses regardless
-of which capture mode is used.
+That synthetic benchmark also reported a ~34% upward period-alias rate. **That
+figure has since been withdrawn** (2026-07-29): measured against real external
+ground truth — 1,848 RepeatsDB-annotated proteins, homology controlled — the 2×
+alias rate among records Talea calls is **1.7%**, and ~50% of periods are exact
+with median error ~4%. The 34% was an artifact of perfect tandem repeats. See
+`../perf/REPEATSDB_PERIOD_BENCHMARK.md`, which supersedes the synthetic result
+for any claim about real proteins.
 
 ### C2. `diagonal_mean_profile` — `talea/attention.py`
 
