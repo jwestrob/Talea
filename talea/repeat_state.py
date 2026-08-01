@@ -50,16 +50,60 @@ def residue_labels_from_runs(length: int, runs: Sequence[Sequence[int]]) -> np.n
     return labels
 
 
+NORMALIZATION_SCOPES = ("matrix", "band")
+
+
+def _normalization_positive_values(
+    values, scope: str, band: int
+):
+    """Entries used to set the normalization scale.
+
+    ``matrix`` -- every positive entry of the L x L map (the v0/v2 behaviour).
+
+    ``band``   -- only entries at separations the teacher can actually see.
+    The teacher scores 128x128 tiles down the diagonal, so it never observes
+    |i - j| >= tile_size. The near-diagonal band is O(L) entries out of O(L^2),
+    so under ``matrix`` scope its share of the map falls as ~1/L (measured:
+    51.6% of entries at L=200, 5.7% at L=2046). The 0.95 quantile therefore
+    slides off the band into background as proteins get longer, the scale
+    shrinks, and the band's normalized intensity inflates 2.5x from length
+    alone. Restricting the quantile to the band removes that: measured
+    inflation over the same range falls from 2.54x to 1.15x.
+    See perf/WHY_LENGTH_BIAS.md.
+    """
+    import numpy as _np
+
+    if scope not in NORMALIZATION_SCOPES:
+        raise ValueError(f"unsupported normalization scope: {scope}")
+    if scope == "matrix":
+        return values[values > 0]
+    if band < 2:
+        raise ValueError("normalization band must be at least 2")
+    length = values.shape[0]
+    offsets = range(1, min(int(band), length))
+    parts = [_np.diagonal(values, offset=k) for k in offsets]
+    if not parts:
+        return values[values > 0]
+    selected = _np.concatenate(parts)
+    return selected[selected > 0]
+
+
 def robust_attention_channel(
     matrix: np.ndarray,
     quantile: float = 0.95,
     clip: float = 8.0,
+    scope: str = "matrix",
+    band: int = 128,
 ) -> np.ndarray:
     """Normalize a nonnegative APC attention matrix without using labels.
 
     Positive entries are scaled by a within-protein upper quantile, transformed
     with ``log1p``, and clipped.  This removes most protein-length and raw-layer
     scale variation while retaining sparse high-attention texture.
+
+    ``scope`` selects which entries set that quantile; see
+    ``_normalization_positive_values``. ``matrix`` reproduces the frozen v2
+    behaviour exactly and remains the default.
     """
 
     values = np.asarray(matrix, dtype=np.float32)
@@ -73,7 +117,7 @@ def robust_attention_channel(
         raise ValueError("quantile must be in [0.5, 1)")
     if clip <= 0:
         raise ValueError("clip must be positive")
-    positive = values[values > 0]
+    positive = _normalization_positive_values(values, scope, band)
     if not positive.size:
         return np.zeros_like(values, dtype=np.float32)
     scale = float(np.quantile(positive, quantile))
@@ -90,13 +134,17 @@ def attention_channels(
     matrices: Sequence[np.ndarray],
     quantile: float = 0.95,
     clip: float = 8.0,
+    scope: str = "matrix",
+    band: int = 128,
 ) -> np.ndarray:
     """Stack consistently sized robust attention channels."""
 
     if not matrices:
         raise ValueError("at least one attention matrix is required")
     channels = [
-        robust_attention_channel(matrix, quantile=quantile, clip=clip)
+        robust_attention_channel(
+            matrix, quantile=quantile, clip=clip, scope=scope, band=band
+        )
         for matrix in matrices
     ]
     shapes = {channel.shape for channel in channels}
