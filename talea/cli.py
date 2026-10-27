@@ -98,6 +98,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unit-placement",
+        choices=("phase-ssm", "comb"),
+        default="phase-ssm",
+        help=(
+            "how registered repeat units are placed. 'phase-ssm' (default) "
+            "decodes units from per-residue helix/strand/loop phase votes with a "
+            "state-space model; 'comb' keeps the equal-period comb and "
+            "reproduces v0.1.0 output exactly. Scores are identical under both."
+        ),
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help=(
@@ -143,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
         deterministic=args.deterministic,
+        unit_placement=args.unit_placement,
     )
     completed = 0
     try:
@@ -186,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
         "deterministic": args.deterministic,
+        "unit_placement": args.unit_placement,
         "model_loaded_seconds": predictor.loaded_seconds,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",

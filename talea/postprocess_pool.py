@@ -42,8 +42,9 @@ def initialize_worker(configs: dict) -> None:
         os.environ.setdefault(variable, "1")
 
 
-def run_record(payload: tuple[dict, dict, tuple[int, ...]]) -> dict:
-    metadata, matrices, window_sizes = payload
+def run_record(payload: tuple) -> dict:
+    """Postprocess ``(metadata, matrices, window_sizes[, probabilities])``."""
+    metadata, matrices, window_sizes, *rest = payload
     if _CONFIGS is None:
         raise RuntimeError("postprocess worker was not initialized")
     return process_attention_record(
@@ -51,6 +52,7 @@ def run_record(payload: tuple[dict, dict, tuple[int, ...]]) -> dict:
             "metadata": metadata,
             "matrices": matrices,
             "window_sizes": window_sizes,
+            "residue_structure_probabilities": rest[0] if rest else None,
             **_CONFIGS,
         }
     )

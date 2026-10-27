@@ -23,6 +23,7 @@ from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_ass
 from talea.capture import selective_capture
 from talea.io import SequenceRecord
 from talea.model import AttentionStateTeacherUNet
+from talea.phase_ssm import probe_parameters, runtime_config
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
@@ -72,6 +73,7 @@ def resolve_dtype(
 
 
 POSTPROCESS_MODES = ("thread", "process")
+UNIT_PLACEMENTS = ("phase-ssm", "comb")
 
 
 def enable_deterministic_convolution() -> None:
@@ -252,8 +254,19 @@ class TaleaPredictor:
         trust_remote_code: bool = False,
         local_files_only: bool = False,
         deterministic: bool = False,
+        unit_placement: str = "phase-ssm",
     ):
+        """``unit_placement`` chooses how registered repeat units are placed.
+
+        "phase-ssm" (default) re-places the units of every registration with the
+        phase-aware state-space decoder in talea.phase_ssm; "comb" keeps the
+        equal-period comb, reproducing v0.1.0 output exactly. Detection scores
+        and topology diagnostics are identical under both.
+        """
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        if unit_placement not in UNIT_PLACEMENTS:
+            raise ValueError(f"unsupported unit placement: {unit_placement}")
+        self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
         if self.deterministic:
             enable_deterministic_convolution()
@@ -281,6 +294,11 @@ class TaleaPredictor:
                 self.assets.topology_config.read_text()
             ),
         }
+        self.phase_ssm = None
+        if self.unit_placement == "phase-ssm":
+            phase_asset = json.loads(self.assets.phase_ssm.read_text())
+            self.phase_ssm = phase_asset
+            self.configs["phase_ssm"] = runtime_config(phase_asset)
         self.global_bundle = joblib.load(self.assets.global_model)
         _validate_global_bundle(self.global_bundle, self.deployment)
         self.loaded_at = time.time()
@@ -325,6 +343,38 @@ class TaleaPredictor:
             raise ValueError(
                 "teacher layers disagree with the ESM++ deployment contract"
             )
+        self.probe_layer = None
+        if self.phase_ssm is not None:
+            weights, bias = probe_parameters(self.phase_ssm)
+            self.probe_layer = int(
+                self.phase_ssm["probes"]["hidden_state_layer_zero_based"]
+            )
+            if self.probe_layer not in self.expected_layers:
+                raise ValueError("phase-SSM probe layer is not captured")
+            self.probe_weights = torch.as_tensor(
+                weights, dtype=torch.float32, device=self.device
+            )
+            self.probe_bias = torch.as_tensor(
+                bias, dtype=torch.float32, device=self.device
+            )
+
+    def residue_structure_probabilities(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        indices: torch.Tensor,
+        batch_position: int,
+    ) -> np.ndarray | None:
+        """Per-residue helix/strand/loop probabilities from the layer-35 probes."""
+
+        if self.probe_layer is None:
+            return None
+        residues = (
+            hidden_states[self.probe_layer][batch_position]
+            .index_select(0, indices)
+            .to(torch.float32)
+        )
+        logits = residues @ self.probe_weights + self.probe_bias
+        return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
 
     @property
     def maximum_length(self) -> int:
@@ -493,10 +543,13 @@ class TaleaPredictor:
                             self.expected_layers,
                         )
                     )
+                    probabilities = self.residue_structure_probabilities(
+                        hidden_states, indices, batch_position
+                    )
                     if postprocess_mode == "process":
                         future = pool.submit(
                             run_record,
-                            (record.metadata(), matrices, window_sizes),
+                            (record.metadata(), matrices, window_sizes, probabilities),
                         )
                     else:
                         future = pool.submit(
@@ -505,6 +558,7 @@ class TaleaPredictor:
                                 "metadata": record.metadata(),
                                 "matrices": matrices,
                                 "window_sizes": window_sizes,
+                                "residue_structure_probabilities": probabilities,
                                 **self.configs,
                             },
                         )
