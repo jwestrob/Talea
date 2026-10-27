@@ -12,6 +12,11 @@ ASSET_ROOT = Path(__file__).resolve().parent / "assets"
 DEPLOYMENT_SHA256 = (
     "7aa5b7f320323b34d2db27b0df488732d1fcec39d72e2d0f5b774ebec1edea2e"
 )
+# Unit placement (v0.2.0) sits outside the frozen detection contract, so its
+# asset is pinned here rather than in deployment.json.
+PHASE_SSM_SHA256 = (
+    "fecba553557eef59dae2b0b1b12982c21563c9d26c73c29c079638f685724595"
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -46,6 +51,7 @@ class RuntimeAssets:
     local_calibration: Path
     wedge_config: Path
     topology_config: Path
+    phase_ssm: Path
     sha256: dict[str, str]
 
 
@@ -59,6 +65,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         "local_calibration": ASSET_ROOT / "local_calibration.json",
         "wedge_config": ASSET_ROOT / "wedge_config.json",
         "topology_config": ASSET_ROOT / "topology_config.json",
+        "phase_ssm": ASSET_ROOT / "phase_ssm.json",
     }
     expected = {
         "teacher_model": deployment["teacher_model"]["sha256"],
@@ -76,6 +83,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         "topology_config": deployment["topology_dependencies"][
             "operational_config"
         ]["sha256"],
+        "phase_ssm": PHASE_SSM_SHA256,
     }
     observed: dict[str, str] = {}
     for name, path in paths.items():
@@ -96,5 +104,6 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         local_calibration=paths["local_calibration"],
         wedge_config=paths["wedge_config"],
         topology_config=paths["topology_config"],
+        phase_ssm=paths["phase_ssm"],
         sha256=observed,
     )

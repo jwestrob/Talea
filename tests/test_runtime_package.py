@@ -25,6 +25,7 @@ def test_deployment_and_runtime_artifacts_verify() -> None:
         "local_calibration",
         "wedge_config",
         "topology_config",
+        "phase_ssm",
     }
 
 
