@@ -77,7 +77,10 @@ flowchart LR
     ZG --> T
 
     A --> L["Auxiliary topology decoder"]
-    L --> O["Interval · period · units"]
+    E --> P["Layer 35 residue states<br/>helix/strand/loop probes"]
+    L --> U["Phase-SSM<br/>unit placement"]
+    P --> U
+    U --> O["Interval · period · units"]
 ```
 
 One ESM++ pass supplies both branches:
@@ -99,6 +102,15 @@ One ESM++ pass supplies both branches:
    periods and intervals. Talea then registers translated units and evaluates
    terminal closure and plausible boundaries. These outputs support
    localization and interpretation but do not enter the primary v2 rank.
+4. **Unit placement.** Within the registered extent, Talea 0.2.0 places repeat
+   units with a phase-aware state-space decoder. Three linear probes on the
+   layer-35 hidden states give per-residue helix, strand, and loop
+   probabilities. Demodulating each track at the registered period gives every
+   residue a vote for its position within a unit. A hidden semi-Markov model
+   then decodes units of locally varying length (0.6–1.6 × period) whose phase
+   agrees with the votes and whose length is supported by attention stacking.
+   Scores, the wedge interval, the period, closure, and the boundary scan are
+   computed before this step and are exactly those of v0.1.0.
 
 The frozen primary score is the unweighted mean of the two independently
 standardized protein views:
@@ -207,7 +219,12 @@ Talea writes:
 | `--dtype` | `auto`, `fp16`, `fp32`, or `bf16` | `auto` |
 | `--maximum-batch` | Maximum proteins per padded ESM++ batch | 64 |
 | `--square-budget` | Upper bound on batch size × padded sequence length² | 4,000,000 |
-| `--postprocess-workers` | CPU threads for topology decoding | up to 4 |
+| `--postprocess-workers` | CPU workers for topology decoding | 1 |
+| `--postprocess-mode` | `thread`, or `process` to scale across CPU cores | `thread` |
+| `--capture-mode` | `manual` (numerically identical to the frozen run) or `sdpa` (faster, small numerical drift) | `manual` |
+| `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
+| `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
+| `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
 | `--trust-remote-code` | Permit the pinned ESM++ model implementation to load | off |
 | `--local-files-only` | Use only the local Hugging Face cache | off |
 | `--overwrite` | Replace an existing output and audit | off |
@@ -243,6 +260,7 @@ for prediction in predictor.iter_predictions(records, progress=True):
     )
 ```
 
+`TaleaPredictor(unit_placement="comb")` reproduces v0.1.0 unit boundaries.
 Load one `TaleaPredictor` and reuse it. Starting multiple processes on the same
 GPU duplicates ESM++ and its attention buffers.
 
@@ -286,8 +304,10 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `status` | `ok` when a wedge was localized; otherwise `no_wedge_call` |
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
-| `registration.units` | Proposed repeat-unit boundaries around the wedge |
-| `closure` | Terminal-to-adjacent attention summary for registered units |
+| `registration.units` | Repeat-unit boundaries in the registered extent |
+| `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
+| `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
+| `closure` | Terminal-to-adjacent attention summary for the equal-period units |
 | `boundary_scan` | Alternative plausible boundary-pair diagnostics |
 | `frozen_spectrum` | Layer-specific harmonic attention summaries |
 | `length_scope` | Evaluation-length boundary and extrapolation flag |
@@ -321,7 +341,11 @@ length-sorts inputs and constrains batches by
 - Lower `--square-budget` if a GPU runs out of memory.
 - Lower `--maximum-batch` when screening many short proteins.
 - `--postprocess-workers` controls CPU-only topology work and does not load
-  additional ESM++ copies.
+  additional ESM++ copies. Pair it with `--postprocess-mode process` to use
+  several cores.
+- ESM++ runs with selective capture: Talea retains only the two attention
+  layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under the default
+  `--capture-mode manual`, output is byte-identical to the full-capture path.
 - Attention matrices, residue embeddings, and residue-state tracks are reduced
   in memory and are not retained on disk.
 - For reproducibility and memory efficiency, run one Talea process per GPU.
@@ -472,6 +496,34 @@ independent validation. The point estimates are competitive, the paired
 intervals do not distinguish the methods, and the lower absolute performance
 under structural and ontology shift is an important scope limit.
 
+### Repeat-unit placement
+
+Unit placement was evaluated on a RepeatsDB class 3 repeat-extraction
+benchmark built by Kinsey Long: solenoid entries from PDB and AlphaFold DB with
+curated unit boundaries, split by homology component into development (2,286
+records) and test (571 records, 466 unique sequences) partitions. Every method
+choice used development records. The test partition was scored once, under a
+plan whose SHA256 was recorded before any test label was read. A predicted
+boundary counts as correct within ±5 residues of a curated one; PDB and
+AlphaFold DB records carry equal weight, and intervals are paired bootstrap
+95% CIs over homology components.
+
+| Test partition (571 proteins) | Boundary F1 |
+|---|---:|
+| Equal-period comb (v0.1.0) | 0.375 |
+| Phase votes on an equal-period comb | 0.488 |
+| Phase-SSM (v0.2.0) | **0.549** |
+
+Phase-SSM minus comb: +0.173 [+0.124, +0.223]; the state-space decode
+contributes +0.061 [+0.036, +0.087] over the same votes on a comb. Region F1 is
+0.90 for both, since both use the same extent. Per protein, by RepeatsDB
+subclass (comb → phase-SSM): α-solenoids (3.3, n = 394) 0.42 → 0.59;
+α/β-solenoids (3.2, n = 88) 0.37 → 0.64; β-solenoids (3.1, n = 71)
+0.44 → 0.49; subclass 3.4 (n = 18) 0.49 → 0.43.
+
+Ian Holmes suggested the state-space formulation. Kinsey Long built the
+repeat-extraction benchmark and the helix/strand/loop probes.
+
 ## Limitations
 
 - Talea ranks candidates; it does not make curated structural or biological
@@ -487,7 +539,11 @@ under structural and ontology shift is an important scope limit.
   confirm stable v2 because this cohort had already been opened when v2 was
   formulated.
 - Candidate periods can have harmonic or subharmonic aliases. Treat the
-  reported period and unit registration as hypotheses for inspection.
+  reported period and unit registration as hypotheses for inspection. Unit
+  placement inherits the period and extent, so an aliased period yields units
+  at the aliased length.
+- Unit placement gains are largest for α and α/β solenoids, where helix and
+  loop probabilities oscillate strongly within each unit.
 - The 1,733–2,046-aa range is a declared length extrapolation, and proteins
   above 2,046 aa are not accepted.
 - Runtime and memory scale quadratically with sequence length.
@@ -504,6 +560,7 @@ The released tool is intentionally inference-only. It contains:
 - runtime source under `talea/`;
 - a frozen 132-KB attention head;
 - a frozen 2.4-MB global head;
+- an 87-KB unit-placement asset (probes, phase coefficients, decoder settings);
 - calibration and deployment contracts;
 - checksum verification for every bundled artifact;
 - focused unit and integration tests; and
@@ -519,6 +576,7 @@ Key frozen provenance:
 | Deployment contract | `7aa5b7f320323b34d2db27b0df488732d1fcec39d72e2d0f5b774ebec1edea2e` |
 | Residue-state teacher head | `130840931f4f8be768f2789cbe8a5db8bc2611fd5605fc797f1023156d4c625e` |
 | Global head | `8701dad34e3392a0f84884e88d0bf3e9741a75903882ec7658bbb8b2fb2161de` |
+| Unit-placement asset | `fecba553557eef59dae2b0b1b12982c21563c9d26c73c29c079638f685724595` |
 | Pinned ESM++ revision | `f813401638b3fddab09748aec1ad2bf537aa4208` |
 | External ESM++ weight file | `4aff3f8c5de68c4d3e3824eb2c478e4a47355d3f849f3c745e5c8a5ee6cff851` |
 
