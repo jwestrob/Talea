@@ -224,7 +224,7 @@ Talea writes:
 | `--capture-mode` | `manual` (numerically identical to the frozen run) or `sdpa` (faster, small numerical drift) | `manual` |
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
-| `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
+| `--unit-placement` | `phase-ssm`; `start-trim` (experimental, see [Repeat-unit placement](#repeat-unit-placement)); or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
 | `--trust-remote-code` | Permit the pinned ESM++ model implementation to load | off |
 | `--local-files-only` | Use only the local Hugging Face cache | off |
 | `--overwrite` | Replace an existing output and audit | off |
@@ -305,7 +305,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
 | `registration.units` | Repeat-unit boundaries in the registered extent |
-| `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
+| `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode; under `start-trim`, `start_trim` or `start_trim_comb` (trimmed comb) |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
 | `closure` | Terminal-to-adjacent attention summary for the equal-period units |
 | `boundary_scan` | Alternative plausible boundary-pair diagnostics |
@@ -523,6 +523,29 @@ subclass (comb → phase-SSM): α-solenoids (3.3, n = 394) 0.42 → 0.59;
 
 Ian Holmes suggested the state-space formulation. Kinsey Long built the
 repeat-extraction benchmark and the helix/strand/loop probes.
+
+#### Experimental: `--unit-placement start-trim`
+
+Two further linear probes on the same layer-35 states mark unit starts and
+residues inside a curated repeat region (`talea/assets/start_trim.json`).
+Extents with mean predicted helix probability ≥ 0.2 decode units from
+attention stacking plus a unit-start term, with phase votes off; other extents
+keep the phase-SSM decode. End units whose mean repeat-region score falls below
+a threshold are then dropped, keeping at least three. The trim targets Talea's
+registered extent, which on development records overshoots the curated repeat
+by about three units in α-solenoids and five in β-solenoids.
+
+| vs phase-SSM (v0.2.0) | Boundary F1 | Matched-unit IoU | Unit-count error |
+|---|---|---|---|
+| Test partition (571; second opening) | 0.548 → 0.601, +0.053 [+0.021, +0.083] | +0.011 [−0.008, +0.029] | 2.56 → 1.42 |
+| Fresh holdout (597; second opening) | 0.425 → 0.451, +0.026 [+0.005, +0.048] | −0.003 [−0.018, +0.012] | 5.63 → 4.02 |
+
+The fresh holdout is a newer set of RepeatsDB class 3 proteins built with the
+same pipeline (median length 782). Both analyses were predeclared with a
+unit-level guard (matched-unit IoU lower bound above −0.01); the test partition
+passed and the fresh holdout did not, so `phase-ssm` stays the default. The
+probes transfer less well to the fresh holdout (unit-start AUROC on
+α-solenoids 0.79 → 0.74).
 
 ## Limitations
 

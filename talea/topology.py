@@ -8,7 +8,7 @@ import numpy as np
 
 from talea.application import frozen_operational_scores, frozen_spectrum_score
 from talea.attention import scan_attention_matrix, score_attention_window
-from talea.phase_ssm import apply_placement, place_units
+from talea.phase_ssm import apply_placement, place_units, place_units_start_trim
 from talea.unit_registration import (
     register_periodic_units,
     registered_closure_score,
@@ -198,11 +198,24 @@ def process_attention_record(task: dict) -> dict:
         # above describe the comb registration and are unchanged by it.
         phase_config = task.get("phase_ssm")
         probabilities = task.get("residue_structure_probabilities")
+        trim_config = task.get("start_trim")
+        boundary_scores = task.get("residue_boundary_scores")
         if phase_config is not None and probabilities is not None:
-            registration = apply_placement(
-                registration,
-                place_units(registration, probabilities, tracks, phase_config),
-            )
+            if trim_config is not None and boundary_scores is not None:
+                units, label = place_units_start_trim(
+                    registration,
+                    probabilities,
+                    boundary_scores,
+                    tracks,
+                    phase_config,
+                    trim_config,
+                )
+                registration = apply_placement(registration, units, method=label)
+            else:
+                registration = apply_placement(
+                    registration,
+                    place_units(registration, probabilities, tracks, phase_config),
+                )
     operational = frozen_operational_scores(
         status,
         boundary_scan,

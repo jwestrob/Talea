@@ -17,6 +17,9 @@ DEPLOYMENT_SHA256 = (
 PHASE_SSM_SHA256 = (
     "fecba553557eef59dae2b0b1b12982c21563c9d26c73c29c079638f685724595"
 )
+START_TRIM_SHA256 = (
+    "35399c7a68fc4d053f29198588c59793f01a1fa332d37932d684826460d918b9"
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -52,6 +55,7 @@ class RuntimeAssets:
     wedge_config: Path
     topology_config: Path
     phase_ssm: Path
+    start_trim: Path
     sha256: dict[str, str]
 
 
@@ -66,6 +70,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         "wedge_config": ASSET_ROOT / "wedge_config.json",
         "topology_config": ASSET_ROOT / "topology_config.json",
         "phase_ssm": ASSET_ROOT / "phase_ssm.json",
+        "start_trim": ASSET_ROOT / "start_trim.json",
     }
     expected = {
         "teacher_model": deployment["teacher_model"]["sha256"],
@@ -84,6 +89,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
             "operational_config"
         ]["sha256"],
         "phase_ssm": PHASE_SSM_SHA256,
+        "start_trim": START_TRIM_SHA256,
     }
     observed: dict[str, str] = {}
     for name, path in paths.items():
@@ -105,5 +111,6 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         wedge_config=paths["wedge_config"],
         topology_config=paths["topology_config"],
         phase_ssm=paths["phase_ssm"],
+        start_trim=paths["start_trim"],
         sha256=observed,
     )

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Experimental `--unit-placement start-trim`.** Unit-start and repeat-region
+  probes on layer 35 (`talea/assets/start_trim.json`): helix-rich extents decode
+  units from attention stacking plus a unit-start term, and end units with a
+  low repeat-region score are trimmed. Boundary F1 vs phase-SSM: +0.053
+  [+0.021, +0.083] on the 571-protein test partition, +0.026 [+0.005, +0.048] on
+  the 597-protein fresh holdout; matched-unit IoU +0.011 and −0.003. Opt-in;
+  the default stays `phase-ssm`.
+
 ## 0.2.0
 
 - **Phase-aware unit placement.** Registered repeat units are now placed by a

@@ -26,6 +26,7 @@ def test_deployment_and_runtime_artifacts_verify() -> None:
         "wedge_config",
         "topology_config",
         "phase_ssm",
+        "start_trim",
     }
 
 

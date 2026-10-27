@@ -23,7 +23,12 @@ from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_ass
 from talea.capture import selective_capture
 from talea.io import SequenceRecord
 from talea.model import AttentionStateTeacherUNet
-from talea.phase_ssm import probe_parameters, runtime_config
+from talea.phase_ssm import (
+    boundary_probe_parameters,
+    probe_parameters,
+    runtime_config,
+    start_trim_config,
+)
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
@@ -73,7 +78,7 @@ def resolve_dtype(
 
 
 POSTPROCESS_MODES = ("thread", "process")
-UNIT_PLACEMENTS = ("phase-ssm", "comb")
+UNIT_PLACEMENTS = ("phase-ssm", "start-trim", "comb")
 
 
 def enable_deterministic_convolution() -> None:
@@ -259,9 +264,11 @@ class TaleaPredictor:
         """``unit_placement`` chooses how registered repeat units are placed.
 
         "phase-ssm" (default) re-places the units of every registration with the
-        phase-aware state-space decoder in talea.phase_ssm; "comb" keeps the
+        phase-aware state-space decoder in talea.phase_ssm; "start-trim"
+        (experimental) adds a unit-start boundary term for helix-rich extents
+        and trims end units with a repeat-region probe; "comb" keeps the
         equal-period comb, reproducing v0.1.0 output exactly. Detection scores
-        and topology diagnostics are identical under both.
+        and topology diagnostics are identical under all three.
         """
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         if unit_placement not in UNIT_PLACEMENTS:
@@ -295,10 +302,15 @@ class TaleaPredictor:
             ),
         }
         self.phase_ssm = None
-        if self.unit_placement == "phase-ssm":
+        self.start_trim = None
+        if self.unit_placement in ("phase-ssm", "start-trim"):
             phase_asset = json.loads(self.assets.phase_ssm.read_text())
             self.phase_ssm = phase_asset
             self.configs["phase_ssm"] = runtime_config(phase_asset)
+        if self.unit_placement == "start-trim":
+            trim_asset = json.loads(self.assets.start_trim.read_text())
+            self.start_trim = trim_asset
+            self.configs["start_trim"] = start_trim_config(trim_asset)
         self.global_bundle = joblib.load(self.assets.global_model)
         _validate_global_bundle(self.global_bundle, self.deployment)
         self.loaded_at = time.time()
@@ -357,6 +369,36 @@ class TaleaPredictor:
             self.probe_bias = torch.as_tensor(
                 bias, dtype=torch.float32, device=self.device
             )
+        self.boundary_weights = None
+        if self.start_trim is not None:
+            weights, bias = boundary_probe_parameters(self.start_trim)
+            layer = int(self.start_trim["probes"]["hidden_state_layer_zero_based"])
+            if layer != self.probe_layer:
+                raise ValueError("start-trim probes read a different layer")
+            self.boundary_weights = torch.as_tensor(
+                weights, dtype=torch.float32, device=self.device
+            )
+            self.boundary_bias = torch.as_tensor(
+                bias, dtype=torch.float32, device=self.device
+            )
+
+    def residue_boundary_scores(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        indices: torch.Tensor,
+        batch_position: int,
+    ) -> np.ndarray | None:
+        """Per-residue unit-start and repeat-region logits (start-trim only)."""
+
+        if self.boundary_weights is None:
+            return None
+        residues = (
+            hidden_states[self.probe_layer][batch_position]
+            .index_select(0, indices)
+            .to(torch.float32)
+        )
+        logits = residues @ self.boundary_weights + self.boundary_bias
+        return logits.cpu().numpy().astype(np.float64)
 
     def residue_structure_probabilities(
         self,
@@ -546,10 +588,19 @@ class TaleaPredictor:
                     probabilities = self.residue_structure_probabilities(
                         hidden_states, indices, batch_position
                     )
+                    boundary_scores = self.residue_boundary_scores(
+                        hidden_states, indices, batch_position
+                    )
                     if postprocess_mode == "process":
                         future = pool.submit(
                             run_record,
-                            (record.metadata(), matrices, window_sizes, probabilities),
+                            (
+                                record.metadata(),
+                                matrices,
+                                window_sizes,
+                                probabilities,
+                                boundary_scores,
+                            ),
                         )
                     else:
                         future = pool.submit(
@@ -559,6 +610,7 @@ class TaleaPredictor:
                                 "matrices": matrices,
                                 "window_sizes": window_sizes,
                                 "residue_structure_probabilities": probabilities,
+                                "residue_boundary_scores": boundary_scores,
                                 **self.configs,
                             },
                         )

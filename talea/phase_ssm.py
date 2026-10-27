@@ -276,8 +276,15 @@ def decode_units(
     start: int,
     end: int,
     config: Mapping,
+    start_scores: np.ndarray | None = None,
+    start_weight: float = 0.0,
 ) -> list[dict]:
-    """Decode units over ``[start, end)`` from whole-protein votes and tracks."""
+    """Decode units over ``[start, end)`` from whole-protein votes and tracks.
+
+    With ``start_scores`` (a per-residue unit-start logit) and a nonzero
+    ``start_weight``, every unit start placed by the path, including the end of
+    the last full unit, adds ``start_weight * start_scores[b]``.
+    """
 
     decoder = config["decoder"]
     length = len(votes)
@@ -297,14 +304,21 @@ def decode_units(
     )
     evidence = lag_evidence(fused_tracks, length, int(decoder["attention_lag_maximum"]))
     emissions = length_emissions(evidence, minimum_length, maximum_length)
-    tables = unit_tables(
+    full, lead, tail = unit_tables(
         votes[start:end],
         emissions[:, start:end],
         minimum_length,
         float(decoder["phase_weight"]),
     )
+    if start_scores is not None and start_weight:
+        scores = np.asarray(start_scores, dtype=np.float64)
+        closing = scores[end] if end < length else 0.0
+        bonus = start_weight * np.append(scores[start:end], closing)[:, None]
+        full, tail = full + bonus, tail + bonus
     boundaries, unit_lengths = viterbi_units(
-        *tables,
+        full,
+        lead,
+        tail,
         minimum_length,
         float(decoder["length_change_penalty"]),
         maximum_step,
@@ -350,8 +364,105 @@ def place_units(
     return units
 
 
-def apply_placement(registration: dict, units: list[dict] | None) -> dict:
-    """Return the registration with phase-SSM units, keeping the comb alongside."""
+BOUNDARY_PROBE_CLASSES = ("unit_start", "repeat_region")
+
+
+def boundary_probe_parameters(asset: Mapping) -> tuple[np.ndarray, np.ndarray]:
+    """Return the start-trim probe map as ``(weights [hidden x 2], bias [2])``."""
+
+    probes = asset["probes"]
+    if tuple(probes["classes"]) != BOUNDARY_PROBE_CLASSES:
+        raise ValueError("start-trim probe classes disagree with the runtime")
+    weights = np.asarray(probes["weights"], dtype=np.float64).T
+    bias = np.asarray(probes["bias"], dtype=np.float64)
+    if weights.shape[1] != len(BOUNDARY_PROBE_CLASSES) or bias.shape != (2,):
+        raise ValueError("start-trim probe parameters have the wrong shape")
+    return weights, bias
+
+
+def start_trim_config(asset: Mapping) -> dict:
+    """The decoder-side subset of the start-trim asset."""
+
+    return {"decoder": dict(asset["decoder"])}
+
+
+def trim_units(
+    units: list[dict], region_scores: np.ndarray, threshold: float, minimum_units: int
+) -> list[dict]:
+    """Drop end units whose mean repeat-region logit is below ``threshold``.
+
+    The weaker end goes first; at least ``minimum_units`` units are kept.
+    """
+
+    scores = np.asarray(region_scores, dtype=np.float64)
+    kept = list(units)
+    while len(kept) > minimum_units:
+        first = float(np.mean(scores[kept[0]["start"] : kept[0]["end"]]))
+        last = float(np.mean(scores[kept[-1]["start"] : kept[-1]["end"]]))
+        if min(first, last) >= threshold:
+            break
+        kept = kept[1:] if first <= last else kept[:-1]
+    return kept
+
+
+def place_units_start_trim(
+    registration: Mapping,
+    probabilities: np.ndarray,
+    boundary_scores: np.ndarray,
+    fused_tracks: Sequence[np.ndarray],
+    phase_config: Mapping,
+    trim_config: Mapping,
+) -> tuple[list[dict], str]:
+    """Start-trim units for a comb registration and the placement label.
+
+    Extents whose mean helix probability reaches ``helix_threshold`` decode
+    with the helix settings (by default phase votes off and the unit-start
+    boundary term on); the rest keep the phase-SSM decode. A decode with fewer
+    than ``minimum_units`` units falls back to the comb. The units are then
+    trimmed with the repeat-region logits.
+    """
+
+    settings = trim_config["decoder"]
+    period = float(registration["period"])
+    start, end = int(registration["start"]), int(registration["end"])
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    scores = np.asarray(boundary_scores, dtype=np.float64)
+    helix = float(probabilities[start:end, 0].mean()) if end > start else 0.0
+    side = settings["helix" if helix >= float(settings["helix_threshold"]) else "strand"]
+    config = {
+        "decoder": dict(
+            phase_config["decoder"], phase_weight=float(side["phase_weight"])
+        )
+    }
+    votes = phase_votes(probabilities, period, phase_config["coefficients"])
+    units = decode_units(
+        votes,
+        fused_tracks,
+        period,
+        start,
+        end,
+        config,
+        start_scores=scores[:, 0],
+        start_weight=float(side["start_weight"]),
+    )
+    minimum_units = int(settings["minimum_units"])
+    label = "start_trim"
+    if len(units) < minimum_units:
+        units = [
+            {"start": int(unit["start"]), "end": int(unit["end"])}
+            for unit in registration["units"]
+        ]
+        label = "start_trim_comb"
+    units = trim_units(
+        units, scores[:, 1], float(side["trim_threshold"]), minimum_units
+    )
+    return units, label
+
+
+def apply_placement(
+    registration: dict, units: list[dict] | None, method: str = "phase_ssm"
+) -> dict:
+    """Return the registration with placed units, keeping the comb alongside."""
 
     placed = dict(registration)
     placed["comb_units"] = registration["units"]
@@ -360,7 +471,7 @@ def apply_placement(registration: dict, units: list[dict] | None) -> dict:
     if units is None:
         placed["unit_placement"] = "comb_fallback"
         return placed
-    placed["unit_placement"] = "phase_ssm"
+    placed["unit_placement"] = method
     placed["units"] = [
         {"start": int(unit["start"]), "end": int(unit["end"])} for unit in units
     ]

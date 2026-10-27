@@ -99,13 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--unit-placement",
-        choices=("phase-ssm", "comb"),
+        choices=("phase-ssm", "start-trim", "comb"),
         default="phase-ssm",
         help=(
             "how registered repeat units are placed. 'phase-ssm' (default) "
             "decodes units from per-residue helix/strand/loop phase votes with a "
-            "state-space model; 'comb' keeps the equal-period comb and "
-            "reproduces v0.1.0 output exactly. Scores are identical under both."
+            "state-space model; 'start-trim' (experimental) adds a unit-start "
+            "probe to the decode of helix-rich extents and trims end units with a "
+            "repeat-region probe; 'comb' keeps the equal-period comb and "
+            "reproduces v0.1.0 output exactly. Scores are identical under all three."
         ),
     )
     parser.add_argument(
