@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 import torch
 
-from talea.inference import apc_head_mean, make_batches, resolve_dtype
+from talea.cli import build_parser
+from talea.inference import (
+    apc_head_mean,
+    available_cpus,
+    make_batches,
+    resolve_dtype,
+    resolve_postprocess_workers,
+)
 from talea.io import SequenceRecord
 from talea.model import AttentionStateTeacherUNet
 
@@ -46,6 +53,25 @@ def test_dtype_auto_is_fp32_on_cpu() -> None:
 def test_bf16_is_rejected_on_mps_contract() -> None:
     with pytest.raises(ValueError, match="MPS"):
         resolve_dtype("bf16", torch.device("mps"))
+
+
+def test_cli_defaults_to_process_postprocessing_on_every_cpu() -> None:
+    args = build_parser().parse_args(["-i", "in.faa", "-o", "out.jsonl"])
+    assert args.postprocess_mode == "process"
+    assert args.postprocess_workers is None
+    assert resolve_postprocess_workers(None, "process") == available_cpus() >= 1
+
+
+def test_thread_postprocessing_defaults_to_one_worker() -> None:
+    assert resolve_postprocess_workers(None, "thread") == 1
+    assert resolve_postprocess_workers(3, "thread") == 3
+
+
+def test_postprocess_worker_resolution_rejects_bad_input() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        resolve_postprocess_workers(0, "process")
+    with pytest.raises(ValueError, match="unsupported"):
+        resolve_postprocess_workers(None, "fork")
 
 
 def test_teacher_runtime_model_output_shape() -> None:

@@ -76,6 +76,32 @@ POSTPROCESS_MODES = ("thread", "process")
 UNIT_PLACEMENTS = ("phase-ssm", "comb")
 
 
+def available_cpus() -> int:
+    """CPUs this process may run on.
+
+    The scheduler affinity mask where the platform reports one, so a Slurm or
+    cgroup allocation is respected; the machine's CPU count elsewhere (macOS).
+    """
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def resolve_postprocess_workers(workers: int | None, mode: str) -> int:
+    """Worker count for the postprocess pool; ``None`` picks the mode default.
+
+    Process mode defaults to every available CPU. Thread mode defaults to one,
+    because the GIL-bound postprocessing convoys rather than scales on threads.
+    """
+    if mode not in POSTPROCESS_MODES:
+        raise ValueError(f"unsupported postprocess mode: {mode}")
+    if workers is None:
+        return available_cpus() if mode == "process" else 1
+    if workers < 1:
+        raise ValueError("postprocess worker count must be positive")
+    return int(workers)
+
+
 def enable_deterministic_convolution() -> None:
     """Pin cuDNN to deterministic convolution algorithms.
 
@@ -412,25 +438,26 @@ class TaleaPredictor:
         *,
         square_budget: int = 4_000_000,
         maximum_batch: int = 64,
-        postprocess_workers: int = 1,
+        postprocess_workers: int | None = None,
         progress: bool = False,
         capture_mode: str = "manual",
         cache_clear_interval: int = 0,
-        postprocess_mode: str = "thread",
+        postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
 
-        ``postprocess_workers`` defaults to 1 because the default
-        ``postprocess_mode="thread"`` cannot scale: the postprocessing is
-        dominated by many small NumPy calls that hold the GIL, so a thread pool
-        convoys rather than parallelizes (measured 0.52x at four workers). See
-        perf/bench_threads.py.
+        ``postprocess_mode="process"`` (default) runs postprocessing in a
+        worker pool, sidestepping the GIL; ``postprocess_workers=None`` then
+        uses every available CPU. Workers come from a forkserver, so they never
+        inherit the parent's CUDA context; the cost is a one-off worker start
+        plus pickling each record's matrices (8-16 MB at maximum length,
+        against seconds of compute). Output is identical to thread mode.
 
-        ``postprocess_mode="process"`` sidesteps the GIL entirely and is the
-        way to use more than one core. It is spawn-based, so workers never
-        inherit the parent's CUDA context; the cost is a one-off interpreter
-        start per worker plus pickling each record's matrices (8-16 MB at
-        maximum length, against seconds of compute).
+        ``postprocess_mode="thread"`` runs postprocessing in-process and
+        defaults to one worker: the work is dominated by many small NumPy
+        calls that hold the GIL, so a thread pool convoys rather than
+        parallelizes (measured 0.52x at four workers). See
+        perf/bench_threads.py.
 
         ``capture_mode`` selects the attention-capture strategy in
         talea.capture; "manual" preserves the frozen numerics exactly.
@@ -443,10 +470,9 @@ class TaleaPredictor:
         if not values:
             return
         self._validate_records(values)
-        if postprocess_workers < 1:
-            raise ValueError("postprocess worker count must be positive")
-        if postprocess_mode not in POSTPROCESS_MODES:
-            raise ValueError(f"unsupported postprocess mode: {postprocess_mode}")
+        postprocess_workers = resolve_postprocess_workers(
+            postprocess_workers, postprocess_mode
+        )
         ordered = sorted(values, key=lambda value: (value.length, value.record_id))
         batches = list(make_batches(ordered, square_budget, maximum_batch))
         completed = 0

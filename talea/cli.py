@@ -18,7 +18,7 @@ import transformers
 
 from talea import __version__
 from talea.artifacts import load_deployment, sha256_file
-from talea.inference import TaleaPredictor
+from talea.inference import TaleaPredictor, resolve_postprocess_workers
 from talea.io import read_fasta
 
 
@@ -49,21 +49,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--postprocess-workers",
         type=int,
-        default=1,
+        default=None,
         help=(
-            "postprocessing threads (default 1). The work is many small NumPy "
-            "calls that hold the GIL, so additional threads convoy rather than "
-            "scale; four workers measured 0.57x of one."
+            "postprocessing workers (default: every CPU this process may use "
+            "in process mode, 1 in thread mode)"
         ),
     )
     parser.add_argument(
         "--postprocess-mode",
-        choices=("thread", "process"),
-        default="thread",
+        choices=("process", "thread"),
+        default="process",
         help=(
-            "how to parallelize postprocessing. 'thread' cannot scale past one "
-            "worker (GIL); use 'process' with --postprocess-workers > 1 to "
-            "actually use more cores."
+            "how to parallelize postprocessing. 'process' (default) runs a "
+            "worker pool across CPU cores; 'thread' runs in-process and cannot "
+            "scale past one worker, because the work is many small NumPy calls "
+            "that hold the GIL (four threads measured 0.57x of one). Output is "
+            "identical under both."
         ),
     )
     parser.add_argument(
@@ -128,6 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.postprocess_workers = resolve_postprocess_workers(
+        args.postprocess_workers, args.postprocess_mode
+    )
     deployment = load_deployment()
     records = read_fasta(
         args.input,

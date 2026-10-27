@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Process-based postprocessing is the default.** `--postprocess-mode` now
+  defaults to `process` and `--postprocess-workers` to every CPU the process
+  may use (the affinity mask, so Slurm allocations are respected). Output is
+  identical to thread mode. On the H200 CATH lockbox timing (178,854 residues,
+  12 workers) this runs at 6,582 residues/s against 1,580 for the previous
+  thread default. `--postprocess-mode thread` restores the old behaviour.
+
 ## 0.2.0
 
 - **Phase-aware unit placement.** Registered repeat units are now placed by a

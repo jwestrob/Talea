@@ -219,8 +219,8 @@ Talea writes:
 | `--dtype` | `auto`, `fp16`, `fp32`, or `bf16` | `auto` |
 | `--maximum-batch` | Maximum proteins per padded ESM++ batch | 64 |
 | `--square-budget` | Upper bound on batch size × padded sequence length² | 4,000,000 |
-| `--postprocess-workers` | CPU workers for topology decoding | 1 |
-| `--postprocess-mode` | `thread`, or `process` to scale across CPU cores | `thread` |
+| `--postprocess-workers` | CPU workers for topology decoding | all available CPUs (process mode); 1 (thread mode) |
+| `--postprocess-mode` | `process` to scale across CPU cores, or `thread` to stay in one process | `process` |
 | `--capture-mode` | `manual` (numerically identical to the frozen run) or `sdpa` (faster, small numerical drift) | `manual` |
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
@@ -340,9 +340,10 @@ length-sorts inputs and constrains batches by
 
 - Lower `--square-budget` if a GPU runs out of memory.
 - Lower `--maximum-batch` when screening many short proteins.
-- `--postprocess-workers` controls CPU-only topology work and does not load
-  additional ESM++ copies. Pair it with `--postprocess-mode process` to use
-  several cores.
+- Postprocessing (CPU-only topology work) runs in a process pool on every CPU
+  the job may use, including a Slurm allocation's CPU set. Workers do not load
+  additional ESM++ copies. `--postprocess-workers` caps the pool;
+  `--postprocess-mode thread` keeps the work in one process.
 - ESM++ runs with selective capture: Talea retains only the two attention
   layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under the default
   `--capture-mode manual`, output is byte-identical to the full-capture path.

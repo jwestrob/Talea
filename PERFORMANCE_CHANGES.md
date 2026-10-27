@@ -385,6 +385,12 @@ slowdown, and both are recorded because they are easy to reintroduce:
 **Numerics.** Bit-exact — worker output is asserted identical to a direct
 `process_attention_record` call, and the pooled result identical to serial.
 
+**Default (after 0.2.0).** Process mode on every available CPU
+(`os.sched_getaffinity`, else `os.cpu_count()`) is now the default for both the
+CLI and `TaleaPredictor.iter_predictions`. Measured on an H200 over the CATH
+lockbox (178,854 residues): 6,582 residues/s with 12 process workers against
+1,580 for the thread default it replaces.
+
 ### C10. `--deterministic` — `talea/inference.py`, `talea/cli.py`
 
 Pins cuDNN to deterministic convolution algorithms, addressing the teacher-UNet
