@@ -10,7 +10,8 @@ a window score lines up with an existing chunk structure.
 Each window is scored exactly as a standalone protein. The protein's row is the
 best window's row (highest discovery score) with every residue coordinate moved
 into the full-protein frame, plus a compact summary of every window under
-``windowing``. Proteins within the contract are scored whole and their rows are
+``windowing``. Its ``repeat_regions`` gathers every window's regions, so a
+protein with repeat domains in several windows lists them all. Proteins within the contract are scored whole and their rows are
 unchanged.
 
 This module stays free of torch, so the window arithmetic and the row merge can
@@ -23,6 +24,7 @@ import hashlib
 from collections.abc import Iterable, Iterator, Sequence
 
 from talea.io import SequenceRecord
+from talea.regions import union_window_regions
 
 DEFAULT_WINDOW_LENGTH = 2000
 DEFAULT_WINDOW_STRIDE = 1000
@@ -152,6 +154,14 @@ def combine_window_rows(
     )
     start, end = spans[best]
     combined = shift_coordinates(rows[best], start)
+    if any("repeat_regions" in row for row in rows):
+        combined["repeat_regions"] = union_window_regions(
+            [
+                (window_start, row.get("repeat_regions") or [])
+                for (window_start, _), row in zip(spans, rows, strict=True)
+            ],
+            best,
+        )
     combined["record_id"] = record.record_id
     combined["sequence_sha256"] = record.sequence_sha256
     combined["length"] = record.length

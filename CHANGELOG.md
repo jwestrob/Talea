@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Every repeat region.** Rows gain `repeat_regions`: the registered primary
+  region plus further regions found by searching the wedge again after
+  neutralizing each call (`secondary_wedge_calls`), kept when the U-Net
+  residue-state track supports them. On 455 RepeatsDB chains with two to four
+  curated solenoid regions, coverage of curated regions rises from 60.0% to
+  76.3% at unchanged residue precision; single-region development proteins
+  keep their residue F1. Window mode reports the union over windows. Detection
+  scores, the primary call, registration and units are unchanged. See README
+  "Repeat regions".
 - **Long proteins as windows.** `--long-proteins window` scores proteins
   above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
   giant-protein folding grid) and reports the best window in full-protein

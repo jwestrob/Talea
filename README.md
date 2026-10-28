@@ -316,6 +316,8 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `status` | `ok` when a wedge was localized; otherwise `no_wedge_call` |
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
+| `secondary_wedge_calls` | Further wedge calls after the primary one (see Repeat regions) |
+| `repeat_regions` | Every repeat region: the registered primary region plus supported further calls, each with period, wedge score and mean residue-state probability |
 | `registration.units` | Repeat-unit boundaries in the registered extent |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
@@ -401,8 +403,8 @@ Validation (2026-10-27; development data only):
   locus overlaps the whole-protein locus for 67 of the top 100. For 28 more,
   another window calls the whole-protein locus: these proteins carry repeats of
   the same period in several regions, and the highest-scoring window holds a
-  different one. Read the row's locus as the strongest window's repeat region,
-  and use `windowing` to see every region.
+  different one. Read the row's locus as the strongest window's repeat region;
+  `repeat_regions` gathers the regions of every window (see Repeat regions).
 
 Read window scores as a ranking. Like whole proteins above 1,000 aa, 2,000-aa
 windows score high in absolute terms: 99% of the 809 windows of the tube
@@ -411,6 +413,56 @@ negative. Compare windows with windows, and rank within a protein to localize.
 Windows put several 2,000-aa sequences in one batch only when `--square-budget`
 allows it (about 4,008,000 per window); raise it on large GPUs so their
 postprocessing runs in parallel.
+
+## Repeat regions
+
+`repeat_regions` lists every repeat region Talea finds in a protein, sorted by
+position. The wedge returns the single best period and interval, so a protein
+with two repeat regions, such as a solenoid split by an insertion or two
+repeat domains, was previously reported by one of them. Talea now continues
+the search: it sets the diagonal values of every residue pair touching the
+primary call's interval to that diagonal's median and searches the wedge
+again, up to three more times, stopping at the first call whose wedge score
+falls below 12 or below half the primary call's. A further call becomes a
+region when the U-Net residue-state track averages at least 0.2 over it. Each
+region extends half a period past its wedge interval, as the registration seed
+does; a region of the same period (within 15%) that overlaps or nearly
+touches another merges into it.
+
+The first region (`source: primary`) is the registered extent, and
+registration, units and every score describe it alone; further regions
+(`source: secondary`) carry a period, extent, wedge score and mean
+residue-state probability. In window mode, `repeat_regions` is the union of
+every window's regions in full-protein coordinates, with the window each came
+from.
+
+Validation (2026-10-28; Talea's development data plus a new cohort):
+
+- **Proteins with several curated regions.** RepeatsDB class 3 chains with two
+  to four curated regions were excluded from the repeat-extraction benchmark
+  by its one-region rule; 455 of them (≤2,046 aa, canonical, exactly mapped,
+  sequences outside the benchmark; 98% AlphaFold DB, mostly α solenoids such
+  as MIF4G, cullin, armadillo and TPR domains) form this cohort. Against the
+  primary region alone, curated regions covered at least half by a reported
+  region rise from 60.0% to 76.3% (+0.163 [+0.125, +0.204]), and regions
+  covered by a region of their own from 45.2% to 58.5% (+0.133 [+0.101,
+  +0.171]). Residue precision holds (0.790 vs 0.783; −0.006 [−0.017, +0.005])
+  and residue F1 rises from 0.653 to 0.746. Intervals are paired bootstrap 95%
+  CIs over 176 Pfam-architecture groups. The acceptance rule was chosen on
+  this cohort; choosing it on one half of the Pfam groups and scoring the
+  other half selects the same rule in both directions, with held-out coverage
+  0.629 → 0.789 and 0.573 → 0.738.
+- **One curated region per protein.** On the 2,286 development records,
+  residue F1 is unchanged (0.811 vs 0.813; +0.003 [−0.003, +0.009] over 350
+  homology components), recall rises (0.970 → 0.991; the further search finds
+  the curated region where the primary call missed it), and the share of
+  proteins with a region outside the curated one rises from 3.4% to 4.9%
+  (+0.015 [+0.006, +0.026]). Proteins carry 1.05 regions on average here and
+  1.44 in the multi-region cohort.
+
+The further search adds one wedge search per protein when nothing passes and
+up to three when regions are found, roughly doubling postprocessing CPU time;
+on GPU-bound runs throughput is unchanged.
 
 ## Benchmark
 
@@ -601,6 +653,8 @@ repeat-extraction benchmark and the helix/strand/loop probes.
   at the aliased length.
 - Unit placement gains are largest for α and α/β solenoids, where helix and
   loop probabilities oscillate strongly within each unit.
+- Secondary repeat regions carry a period and extent but no unit
+  registration; units are placed in the primary region only.
 - The 1,733–2,046-aa range is a declared length extrapolation. Proteins
   above 2,046 aa are scored only as 2,000-aa windows (`--long-proteins
   window`), which see at most 2,000 residues of context.

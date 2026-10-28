@@ -29,6 +29,7 @@ from talea.long_protein import (
 )
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
+from talea.regions import repeat_regions
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
@@ -676,6 +677,7 @@ class TaleaPredictor:
                     yield {
                         **topology,
                         **scores,
+                        "repeat_regions": repeat_regions(topology, state_track),
                         "primary_score_field": "talea_discovery_score",
                         "teacher_state_summary": {
                             key: value

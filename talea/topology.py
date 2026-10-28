@@ -9,6 +9,7 @@ import numpy as np
 from talea.application import frozen_operational_scores, frozen_spectrum_score
 from talea.attention import scan_attention_matrix, score_attention_window
 from talea.phase_ssm import apply_placement, place_units
+from talea.regions import secondary_wedge_calls
 from talea.unit_registration import (
     register_periodic_units,
     registered_closure_score,
@@ -142,6 +143,7 @@ def process_attention_record(task: dict) -> dict:
         quantization=float(period_config["quantization"]),
     )
     wedge_call = None
+    secondary_calls: list[dict] = []
     if periods:
         tracks = fuse_diagonal_tracks(
             [
@@ -169,6 +171,14 @@ def process_attention_record(task: dict) -> dict:
         )
         if math.isfinite(float(candidate["score"])):
             wedge_call = candidate
+            secondary_calls = secondary_wedge_calls(
+                tracks,
+                length,
+                periods,
+                widths_from_config(wedge_config),
+                wedge,
+                wedge_call,
+            )
     registration = None
     closure = None
     boundary_scan = None
@@ -217,6 +227,7 @@ def process_attention_record(task: dict) -> dict:
         "frozen_spectrum": spectrum,
         "candidate_periods": list(periods),
         "wedge_call": wedge_call,
+        "secondary_wedge_calls": secondary_calls,
         "registration": registration,
         "closure": closure,
         "boundary_scan": boundary_scan,
