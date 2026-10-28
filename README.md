@@ -225,6 +225,9 @@ Talea writes:
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
 | `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
+| `--long-proteins` | `reject` proteins above 2,046 aa, or score them as overlapping `window`s | `reject` |
+| `--window-length` | Residues per window in window mode | 2,000 |
+| `--window-stride` | Residues between window starts in window mode | 1,000 |
 | `--trust-remote-code` | Permit the pinned ESM++ model implementation to load | off |
 | `--local-files-only` | Use only the local Hugging Face cache | off |
 | `--overwrite` | Replace an existing output and audit | off |

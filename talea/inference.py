@@ -22,6 +22,11 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_assets
 from talea.capture import selective_capture
 from talea.io import SequenceRecord
+from talea.long_protein import (
+    DEFAULT_WINDOW_LENGTH,
+    DEFAULT_WINDOW_STRIDE,
+    iter_windowed_predictions,
+)
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
 from talea.postprocess_pool import initialize_worker, run_record
@@ -431,6 +436,28 @@ class TaleaPredictor:
                 raise ValueError(
                     f"sequence checksum mismatch for {record.record_id}"
                 )
+
+    def iter_windowed_predictions(
+        self,
+        records: Iterable[SequenceRecord],
+        *,
+        window_length: int = DEFAULT_WINDOW_LENGTH,
+        window_stride: int = DEFAULT_WINDOW_STRIDE,
+        **options,
+    ) -> Iterator[dict]:
+        """``iter_predictions`` that also accepts proteins above the maximum.
+
+        Each longer protein is scored as overlapping windows and reported as one
+        row; see talea.long_protein. ``options`` go to ``iter_predictions``.
+        """
+
+        return iter_windowed_predictions(
+            self,
+            records,
+            window_length=window_length,
+            window_stride=window_stride,
+            **options,
+        )
 
     def iter_predictions(
         self,

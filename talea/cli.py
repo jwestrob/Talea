@@ -20,6 +20,13 @@ from talea import __version__
 from talea.artifacts import load_deployment, sha256_file
 from talea.inference import TaleaPredictor, resolve_postprocess_workers
 from talea.io import read_fasta
+from talea.long_protein import (
+    DEFAULT_WINDOW_LENGTH,
+    DEFAULT_WINDOW_STRIDE,
+    LONG_PROTEIN_MODES,
+    iter_windowed_predictions,
+    window_spans,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +117,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--long-proteins",
+        choices=LONG_PROTEIN_MODES,
+        default="reject",
+        help=(
+            "what to do with proteins longer than the 2,046-residue maximum. "
+            "'reject' (default) stops with an error; 'window' scores "
+            "overlapping windows and reports the best window in full-protein "
+            "coordinates, with every window summarized under 'windowing'"
+        ),
+    )
+    parser.add_argument(
+        "--window-length",
+        type=int,
+        default=DEFAULT_WINDOW_LENGTH,
+        help=(
+            "residues per window in --long-proteins window mode (default "
+            f"{DEFAULT_WINDOW_LENGTH}, the giant-protein folding chunk length)"
+        ),
+    )
+    parser.add_argument(
+        "--window-stride",
+        type=int,
+        default=DEFAULT_WINDOW_STRIDE,
+        help=(
+            "residues between window starts in --long-proteins window mode "
+            f"(default {DEFAULT_WINDOW_STRIDE}, so each residue is read twice)"
+        ),
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help=(
@@ -133,10 +169,24 @@ def main(argv: list[str] | None = None) -> int:
         args.postprocess_workers, args.postprocess_mode
     )
     deployment = load_deployment()
-    records = read_fasta(
-        args.input,
-        maximum_length=int(deployment["input_contract"]["maximum_residues"]),
-    )
+    maximum_residues = int(deployment["input_contract"]["maximum_residues"])
+    records = read_fasta(args.input, maximum_length=sys.maxsize)
+    long_records = [record for record in records if record.length > maximum_residues]
+    if long_records and args.long_proteins == "reject":
+        first = long_records[0]
+        raise ValueError(
+            f"{len(long_records)} sequences exceed Talea's frozen maximum of "
+            f"{maximum_residues} residues (first: {first.record_id}, "
+            f"{first.length}); rerun with --long-proteins window to score them "
+            "as overlapping windows"
+        )
+    if args.long_proteins == "window":
+        if not 1 <= args.window_length <= maximum_residues:
+            raise ValueError(
+                f"--window-length must be between 1 and {maximum_residues}"
+            )
+        if not 1 <= args.window_stride <= args.window_length:
+            raise ValueError("--window-stride must be between 1 and --window-length")
     if args.input.resolve() == args.output.resolve():
         raise ValueError("input FASTA and output JSONL must be different files")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -160,19 +210,29 @@ def main(argv: list[str] | None = None) -> int:
         deterministic=args.deterministic,
         unit_placement=args.unit_placement,
     )
+    prediction_options = {
+        "square_budget": args.square_budget,
+        "maximum_batch": args.maximum_batch,
+        "postprocess_workers": args.postprocess_workers,
+        "progress": not args.quiet,
+        "capture_mode": args.capture_mode,
+        "cache_clear_interval": args.cache_clear_interval,
+        "postprocess_mode": args.postprocess_mode,
+    }
+    if args.long_proteins == "window":
+        rows = iter_windowed_predictions(
+            predictor,
+            records,
+            window_length=args.window_length,
+            window_stride=args.window_stride,
+            **prediction_options,
+        )
+    else:
+        rows = predictor.iter_predictions(records, **prediction_options)
     completed = 0
     try:
         with partial.open("x") as handle:
-            for row in predictor.iter_predictions(
-                records,
-                square_budget=args.square_budget,
-                maximum_batch=args.maximum_batch,
-                postprocess_workers=args.postprocess_workers,
-                progress=not args.quiet,
-                capture_mode=args.capture_mode,
-                cache_clear_interval=args.cache_clear_interval,
-                postprocess_mode=args.postprocess_mode,
-            ):
+            for row in rows:
                 handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
                 completed += 1
         partial.replace(args.output)
@@ -203,6 +263,14 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
+        "long_proteins": args.long_proteins,
+        "window_length": args.window_length,
+        "window_stride": args.window_stride,
+        "windowed_records": len(long_records),
+        "scored_windows": sum(
+            len(window_spans(record.length, args.window_length, args.window_stride))
+            for record in long_records
+        ),
         "model_loaded_seconds": predictor.loaded_seconds,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",
