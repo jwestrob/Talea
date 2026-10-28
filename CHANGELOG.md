@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Long proteins as windows.** `--long-proteins window` scores proteins
+  above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
+  giant-protein folding grid) and reports the best window in full-protein
+  coordinates, with every window under `windowing`. The default remains
+  `reject`, whose error now names the option. See README "Long proteins".
 - **Process-based postprocessing is the default.** `--postprocess-mode` now
   defaults to `process` and `--postprocess-workers` to every CPU the process
   may use (the affinity mask, so Slurm allocations are respected). Output is

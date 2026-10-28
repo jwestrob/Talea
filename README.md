@@ -355,9 +355,53 @@ length-sorts inputs and constrains batches by
 - For reproducibility and memory efficiency, run one Talea process per GPU.
 
 The 2,046-aa ceiling is part of the frozen deployment contract, not a
-fundamental limit of the method. Longer proteins currently require an
-explicitly designed and validated windowing strategy; Talea does not silently
-tile or truncate them.
+fundamental limit of the method. Longer proteins are scored only on request,
+as overlapping windows (next section); Talea never silently tiles or truncates.
+
+## Long proteins
+
+`--long-proteins window` (Python: `TaleaPredictor.iter_windowed_predictions`)
+scores each protein longer than 2,046 aa as windows of `--window-length`
+residues (2,000) starting every `--window-stride` residues (1,000), plus one
+window ending at the C-terminus, so every window has the same length and every
+residue is read at least twice. The 2,000/1,000 grid matches the chunks used to
+fold the Omnitrophota giant proteins, so window *k* is chunk *k*. Each window is
+scored exactly as a standalone protein. Proteins within the contract are scored
+whole and their rows are unchanged.
+
+A windowed protein yields one row: the best window's row (highest discovery
+score) with every residue position moved into the full-protein frame, plus
+`windowing`, which lists every window's `start`, `end`, scores, period, wedge
+interval and registered extent in full-protein coordinates.
+
+Validation (2026-10-27; development data only):
+
+- **Exact windows.** On the 19 standard-alphabet parents of the 35 curated
+  giant-protein tube chunks, the 34 windows at chunk positions are the curated
+  chunk sequences, and their scores match the frozen chunk scores within
+  0.0008.
+- **Tube localization.** Within every parent, the curated tube windows outrank
+  the parent's other windows (within-parent AUROC 0.78 on average; median tube
+  window at the 19th percentile). The other windows are unlabeled, so this is a
+  lower bound.
+- **Whole versus windowed.** 300 DPANN proteins of 1,600–2,046 aa (the 150
+  top-scored and 150 random), scored whole and as forced 1,000/500 windows,
+  which give less context than deployment: the best-window score has rank
+  correlation 0.93 with the whole-protein score, 81 of the top 100 are shared,
+  and for 85 of the top 100 the period agrees within 10%. The best window's
+  locus overlaps the whole-protein locus for 67 of the top 100. For 28 more,
+  another window calls the whole-protein locus: these proteins carry repeats of
+  the same period in several regions, and the highest-scoring window holds a
+  different one. Read the row's locus as the strongest window's repeat region,
+  and use `windowing` to see every region.
+
+Read window scores as a ranking. Like whole proteins above 1,000 aa, 2,000-aa
+windows score high in absolute terms: 99% of the 809 windows of the tube
+parents exceed the CATH-control cutoff that classifies 95% of CATH controls as
+negative. Compare windows with windows, and rank within a protein to localize.
+Windows put several 2,000-aa sequences in one batch only when `--square-budget`
+allows it (about 4,008,000 per window); raise it on large GPUs so their
+postprocessing runs in parallel.
 
 ## Benchmark
 
@@ -548,8 +592,9 @@ repeat-extraction benchmark and the helix/strand/loop probes.
   at the aliased length.
 - Unit placement gains are largest for α and α/β solenoids, where helix and
   loop probabilities oscillate strongly within each unit.
-- The 1,733–2,046-aa range is a declared length extrapolation, and proteins
-  above 2,046 aa are not accepted.
+- The 1,733–2,046-aa range is a declared length extrapolation. Proteins
+  above 2,046 aa are scored only as 2,000-aa windows (`--long-proteins
+  window`), which see at most 2,000 residues of context.
 - Runtime and memory scale quadratically with sequence length.
 - “Sequence-only” applies to inference; the residue-state head was developed
   with structural supervision.
