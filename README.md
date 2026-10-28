@@ -405,6 +405,11 @@ Validation (2026-10-27; development data only):
   the same period in several regions, and the highest-scoring window holds a
   different one. Read the row's locus as the strongest window's repeat region;
   `repeat_regions` gathers the regions of every window (see Repeat regions).
+  Rescored with `repeat_regions` (scores and primary calls identical for all
+  300), the whole-protein locus lies in one of the windowed protein's regions
+  for all 100 of the top 100, and 99% of the regions found when the protein is
+  scored whole are among the windowed regions (2.24 regions per protein whole,
+  2.68 windowed).
 
 Read window scores as a ranking. Like whole proteins above 1,000 aa, 2,000-aa
 windows score high in absolute terms: 99% of the 809 windows of the tube
