@@ -12,6 +12,13 @@
   supported regions and lists each window's regions under `windowing`. Detection
   scores, the primary call, registration and units are unchanged. See README
   "Repeat regions".
+- **Faster wedge search.** Each search computes every diagonal's interval
+  sums once and scores all candidate periods of a width together, and the
+  repeat-region search reuses one template plan per protein. Output is
+  bit-identical (the original search is kept as the concordance oracle).
+  Single-threaded postprocessing of 240 Omnitrophota proteins takes 15.6 s
+  with repeat regions, against 18.3 s for v0.2.0 without them and 37.4 s for
+  repeat regions on the previous search.
 - **Long proteins as windows.** `--long-proteins window` scores proteins
   above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
   giant-protein folding grid) and reports the best window in full-protein
