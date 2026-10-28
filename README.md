@@ -240,25 +240,34 @@ from talea.artifacts import load_deployment
 from talea.inference import TaleaPredictor
 from talea.io import read_fasta
 
-deployment = load_deployment()
-records = read_fasta(
-    "proteins.faa",
-    maximum_length=deployment["input_contract"]["maximum_residues"],
-)
 
-predictor = TaleaPredictor(
-    device="cuda",
-    dtype="fp16",
-    trust_remote_code=True,
-)
-
-for prediction in predictor.iter_predictions(records, progress=True):
-    print(
-        prediction["record_id"],
-        prediction["talea_discovery_score"],
-        prediction["wedge_call"],
+def main():
+    deployment = load_deployment()
+    records = read_fasta(
+        "proteins.faa",
+        maximum_length=deployment["input_contract"]["maximum_residues"],
     )
+    predictor = TaleaPredictor(
+        device="cuda",
+        dtype="fp16",
+        trust_remote_code=True,
+    )
+    for prediction in predictor.iter_predictions(records, progress=True):
+        print(
+            prediction["record_id"],
+            prediction["talea_discovery_score"],
+            prediction["wedge_call"],
+        )
+
+
+if __name__ == "__main__":
+    main()
 ```
+
+Postprocessing runs in worker processes, and each worker re-imports the calling
+script (Python's rule for spawned processes), so keep the entry point under
+`if __name__ == "__main__":` as above. `postprocess_mode="thread"` runs in one
+process.
 
 `TaleaPredictor(unit_placement="comb")` reproduces v0.1.0 unit boundaries.
 Load one `TaleaPredictor` and reuse it. Starting multiple processes on the same

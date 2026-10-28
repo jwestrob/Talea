@@ -1,3 +1,4 @@
+import concurrent.futures
 import hashlib
 
 import numpy as np
@@ -9,6 +10,7 @@ from talea.inference import (
     apc_head_mean,
     available_cpus,
     make_batches,
+    postprocess_result,
     resolve_dtype,
     resolve_postprocess_workers,
 )
@@ -72,6 +74,16 @@ def test_postprocess_worker_resolution_rejects_bad_input() -> None:
         resolve_postprocess_workers(0, "process")
     with pytest.raises(ValueError, match="unsupported"):
         resolve_postprocess_workers(None, "fork")
+
+
+def test_broken_worker_pool_names_the_main_guard() -> None:
+    future = concurrent.futures.Future()
+    future.set_exception(concurrent.futures.process.BrokenProcessPool("died"))
+    with pytest.raises(RuntimeError, match="__main__"):
+        postprocess_result(future)
+    finished = concurrent.futures.Future()
+    finished.set_result({"status": "ok"})
+    assert postprocess_result(finished) == {"status": "ok"}
 
 
 def test_teacher_runtime_model_output_shape() -> None:
