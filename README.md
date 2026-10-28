@@ -358,6 +358,8 @@ length-sorts inputs and constrains batches by
   the job may use, including a Slurm allocation's CPU set. Workers do not load
   additional ESM++ copies. `--postprocess-workers` caps the pool;
   `--postprocess-mode thread` keeps the work in one process.
+- Batches are pipelined: each batch's postprocessing runs in the pool while
+  the next batch is on the device, and rows keep their order and values.
 - ESM++ runs with selective capture: Talea retains only the two attention
   layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under the default
   `--capture-mode manual`, output is byte-identical to the full-capture path.

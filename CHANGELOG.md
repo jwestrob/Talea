@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - **Every repeat region.** Rows gain `repeat_regions`: the registered primary
   region plus further regions found by searching the wedge again after
@@ -28,6 +28,11 @@
   with repeat regions, against 18.3 s for v0.2.0 without them and 37.4 s for
   repeat regions on the previous search; at 1,800-2,046 aa (24 proteins) it
   takes 12.5 s, against 9.9 s and 22.8 s.
+- **Pipelined batches.** A batch's rows are yielded after the next batch has
+  run on the device and been submitted, so worker postprocessing overlaps the
+  forward pass; rows keep their order and values (byte-identical on MPS). On
+  an M4 Max, 400 natural Omnitrophota proteins take 44 s instead of 49 s and
+  40 proteins of 1,800-2,046 aa take 30 s instead of 55 s.
 - **Long proteins as windows.** `--long-proteins window` scores proteins
   above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
   giant-protein folding grid) and reports the best window in full-protein
