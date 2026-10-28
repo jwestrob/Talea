@@ -142,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WINDOW_STRIDE,
         help=(
             "residues between window starts in --long-proteins window mode "
-            f"(default {DEFAULT_WINDOW_STRIDE}, so each residue is read twice)"
+            f"(default {DEFAULT_WINDOW_STRIDE}, so interior residues are read twice)"
         ),
     )
     parser.add_argument(

@@ -372,8 +372,8 @@ as overlapping windows (next section); Talea never silently tiles or truncates.
 `--long-proteins window` (Python: `TaleaPredictor.iter_windowed_predictions`)
 scores each protein longer than 2,046 aa as windows of `--window-length`
 residues (2,000) starting every `--window-stride` residues (1,000), plus one
-window ending at the C-terminus, so every window has the same length and every
-residue is read at least twice. The 2,000/1,000 grid matches the chunks used to
+window ending at the C-terminus, so every window has the same length and
+residues more than 1,000 positions from either end are read twice. The 2,000/1,000 grid matches the chunks used to
 fold the Omnitrophota giant proteins, so window *k* is chunk *k*. Each window is
 scored exactly as a standalone protein. Proteins within the contract are scored
 whole and their rows are unchanged.
