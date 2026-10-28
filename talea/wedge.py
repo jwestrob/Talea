@@ -341,6 +341,165 @@ def _wedge_start_scores_reference(
     return scores / denominator
 
 
+class WedgePlan:
+    """Every template of a wedge search, laid out for evaluation together.
+
+    A template is one period at one interval width. Its harmonic members, their
+    weights and its normalizing variance depend only on the period, the width
+    and the track lengths, so one plan serves every search over tracks of the
+    same shape; repeat-region peeling repeats the search on edited tracks.
+
+    ``scores`` evaluates all periods of a width at once: each width's templates
+    accumulate slot by slot (the k-th member of every template in one array
+    operation), with the reference's elementwise products and sums in the
+    reference's order, so every score is bit-identical to
+    ``_wedge_start_scores_reference`` (asserted in tests/test_concordance.py).
+    """
+
+    def __init__(
+        self,
+        track_lengths: Sequence[int],
+        protein_length: int,
+        periods: Iterable[float],
+        widths: Iterable[int],
+        tolerance: int = 1,
+        max_harmonics: int = 8,
+        min_harmonics: int = 2,
+        interharmonic_controls: bool = True,
+    ):
+        if protein_length < 1:
+            raise ValueError("protein length must be positive")
+        if tolerance < 0:
+            raise ValueError("tolerance must be nonnegative")
+        if max_harmonics < 1 or min_harmonics < 1:
+            raise ValueError("harmonic counts must be positive")
+        self.track_lengths = tuple(int(value) for value in track_lengths)
+        self.protein_length = int(protein_length)
+        self.periods = tuple(sorted({float(value) for value in periods if value > 0}))
+        self.requested_widths = tuple(sorted({int(value) for value in widths if value > 0}))
+        self.settings = (int(tolerance), int(max_harmonics), int(min_harmonics), bool(interharmonic_controls))
+        self.layouts = {}
+        separations = set()
+        for width in sorted({min(value, self.protein_length) for value in self.requested_widths}):
+            members = {period: self._members(period, width) for period in self.periods}
+            valid = sorted(
+                (period for period in self.periods if members[period] is not None),
+                key=lambda period: -len(members[period][0]),
+            )
+            if not valid:
+                self.layouts[width] = None
+                continue
+            used = np.array(sorted({value for period in valid for value in members[period][0]}), dtype=np.int64)
+            position = {int(value): index for index, value in enumerate(used)}
+            slots = len(members[valid[0]][0])
+            index = np.zeros((len(valid), slots), dtype=np.int64)
+            weight = np.zeros((len(valid), slots), dtype=np.float64)
+            for row, period in enumerate(valid):
+                offsets, weights, _ = members[period]
+                index[row, : len(offsets)] = [position[value] for value in offsets]
+                weight[row, : len(weights)] = weights
+            counts = np.array([len(members[period][0]) for period in valid])
+            self.layouts[width] = {
+                "periods": tuple(valid),
+                "used": used,
+                "index": index,
+                "weight": weight,
+                "rows": tuple(int(np.sum(counts > slot)) for slot in range(slots)),
+                "denominator": np.array([members[period][2] for period in valid], dtype=np.float64),
+            }
+            separations.update(int(value) for value in used)
+        self.separations = np.array(sorted(separations), dtype=np.int64)
+
+    def _members(self, period: float, width: int):
+        """The reference's member offsets, weights and variance for one template."""
+        tolerance, max_harmonics, min_harmonics, interharmonic_controls = self.settings
+        lengths, protein_length = self.track_lengths, self.protein_length
+        maximum = min(len(lengths) - 1, width - 1)
+        offsets_out: list[int] = []
+        weights_out: list[float] = []
+        variance = 0.0
+        retained_harmonics = 0
+
+        def add_offsets(offsets: Iterable[int], weight: float) -> bool:
+            nonlocal variance
+            members = tuple(
+                separation
+                for separation in offsets
+                if separation < width
+                and separation < len(lengths)
+                and lengths[separation] == protein_length - separation
+            )
+            if not members:
+                return False
+            member_weight = weight / len(members)
+            for separation in members:
+                offsets_out.append(separation)
+                weights_out.append(member_weight)
+                variance += (member_weight**2) * (width - separation)
+            return True
+
+        for harmonic in range(1, max_harmonics + 1):
+            center = harmonic * period
+            if center > maximum + tolerance:
+                break
+            weight = 1.0 / np.sqrt(harmonic)
+            if add_offsets(_offsets(center, tolerance, maximum), weight):
+                retained_harmonics += 1
+            if interharmonic_controls:
+                control_center = (harmonic + 0.5) * period
+                if control_center <= maximum + tolerance:
+                    add_offsets(_offsets(control_center, tolerance, maximum), -weight)
+
+        if retained_harmonics < min_harmonics:
+            return None
+        return offsets_out, weights_out, np.sqrt(np.maximum(variance, 1e-12))
+
+    def matches(self, tracks: Sequence[np.ndarray], protein_length: int, periods, widths, settings) -> bool:
+        return (
+            self.protein_length == protein_length
+            and self.track_lengths == tuple(len(track) for track in tracks)
+            and self.periods == tuple(sorted({float(value) for value in periods if value > 0}))
+            and self.requested_widths == tuple(sorted({int(value) for value in widths if value > 0}))
+            and self.settings == settings
+        )
+
+    def scores(self, tracks: Sequence[np.ndarray]) -> dict[tuple[float, int], np.ndarray]:
+        """Start scores of every valid template, keyed by (period, clipped width)."""
+        if tuple(len(track) for track in tracks) != self.track_lengths:
+            raise ValueError("tracks differ in shape from the plan")
+        length = self.protein_length
+        # Row d holds the reference's prefix sum of diagonal d, [0, cumsum(track)].
+        prefix = np.zeros((len(tracks), length + 1), dtype=np.float64)
+        for separation in self.separations:
+            track = np.asarray(tracks[separation], dtype=np.float64)
+            prefix[separation, 1 : len(track) + 1] = np.cumsum(track)
+        flat = prefix.reshape(-1)
+        result = {}
+        for width, layout in self.layouts.items():
+            if layout is None:
+                continue
+            n_starts = length - width + 1
+            used = layout["used"]
+            # Element (d, width - d + j) of the prefix matrix sits at flat index
+            # d * length + width + j, so one strided view holds every diagonal's
+            # upper prefix values for all starts j.
+            upper = np.lib.stride_tricks.as_strided(
+                flat[width:],
+                shape=(len(tracks), n_starts),
+                strides=(length * flat.itemsize, flat.itemsize),
+                writeable=False,
+            )
+            sums = upper[used] - prefix[used, :n_starts]
+            scores = np.zeros((len(layout["periods"]), n_starts), dtype=np.float64)
+            index, weight = layout["index"], layout["weight"]
+            for slot, rows in enumerate(layout["rows"]):
+                scores[:rows] += weight[:rows, slot, None] * sums[index[:rows, slot]]
+            scores /= layout["denominator"][:, None]
+            for row, period in enumerate(layout["periods"]):
+                result[(period, width)] = scores[row]
+        return result
+
+
 def best_wedge_interval(
     tracks: Sequence[np.ndarray],
     protein_length: int,
@@ -350,14 +509,81 @@ def best_wedge_interval(
     max_harmonics: int = 8,
     min_harmonics: int = 2,
     interharmonic_controls: bool = True,
+    plan: WedgePlan | None = None,
 ) -> dict:
-    """Return the highest-scoring period/interval wedge call."""
+    """Return the highest-scoring period/interval wedge call.
+
+    ``plan`` reuses the templates of an earlier search over tracks of the same
+    shape (see WedgePlan); it must have been built with the same arguments.
+    """
     best: dict | None = None
-    diagonal_sums = DiagonalWindowSums(tracks, protein_length)
+    periods = tuple(periods)
+    widths = tuple(widths)
+    settings = (int(tolerance), int(max_harmonics), int(min_harmonics), bool(interharmonic_controls))
+    if protein_length >= 1:
+        if plan is None:
+            plan = WedgePlan(
+                [len(track) for track in tracks],
+                protein_length,
+                periods,
+                widths,
+                tolerance=tolerance,
+                max_harmonics=max_harmonics,
+                min_harmonics=min_harmonics,
+                interharmonic_controls=interharmonic_controls,
+            )
+        elif not plan.matches(tracks, protein_length, periods, widths, settings):
+            raise ValueError("plan was built for a different search")
+        template_scores = plan.scores(tracks)
+    else:
+        template_scores = {}
     for period in sorted({float(value) for value in periods if value > 0}):
         for requested_width in sorted({int(value) for value in widths if value > 0}):
             width = min(requested_width, protein_length)
-            scores = wedge_start_scores(
+            scores = template_scores.get((period, width))
+            if scores is None or not len(scores) or not np.any(np.isfinite(scores)):
+                continue
+            start = int(np.nanargmax(scores))
+            candidate = {
+                "start": start,
+                "end": start + width,
+                "window_size": width,
+                "period": period,
+                "score": float(scores[start]),
+                "tolerance": tolerance,
+                "max_harmonics": max_harmonics,
+                "min_harmonics": min_harmonics,
+                "interharmonic_controls": interharmonic_controls,
+            }
+            if best is None or candidate["score"] > best["score"]:
+                best = candidate
+    if best is None:
+        return {
+            "start": 0,
+            "end": 0,
+            "window_size": 0,
+            "period": -1.0,
+            "score": float("-inf"),
+        }
+    return best
+
+
+def _best_wedge_interval_reference(
+    tracks: Sequence[np.ndarray],
+    protein_length: int,
+    periods: Iterable[float],
+    widths: Iterable[int],
+    tolerance: int = 1,
+    max_harmonics: int = 8,
+    min_harmonics: int = 2,
+    interharmonic_controls: bool = True,
+) -> dict:
+    """Original template-by-template search, kept as the concordance oracle."""
+    best: dict | None = None
+    for period in sorted({float(value) for value in periods if value > 0}):
+        for requested_width in sorted({int(value) for value in widths if value > 0}):
+            width = min(requested_width, protein_length)
+            scores = _wedge_start_scores_reference(
                 tracks,
                 protein_length,
                 period,
@@ -366,7 +592,6 @@ def best_wedge_interval(
                 max_harmonics=max_harmonics,
                 min_harmonics=min_harmonics,
                 interharmonic_controls=interharmonic_controls,
-                diagonal_sums=diagonal_sums,
             )
             if not len(scores) or not np.any(np.isfinite(scores)):
                 continue

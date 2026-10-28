@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from talea.wedge import best_wedge_interval
+from talea.wedge import WedgePlan, best_wedge_interval
 
 SECONDARY_MAXIMUM_CALLS = 20
 SECONDARY_MINIMUM_SCORE = 12.0
@@ -70,18 +70,17 @@ def secondary_wedge_calls(
     minimum = max(SECONDARY_MINIMUM_SCORE, SECONDARY_MINIMUM_RELATIVE_SCORE * primary_score)
     work = [np.array(track, dtype=np.float64, copy=True) for track in tracks]
     suppress_interval(work, int(primary["start"]), int(primary["end"]))
+    settings = {
+        "tolerance": int(wedge["tolerance"]),
+        "max_harmonics": int(wedge["max_harmonics"]),
+        "min_harmonics": int(wedge["min_harmonics"]),
+        "interharmonic_controls": bool(wedge["interharmonic_controls"]),
+    }
+    # Suppression edits values only, so every search shares one template plan.
+    plan = WedgePlan([len(track) for track in work], length, periods, widths, **settings)
     calls = []
     for rank in range(2, 2 + SECONDARY_MAXIMUM_CALLS):
-        call = best_wedge_interval(
-            work,
-            length,
-            periods,
-            widths,
-            tolerance=int(wedge["tolerance"]),
-            max_harmonics=int(wedge["max_harmonics"]),
-            min_harmonics=int(wedge["min_harmonics"]),
-            interharmonic_controls=bool(wedge["interharmonic_controls"]),
-        )
+        call = best_wedge_interval(work, length, periods, widths, plan=plan, **settings)
         score = float(call["score"])
         if not math.isfinite(score) or score < minimum:
             break

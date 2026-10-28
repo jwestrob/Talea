@@ -37,6 +37,8 @@ from talea.production import roundtrip_attention_storage
 from talea.topology import process_attention_record, widths_from_config
 from talea.wedge import (
     DiagonalWindowSums,
+    WedgePlan,
+    _best_wedge_interval_reference,
     _wedge_start_scores_reference,
     best_wedge_interval,
     fuse_diagonal_tracks,
@@ -252,21 +254,51 @@ def test_wedge_scores_with_shared_sums_are_bit_exact(length, period):
                 assert np.array_equal(optimized, reference), (template_period, width, controls)
 
 
-def test_best_wedge_interval_matches_a_reference_template_loop():
-    length = 420
-    tracks = _wedge_tracks(length, 23.5, seed=4)
+@pytest.mark.parametrize(
+    "length,period,widths",
+    [
+        (96, 11.0, None),
+        (150, 7.5, None),
+        (333, 31.5, None),
+        (700, 42.0, None),
+        (420, 23.5, (96, 100, 333, 420, 512, 600)),
+        (60, 9.0, (96, 128)),
+    ],
+)
+def test_planned_search_matches_the_reference_search(length, period, widths):
+    """Every period of a width is scored at once; the call must be the reference's."""
+    tracks = _wedge_tracks(length, period, seed=length + 3)
+    if widths is None:
+        widths = widths_from_config(json.loads((ASSETS / "wedge_config.json").read_text()))
+    for periods in ((5.0, 7.5, period / 2, period, 2 * period, 64.0), (period,), (80.0,)):
+        for controls in (True, False):
+            for minimum in (1, 2, 4):
+                settings = {"interharmonic_controls": controls, "min_harmonics": minimum}
+                reference = _best_wedge_interval_reference(tracks, length, periods, widths, **settings)
+                assert best_wedge_interval(tracks, length, periods, widths, **settings) == reference
+
+
+def test_one_plan_serves_searches_over_edited_tracks():
+    """Repeat-region peeling edits track values between searches and reuses the plan."""
+    from talea.regions import suppress_interval
+
+    length = 640
+    tracks = _wedge_tracks(length, 28.0, seed=9)
     widths = widths_from_config(json.loads((ASSETS / "wedge_config.json").read_text()))
-    periods = (11.5, 23.5, 47.0, 70.5)
-    best = None
-    for period in periods:
-        for requested_width in widths:
-            width = min(requested_width, length)
-            scores = _wedge_start_scores_reference(tracks, length, period, width)
-            start = int(np.nanargmax(scores))
-            if best is None or float(scores[start]) > best[3]:
-                best = (start, start + width, period, float(scores[start]))
-    call = best_wedge_interval(tracks, length, periods, widths)
-    assert (call["start"], call["end"], call["period"], call["score"]) == best
+    periods = (14.0, 28.0, 56.0, 9.5)
+    plan = WedgePlan([len(track) for track in tracks], length, periods, widths)
+    for start, end in ((100, 300), (400, 560), (0, 90)):
+        assert best_wedge_interval(tracks, length, periods, widths, plan=plan) == (
+            _best_wedge_interval_reference(tracks, length, periods, widths)
+        )
+        suppress_interval(tracks, start, end)
+
+
+def test_plan_refuses_a_different_search():
+    tracks = _wedge_tracks(200, 16.0, seed=2)
+    plan = WedgePlan([len(track) for track in tracks], 200, (16.0,), (96, 128))
+    with pytest.raises(ValueError, match="different search"):
+        best_wedge_interval(tracks, 200, (16.0, 32.0), (96, 128), plan=plan)
 
 
 def test_shared_sums_refuse_other_tracks():
@@ -291,18 +323,21 @@ def test_process_attention_record_fields_agree(length):
         "diagonal_mean_profile"
     ]
     fast_comb = physical_module.score_signals.__globals__["best_harmonic_comb"]
-    fast_wedge = best_wedge_interval.__globals__["wedge_start_scores"]
+    import talea.regions as regions_module
+    import talea.topology as topology_module
+
+    fast_search = topology_module.best_wedge_interval
     attention_module.score_attention_window.__globals__["diagonal_mean_profile"] = (
         _diagonal_mean_profile_reference
     )
     physical_module.score_signals.__globals__["best_harmonic_comb"] = (
         _best_harmonic_comb_reference
     )
-    best_wedge_interval.__globals__["wedge_start_scores"] = (
-        lambda *args, diagonal_sums=None, **kwargs: _wedge_start_scores_reference(
-            *args, **kwargs
-        )
-    )
+    def reference_search(*args, plan=None, **kwargs):
+        return _best_wedge_interval_reference(*args, **kwargs)
+
+    topology_module.best_wedge_interval = reference_search
+    regions_module.best_wedge_interval = reference_search
     try:
         reference = process_attention_record(build_task(length))
     finally:
@@ -310,7 +345,8 @@ def test_process_attention_record_fields_agree(length):
             "diagonal_mean_profile"
         ] = fast_diagonal
         physical_module.score_signals.__globals__["best_harmonic_comb"] = fast_comb
-        best_wedge_interval.__globals__["wedge_start_scores"] = fast_wedge
+        topology_module.best_wedge_interval = fast_search
+        regions_module.best_wedge_interval = fast_search
 
     assert reference["status"] == optimized["status"]
     left, right = flatten_numeric(reference), flatten_numeric(optimized)
