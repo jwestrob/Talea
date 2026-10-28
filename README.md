@@ -434,7 +434,9 @@ region extends half a period past its wedge interval, as the registration seed
 does; a region of the same period (within 15%) that overlaps or nearly
 touches another merges into it.
 
-The first region (`source: primary`) is the registered extent, and
+Regions locate Talea's repeat evidence; read them for proteins that rank high
+on the discovery score, since every protein with a wedge call has a primary
+region. The first region (`source: primary`) is the registered extent, and
 registration, units and every score describe it alone; further regions
 (`source: secondary`) carry a period, extent, wedge score and mean
 residue-state probability. In window mode, `repeat_regions` is the union of
