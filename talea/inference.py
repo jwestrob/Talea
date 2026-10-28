@@ -78,6 +78,12 @@ def resolve_dtype(
 
 
 POSTPROCESS_MODES = ("thread", "process")
+BROKEN_POOL_MESSAGE = (
+    "a postprocess worker process exited abruptly. Process mode starts workers "
+    "that re-import the calling script, so a script that runs Talea must keep "
+    'that code under `if __name__ == "__main__":`; a worker can also be killed '
+    'for lack of memory. postprocess_mode="thread" runs without worker processes.'
+)
 UNIT_PLACEMENTS = ("phase-ssm", "comb")
 
 
@@ -105,6 +111,15 @@ def resolve_postprocess_workers(workers: int | None, mode: str) -> int:
     if workers < 1:
         raise ValueError("postprocess worker count must be positive")
     return int(workers)
+
+
+def postprocess_result(future: concurrent.futures.Future) -> dict:
+    """A postprocess future's result, explaining a broken worker pool."""
+
+    try:
+        return future.result()
+    except concurrent.futures.process.BrokenProcessPool as error:
+        raise RuntimeError(BROKEN_POOL_MESSAGE) from error
 
 
 def enable_deterministic_convolution() -> None:
@@ -479,6 +494,8 @@ class TaleaPredictor:
         inherit the parent's CUDA context; the cost is a one-off worker start
         plus pickling each record's matrices (8-16 MB at maximum length,
         against seconds of compute). Output is identical to thread mode.
+        Workers re-import the calling script (Python's spawn/forkserver rule),
+        so scripts must call Talea under ``if __name__ == "__main__":``.
 
         ``postprocess_mode="thread"`` runs postprocessing in-process and
         defaults to one worker: the work is dominated by many small NumPy
@@ -643,7 +660,7 @@ class TaleaPredictor:
                         teacher_track,
                         self.teacher_contract,
                     )
-                    topology = future.result()
+                    topology = postprocess_result(future)
                     scores = compose_talea_score(
                         teacher_summary["mean_probability"],
                         topology["topology_development_control_z"],

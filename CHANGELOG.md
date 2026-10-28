@@ -13,6 +13,9 @@
   identical to thread mode. On the H200 CATH lockbox timing (178,854 residues,
   12 workers) this runs at 6,582 residues/s against 1,580 for the previous
   thread default. `--postprocess-mode thread` restores the old behaviour.
+  Worker processes re-import the calling script, so API scripts must call
+  Talea under `if __name__ == "__main__":` (the README example now does); a
+  broken worker pool raises an error that says so.
 
 ## 0.2.0
 
