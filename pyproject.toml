@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "talea-solenoid"
-version = "0.3.0"
+version = "0.3.1"
 description = "Sequence-only discovery of elongated protein solenoids from ESM++ attention"
 readme = "README.md"
 requires-python = ">=3.10"

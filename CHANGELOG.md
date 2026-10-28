@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - **Kept worker pool.** The predictor starts its postprocess pool on the
   first call and reuses it; `close()` or the context manager stops it. Each
