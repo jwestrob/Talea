@@ -8,7 +8,8 @@
   residue-state track supports them. On 455 RepeatsDB chains with two to four
   curated solenoid regions, coverage of curated regions rises from 60.0% to
   76.7% at unchanged residue precision; single-region development proteins
-  keep their residue F1. Window mode reports the union over windows. Detection
+  keep their residue F1. Window mode reports the union of every window's
+  supported regions and lists each window's regions under `windowing`. Detection
   scores, the primary call, registration and units are unchanged. See README
   "Repeat regions".
 - **Long proteins as windows.** `--long-proteins window` scores proteins

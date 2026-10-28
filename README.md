@@ -440,8 +440,12 @@ region. The first region (`source: primary`) is the registered extent, and
 registration, units and every score describe it alone; further regions
 (`source: secondary`) carry a period, extent, wedge score and mean
 residue-state probability. In window mode, `repeat_regions` is the union of
-every window's regions in full-protein coordinates, with the window each came
-from.
+every window's supported regions in full-protein coordinates, with the window
+each came from: the best window's regions, plus the other windows' further
+regions and those of their primary regions that pass the same gate as a
+further call (mean residue-state probability at least 0.2, wedge score at
+least 12), since every window has a primary region whether or not it holds a
+repeat. Each window's own regions are listed under `windowing.windows`.
 
 Validation (2026-10-28; Talea's development data plus a new cohort):
 

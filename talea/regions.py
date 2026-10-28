@@ -189,18 +189,30 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
 
 
 def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best: int) -> list[dict]:
-    """Every window's regions in the full-protein frame, as one list.
+    """Every window's supported regions in the full-protein frame, as one list.
 
     ``windows`` holds each window's ``(start, repeat_regions)`` with window
     positions. The best window's regions enter first (its primary region stays
-    ``primary``); the rest enter strongest wedge score first, labelled
-    ``secondary``, and merge or trim exactly as within one protein. Each region
-    records the window it came from.
+    ``primary``). The other windows' regions enter strongest wedge score first,
+    labelled ``secondary``, and merge or trim exactly as within one protein;
+    their primary regions enter only when they pass the gate a further call
+    passes (mean residue-state probability >= 0.2, wedge score >= 12), since
+    every window has a primary region whether or not it holds a repeat. Each
+    region records the window it came from.
     """
 
     candidates = []
     for index, (offset, regions) in enumerate(windows):
         for region in regions:
+            if (
+                index != best
+                and region["source"] == "primary"
+                and not (
+                    float(region.get("mean_state_probability", 0.0)) >= SECONDARY_MINIMUM_STATE
+                    and float(region["wedge_score"]) >= SECONDARY_MINIMUM_SCORE
+                )
+            ):
+                continue
             shifted = {
                 **region,
                 "start": int(region["start"]) + int(offset),

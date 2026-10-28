@@ -111,8 +111,10 @@ def test_no_wedge_call_means_no_regions():
 def test_window_union_merges_a_region_seen_by_two_windows():
     first = [{"start": 1500, "end": 1900, "period": 24.0, "wedge_score": 40.0, "source": "primary", "wedge_calls": 1}]
     second = [
-        {"start": 500, "end": 950, "period": 24.5, "wedge_score": 35.0, "source": "primary", "wedge_calls": 1},
-        {"start": 1300, "end": 1700, "period": 40.0, "wedge_score": 20.0, "source": "secondary", "wedge_calls": 1},
+        {"start": 500, "end": 950, "period": 24.5, "wedge_score": 35.0, "source": "primary", "wedge_calls": 1,
+         "mean_state_probability": 0.6},
+        {"start": 1300, "end": 1700, "period": 40.0, "wedge_score": 20.0, "source": "secondary", "wedge_calls": 1,
+         "mean_state_probability": 0.4},
     ]
     union = union_window_regions([(0, first), (1000, second)], best=0)
     assert [(r["start"], r["end"], r["source"], r["window_index"]) for r in union] == [
@@ -120,6 +122,18 @@ def test_window_union_merges_a_region_seen_by_two_windows():
         (2300, 2700, "secondary", 1),
     ]
     assert union[0]["wedge_calls"] == 2
+
+
+def test_other_windows_add_their_primary_region_only_when_it_is_supported():
+    best = [{"start": 100, "end": 400, "period": 30.0, "wedge_score": 40.0, "source": "primary", "wedge_calls": 1,
+             "mean_state_probability": 0.1}]
+    weak = [{"start": 800, "end": 1100, "period": 22.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
+             "mean_state_probability": 0.1}]
+    strong = [{"start": 800, "end": 1100, "period": 22.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
+               "mean_state_probability": 0.5}]
+    assert [r["source"] for r in union_window_regions([(0, best), (1000, weak)], best=0)] == ["primary"]
+    union = union_window_regions([(0, best), (1000, strong)], best=0)
+    assert [(r["start"], r["source"], r["window_index"]) for r in union] == [(100, "primary", 0), (1800, "secondary", 1)]
 
 
 def test_windowed_rows_carry_the_union_of_window_regions():
@@ -135,6 +149,9 @@ def test_windowed_rows_carry_the_union_of_window_regions():
         })
     combined = combine_window_rows(parent, spans, rows, 2000, 1000)
     assert [(r["start"], r["end"], r["source"]) for r in combined["repeat_regions"]] == [(1100, 1400, "primary")]
+    windows = combined["windowing"]["windows"]
+    assert windows[0]["repeat_regions"] == []
+    assert [(r["start"], r["end"]) for r in windows[1]["repeat_regions"]] == [(1100, 1400)]
 
 
 def test_topology_rows_list_further_calls_and_keep_the_primary_call():

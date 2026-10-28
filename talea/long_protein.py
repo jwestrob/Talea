@@ -10,8 +10,9 @@ a window score lines up with an existing chunk structure.
 Each window is scored exactly as a standalone protein. The protein's row is the
 best window's row (highest discovery score) with every residue coordinate moved
 into the full-protein frame, plus a compact summary of every window under
-``windowing``. Its ``repeat_regions`` gathers every window's regions, so a
-protein with repeat domains in several windows lists them all. Proteins within the contract are scored whole and their rows are
+``windowing``. Its ``repeat_regions`` gathers the supported regions of every
+window, so a protein with repeat domains in several windows lists them all;
+each window's own regions stay under ``windowing``. Proteins within the contract are scored whole and their rows are
 unchanged.
 
 This module stays free of torch, so the window arithmetic and the row merge can
@@ -128,6 +129,11 @@ def window_summary(index: int, start: int, end: int, row: dict) -> dict:
             None if registration is None else start + int(registration["end"])
         ),
         "n_units": None if registration is None else int(registration["n_units"]),
+        **(
+            {"repeat_regions": shift_coordinates(row["repeat_regions"], start)}
+            if "repeat_regions" in row
+            else {}
+        ),
     }
 
 
