@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Kept worker pool.** The predictor starts its postprocess pool on the
+  first call and reuses it; `close()` or the context manager stops it. Each
+  new worker re-imports the calling script, so with a fresh pool per call a
+  script that imports Talea at top level paid the torch import on every call:
+  13 s per call on biotite's login node, 2.2 s on an M4 Max (and ~5 s per
+  single-protein call on an H200 in process mode). Later calls now take
+  milliseconds. Rows are byte-identical and batch time is unchanged.
+
 ## 0.3.0
 
 - **Every repeat region.** Rows gain `repeat_regions`: the registered primary

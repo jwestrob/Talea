@@ -270,7 +270,12 @@ if __name__ == "__main__":
 Postprocessing runs in worker processes, and each worker re-imports the calling
 script (Python's rule for spawned processes), so keep the entry point under
 `if __name__ == "__main__":` as above. `postprocess_mode="thread"` runs in one
-process.
+process. Every new worker re-imports the calling script, including torch if
+the script imports Talea at top level, which takes seconds on network storage
+(13 s per worker on biotite's login node). The predictor therefore starts its
+worker pool on the first call and keeps it, so scoring proteins one call at a
+time pays this once; `predictor.close()` (or
+`with TaleaPredictor(...) as predictor:`) stops it.
 
 `TaleaPredictor(unit_placement="comb")` reproduces v0.1.0 unit boundaries.
 Load one `TaleaPredictor` and reuse it. Starting multiple processes on the same

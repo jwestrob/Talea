@@ -1,5 +1,6 @@
 import concurrent.futures
 import hashlib
+import os
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ import torch
 
 from talea.cli import build_parser
 from talea.inference import (
+    TaleaPredictor,
     apc_head_mean,
     available_cpus,
     make_batches,
@@ -84,6 +86,39 @@ def test_broken_worker_pool_names_the_main_guard() -> None:
     finished = concurrent.futures.Future()
     finished.set_result({"status": "ok"})
     assert postprocess_result(finished) == {"status": "ok"}
+
+
+def bare_predictor() -> TaleaPredictor:
+    """A predictor with only what the worker pool needs (no models loaded)."""
+    predictor = object.__new__(TaleaPredictor)
+    predictor.configs = {}
+    predictor._postprocess_pool = None
+    predictor._postprocess_pool_workers = 0
+    return predictor
+
+
+def test_process_pool_serves_later_calls_until_closed() -> None:
+    with bare_predictor() as predictor:
+        pool = predictor._process_pool(2)
+        assert pool.submit(sum, [1, 2]).result() == 3
+        assert predictor._process_pool(2) is pool
+        resized = predictor._process_pool(3)
+        assert resized is not pool
+        with pytest.raises(RuntimeError):
+            pool.submit(sum, [1])
+    assert predictor._postprocess_pool is None
+    with pytest.raises(RuntimeError):
+        resized.submit(sum, [1])
+
+
+def test_process_pool_replaces_a_broken_pool() -> None:
+    with bare_predictor() as predictor:
+        pool = predictor._process_pool(2)
+        with pytest.raises(concurrent.futures.process.BrokenProcessPool):
+            pool.submit(os._exit, 1).result()
+        replacement = predictor._process_pool(2)
+        assert replacement is not pool
+        assert replacement.submit(sum, [4, 5]).result() == 9
 
 
 def test_teacher_runtime_model_output_shape() -> None:

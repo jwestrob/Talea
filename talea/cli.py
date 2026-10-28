@@ -243,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         raise
+    finally:
+        predictor.close()
 
     audit = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),

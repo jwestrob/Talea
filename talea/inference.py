@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import gc
 import hashlib
 import json
@@ -313,6 +314,8 @@ class TaleaPredictor:
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         if unit_placement not in UNIT_PLACEMENTS:
             raise ValueError(f"unsupported unit placement: {unit_placement}")
+        self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
+        self._postprocess_pool_workers = 0
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
         if self.deterministic:
@@ -351,6 +354,47 @@ class TaleaPredictor:
         self.loaded_at = time.time()
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
+
+    def _process_pool(self, workers: int) -> concurrent.futures.ProcessPoolExecutor:
+        """The postprocess worker pool, started once and kept for later calls.
+
+        Each new worker re-imports the calling script, torch included when
+        the script imports Talea at top level, which takes seconds on network
+        storage and would dominate a call that scores a single protein. A
+        call asking for a different worker count, or finding the pool broken
+        by a dead worker, gets a new pool.
+        """
+
+        pool = self._postprocess_pool
+        if pool is not None and (
+            workers != self._postprocess_pool_workers
+            or getattr(pool, "_broken", False)
+        ):
+            pool.shutdown(wait=True, cancel_futures=True)
+            pool = None
+        if pool is None:
+            pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=postprocess_pool_context(),
+                initializer=initialize_worker,
+                initargs=(self.configs,),
+            )
+            self._postprocess_pool = pool
+            self._postprocess_pool_workers = workers
+        return pool
+
+    def close(self) -> None:
+        """Stop the postprocess worker pool; a later call starts a new one."""
+
+        pool, self._postprocess_pool = self._postprocess_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> TaleaPredictor:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
     def _load_models(self) -> None:
         model_name = str(self.deployment["esmplusplus"]["model"])
@@ -495,6 +539,9 @@ class TaleaPredictor:
         inherit the parent's CUDA context; the cost is a one-off worker start
         plus pickling each record's matrices (8-16 MB at maximum length,
         against seconds of compute). Output is identical to thread mode.
+        The first call starts the pool and later calls reuse it, so calls that
+        each score one protein pay the start once; ``close()`` (or using the
+        predictor as a context manager) stops it.
         Workers re-import the calling script (Python's spawn/forkserver rule),
         so scripts must call Talea under ``if __name__ == "__main__":``.
 
@@ -537,11 +584,8 @@ class TaleaPredictor:
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
         )
         if postprocess_mode == "process":
-            pool_context = concurrent.futures.ProcessPoolExecutor(
-                max_workers=postprocess_workers,
-                mp_context=postprocess_pool_context(),
-                initializer=initialize_worker,
-                initargs=(self.configs,),
+            pool_context = contextlib.nullcontext(
+                self._process_pool(postprocess_workers)
             )
         else:
             pool_context = concurrent.futures.ThreadPoolExecutor(
@@ -607,12 +651,26 @@ class TaleaPredictor:
                 )
 
         pending = None
-        with pool_context as pool, torch.inference_mode(), selective_capture(
-            self.esm_model,
-            self.expected_layers,
-            self.expected_layers,
-            mode=capture_mode,
-        ) as capture:
+        compact = []
+
+        def cancel_outstanding():
+            # A call stopped early leaves no queued work in the kept pool.
+            for outstanding in (compact, pending[1] if pending else ()):
+                for _, future, *_ in outstanding:
+                    future.cancel()
+
+        with contextlib.ExitStack() as stack:
+            pool = stack.enter_context(pool_context)
+            stack.callback(cancel_outstanding)
+            stack.enter_context(torch.inference_mode())
+            capture = stack.enter_context(
+                selective_capture(
+                    self.esm_model,
+                    self.expected_layers,
+                    self.expected_layers,
+                    mode=capture_mode,
+                )
+            )
             for batch_index, batch in enumerate(batches, start=1):
                 tokenized = self.tokenizer(
                     [record.sequence for record in batch],
