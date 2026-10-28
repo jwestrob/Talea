@@ -32,7 +32,11 @@
   run on the device and been submitted, so worker postprocessing overlaps the
   forward pass; rows keep their order and values (byte-identical on MPS). On
   an M4 Max, 400 natural Omnitrophota proteins take 44 s instead of 49 s and
-  40 proteins of 1,800-2,046 aa take 30 s instead of 55 s.
+  40 proteins of 1,800-2,046 aa take 30 s instead of 55 s. On an H200 with 24
+  CPUs, pipelining recovers the throughput that units in every region had
+  cost (7% on natural proteins, 20% at 1,800-2,046 aa): 0.3.0 runs at 15,795
+  residues/s on 2,000 natural Omnitrophota proteins against 14,746 for v0.2.0,
+  and at 5,941 against 6,072 on 120 proteins of 1,800-2,046 aa.
 - **Long proteins as windows.** `--long-proteins window` scores proteins
   above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
   giant-protein folding grid) and reports the best window in full-protein

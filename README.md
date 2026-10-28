@@ -507,6 +507,12 @@ length of every window in window mode): 24 such proteins take 12.5 s against
 supported further calls (567 of 1,081 calls in the multi-region cohort) adds
 no measurable time on the 240 natural proteins and 8% at window length.
 
+End to end on an H200 with 24 CPUs (process workers, pipelined batches; two
+rounds in mirrored order), Talea 0.3.0 scores 2,000 natural Omnitrophota
+proteins at 15,795 residues/s against 14,746 for v0.2.0, and 120 proteins of
+1,800-2,046 aa at 5,941 against 6,072 (v0.2.0's own runs on that set ranged
+from 5,506 to 6,109 residues/s across two benchmark jobs on this shared node).
+
 ## Benchmark
 
 The principal comparator cohort contains 452 canonical proteins: 226
