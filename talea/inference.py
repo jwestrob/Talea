@@ -498,6 +498,10 @@ class TaleaPredictor:
         Workers re-import the calling script (Python's spawn/forkserver rule),
         so scripts must call Talea under ``if __name__ == "__main__":``.
 
+        Batches are pipelined: a batch's rows are yielded after the next batch
+        has run on the device and been submitted, so postprocessing overlaps
+        the forward pass. Up to two batches of matrices wait in the pool.
+
         ``postprocess_mode="thread"`` runs postprocessing in-process and
         defaults to one worker: the work is dominated by many small NumPy
         calls that hold the GIL, so a thread pool convoys rather than
@@ -543,6 +547,66 @@ class TaleaPredictor:
             pool_context = concurrent.futures.ThreadPoolExecutor(
                 max_workers=postprocess_workers
             )
+        reference_maximum = int(
+            self.deployment["input_contract"]["lockbox_reference_maximum_residues"]
+        )
+
+        def collect(batch_index, compact, global_probabilities):
+            """Yield one batch's rows, waiting for its postprocessing."""
+
+            nonlocal completed
+            for (
+                record,
+                future,
+                state_track,
+                teacher_track,
+            ), global_probability in zip(compact, global_probabilities, strict=True):
+                teacher_summary = summarize_teacher_prediction(
+                    state_track,
+                    teacher_track,
+                    self.teacher_contract,
+                )
+                topology = postprocess_result(future)
+                scores = compose_talea_score(
+                    teacher_summary["mean_probability"],
+                    topology["topology_development_control_z"],
+                    float(global_probability),
+                    self.deployment["score_contract"],
+                )
+                above_reference = bool(record.length > reference_maximum)
+                yield {
+                    **topology,
+                    **scores,
+                    "repeat_regions": repeat_regions(topology, state_track),
+                    "primary_score_field": "talea_discovery_score",
+                    "teacher_state_summary": {
+                        key: value
+                        for key, value in teacher_summary.items()
+                        if key != "predicted_teacher_mean_class_probability"
+                    },
+                    "predicted_teacher_mean_class_probability": teacher_summary[
+                        "predicted_teacher_mean_class_probability"
+                    ],
+                    "length_scope": {
+                        "lockbox_reference_maximum_residues": reference_maximum,
+                        "above_lockbox_reference_length": above_reference,
+                    },
+                    "above_lockbox_reference_length": above_reference,
+                    "evidence_status": self.deployment["evidence_status"],
+                    "interpretation": self.deployment["reporting_contract"][
+                        "interpretation"
+                    ],
+                }
+                completed += 1
+            if progress:
+                print(
+                    f"Talea: batch {batch_index}/{len(batches)}; "
+                    f"proteins {completed}/{len(ordered)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        pending = None
         with pool_context as pool, torch.inference_mode(), selective_capture(
             self.esm_model,
             self.expected_layers,
@@ -662,59 +726,8 @@ class TaleaPredictor:
                     attention_mask,
                     attentions,
                     hidden_states,
+                    pooled_rows,
                 )
-                for (
-                    record,
-                    future,
-                    state_track,
-                    teacher_track,
-                ), global_probability in zip(
-                    compact, global_probabilities, strict=True
-                ):
-                    teacher_summary = summarize_teacher_prediction(
-                        state_track,
-                        teacher_track,
-                        self.teacher_contract,
-                    )
-                    topology = postprocess_result(future)
-                    scores = compose_talea_score(
-                        teacher_summary["mean_probability"],
-                        topology["topology_development_control_z"],
-                        float(global_probability),
-                        self.deployment["score_contract"],
-                    )
-                    reference_maximum = int(
-                        self.deployment["input_contract"][
-                            "lockbox_reference_maximum_residues"
-                        ]
-                    )
-                    above_reference = bool(record.length > reference_maximum)
-                    yield {
-                        **topology,
-                        **scores,
-                        "repeat_regions": repeat_regions(topology, state_track),
-                        "primary_score_field": "talea_discovery_score",
-                        "teacher_state_summary": {
-                            key: value
-                            for key, value in teacher_summary.items()
-                            if key
-                            != "predicted_teacher_mean_class_probability"
-                        },
-                        "predicted_teacher_mean_class_probability": teacher_summary[
-                            "predicted_teacher_mean_class_probability"
-                        ],
-                        "length_scope": {
-                            "lockbox_reference_maximum_residues": reference_maximum,
-                            "above_lockbox_reference_length": above_reference,
-                        },
-                        "above_lockbox_reference_length": above_reference,
-                        "evidence_status": self.deployment["evidence_status"],
-                        "interpretation": self.deployment["reporting_contract"][
-                            "interpretation"
-                        ],
-                    }
-                    completed += 1
-                del compact, pooled_rows, global_probabilities
                 # empty_cache() returns blocks to the driver and forces later
                 # cudaMalloc; gc.collect() walks every generation. Both were
                 # unconditional per batch. Interval 0 disables them entirely,
@@ -725,10 +738,11 @@ class TaleaPredictor:
                         torch.mps.empty_cache()
                     elif self.device.type == "cuda":
                         torch.cuda.empty_cache()
-                if progress:
-                    print(
-                        f"Talea: batch {batch_index}/{len(batches)}; "
-                        f"proteins {completed}/{len(ordered)}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                # The previous batch is collected only now, so its
+                # postprocessing ran in the pool during this batch's forward
+                # pass and submissions.
+                if pending is not None:
+                    yield from collect(*pending)
+                pending = (batch_index, compact, global_probabilities)
+            if pending is not None:
+                yield from collect(*pending)
