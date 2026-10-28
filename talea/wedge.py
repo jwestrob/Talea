@@ -160,6 +160,40 @@ def _offsets(
     )
 
 
+class DiagonalWindowSums:
+    """Interval sums along each diagonal track, shared by the templates of one search.
+
+    A search scores every candidate period at every interval width, and the
+    harmonic offsets of different periods (and one offset at different widths)
+    revisit the same diagonals. Each track's prefix sum and each
+    (separation, width) interval sum is therefore computed once, with the
+    reference arithmetic, so every score stays bit-identical. The tracks must
+    not change while an instance is in use.
+    """
+
+    def __init__(self, tracks: Sequence[np.ndarray], protein_length: int):
+        self.tracks = tracks
+        self.protein_length = protein_length
+        self._prefix: dict[int, np.ndarray] = {}
+        self._sums: dict[tuple[int, int], np.ndarray] = {}
+
+    def interval_sums(self, separation: int, width: int) -> np.ndarray:
+        """Sum of diagonal ``separation`` over the pairs inside every ``width`` interval."""
+        key = (separation, width)
+        sums = self._sums.get(key)
+        if sums is None:
+            prefix = self._prefix.get(separation)
+            if prefix is None:
+                track = np.asarray(self.tracks[separation], dtype=np.float64)
+                prefix = np.concatenate(([0.0], np.cumsum(track)))
+                self._prefix[separation] = prefix
+            n_starts = self.protein_length - width + 1
+            included = width - separation
+            sums = prefix[included : included + n_starts] - prefix[:n_starts]
+            self._sums[key] = sums
+        return sums
+
+
 def wedge_start_scores(
     tracks: Sequence[np.ndarray],
     protein_length: int,
@@ -169,6 +203,7 @@ def wedge_start_scores(
     max_harmonics: int = 8,
     min_harmonics: int = 2,
     interharmonic_controls: bool = True,
+    diagonal_sums: DiagonalWindowSums | None = None,
 ) -> np.ndarray:
     """Score every start for one period/width wedge template.
 
@@ -177,7 +212,80 @@ def wedge_start_scores(
     regions.  Scores are normalized by the nominal independent-pair variance;
     this is a ranking statistic rather than a calibrated z score because
     neighboring attention entries are correlated.
+
+    ``diagonal_sums`` shares interval sums across the templates of one search
+    over ``tracks``. The normalizing variance is the same for every start, so it
+    accumulates as one scalar through the reference's sequence of additions.
+    ``_wedge_start_scores_reference`` retains the original implementation and
+    is asserted bit-identical in tests/test_concordance.py.
     """
+    if protein_length < 1:
+        return np.empty(0, dtype=np.float64)
+    if period <= 0:
+        raise ValueError("period must be positive")
+    if width < 1 or width > protein_length:
+        raise ValueError("width must be between one and protein length")
+    if tolerance < 0:
+        raise ValueError("tolerance must be nonnegative")
+    if max_harmonics < 1 or min_harmonics < 1:
+        raise ValueError("harmonic counts must be positive")
+    if diagonal_sums is None:
+        diagonal_sums = DiagonalWindowSums(tracks, protein_length)
+    elif diagonal_sums.tracks is not tracks or diagonal_sums.protein_length != protein_length:
+        raise ValueError("diagonal_sums belongs to different tracks")
+
+    n_starts = protein_length - width + 1
+    scores = np.zeros(n_starts, dtype=np.float64)
+    variance = 0.0
+    maximum = min(len(tracks) - 1, width - 1)
+    retained_harmonics = 0
+
+    def add_offsets(offsets: Iterable[int], weight: float) -> bool:
+        nonlocal variance
+        members = tuple(
+            separation
+            for separation in offsets
+            if separation < width
+            and separation < len(tracks)
+            and len(tracks[separation]) == protein_length - separation
+        )
+        if not members:
+            return False
+        member_weight = weight / len(members)
+        for separation in members:
+            scores[:] += member_weight * diagonal_sums.interval_sums(separation, width)
+            variance += (member_weight**2) * (width - separation)
+        return True
+
+    for harmonic in range(1, max_harmonics + 1):
+        center = harmonic * period
+        if center > maximum + tolerance:
+            break
+        weight = 1.0 / np.sqrt(harmonic)
+        if add_offsets(_offsets(center, tolerance, maximum), weight):
+            retained_harmonics += 1
+        if interharmonic_controls:
+            control_center = (harmonic + 0.5) * period
+            if control_center <= maximum + tolerance:
+                add_offsets(_offsets(control_center, tolerance, maximum), -weight)
+
+    if retained_harmonics < min_harmonics:
+        return np.full(n_starts, -np.inf, dtype=np.float64)
+    denominator = np.sqrt(np.maximum(variance, 1e-12))
+    return scores / denominator
+
+
+def _wedge_start_scores_reference(
+    tracks: Sequence[np.ndarray],
+    protein_length: int,
+    period: float,
+    width: int,
+    tolerance: int = 1,
+    max_harmonics: int = 8,
+    min_harmonics: int = 2,
+    interharmonic_controls: bool = True,
+) -> np.ndarray:
+    """Original per-template implementation, kept as the concordance oracle."""
     if protein_length < 1:
         return np.empty(0, dtype=np.float64)
     if period <= 0:
@@ -245,6 +353,7 @@ def best_wedge_interval(
 ) -> dict:
     """Return the highest-scoring period/interval wedge call."""
     best: dict | None = None
+    diagonal_sums = DiagonalWindowSums(tracks, protein_length)
     for period in sorted({float(value) for value in periods if value > 0}):
         for requested_width in sorted({int(value) for value in widths if value > 0}):
             width = min(requested_width, protein_length)
@@ -257,6 +366,7 @@ def best_wedge_interval(
                 max_harmonics=max_harmonics,
                 min_harmonics=min_harmonics,
                 interharmonic_controls=interharmonic_controls,
+                diagonal_sums=diagonal_sums,
             )
             if not len(scores) or not np.any(np.isfinite(scores)):
                 continue
@@ -324,6 +434,7 @@ def top_wedge_intervals(
         raise ValueError("global_nms_iou must be in [0, 1]")
 
     candidates = []
+    diagonal_sums = DiagonalWindowSums(tracks, protein_length)
     for period in sorted({float(value) for value in periods if value > 0}):
         for requested_width in sorted({int(value) for value in widths if value > 0}):
             width = min(requested_width, protein_length)
@@ -336,6 +447,7 @@ def top_wedge_intervals(
                 max_harmonics=max_harmonics,
                 min_harmonics=min_harmonics,
                 interharmonic_controls=interharmonic_controls,
+                diagonal_sums=diagonal_sums,
             )
             working = np.asarray(scores, dtype=np.float64).copy()
             minimum_separation = max(

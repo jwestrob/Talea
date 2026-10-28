@@ -34,7 +34,15 @@ from talea.physical import (
     best_harmonic_comb,
 )
 from talea.production import roundtrip_attention_storage
-from talea.topology import process_attention_record
+from talea.topology import process_attention_record, widths_from_config
+from talea.wedge import (
+    DiagonalWindowSums,
+    _wedge_start_scores_reference,
+    best_wedge_interval,
+    fuse_diagonal_tracks,
+    robust_diagonal_tracks,
+    wedge_start_scores,
+)
 
 ASSETS = Path(__file__).resolve().parents[1] / "talea" / "assets"
 
@@ -210,6 +218,66 @@ def test_harmonic_comb_degenerate_spectra_return_the_empty_call():
         assert reference == optimized
 
 
+# ------------------------------------------------------------ L1: wedge search
+def _wedge_tracks(length: int, period: float, seed: int) -> list[np.ndarray]:
+    return fuse_diagonal_tracks(
+        [
+            robust_diagonal_tracks(synthetic_attention(length, period, seed + offset), 256)
+            for offset in (0, 1)
+        ]
+    )
+
+
+@pytest.mark.parametrize("length,period", [(96, 11.0), (150, 7.5), (333, 31.5), (700, 42.0)])
+def test_wedge_scores_with_shared_sums_are_bit_exact(length, period):
+    """One search shares interval sums across templates; every score must be unchanged."""
+    tracks = _wedge_tracks(length, period, seed=length)
+    widths = widths_from_config(json.loads((ASSETS / "wedge_config.json").read_text()))
+    shared = DiagonalWindowSums(tracks, length)
+    for template_period in (5.0, 7.5, period / 2, period, 2 * period, 64.0):
+        for requested_width in widths:
+            width = min(requested_width, length)
+            for controls in (True, False):
+                reference = _wedge_start_scores_reference(
+                    tracks, length, template_period, width, interharmonic_controls=controls
+                )
+                optimized = wedge_start_scores(
+                    tracks,
+                    length,
+                    template_period,
+                    width,
+                    interharmonic_controls=controls,
+                    diagonal_sums=shared,
+                )
+                assert np.array_equal(optimized, reference), (template_period, width, controls)
+
+
+def test_best_wedge_interval_matches_a_reference_template_loop():
+    length = 420
+    tracks = _wedge_tracks(length, 23.5, seed=4)
+    widths = widths_from_config(json.loads((ASSETS / "wedge_config.json").read_text()))
+    periods = (11.5, 23.5, 47.0, 70.5)
+    best = None
+    for period in periods:
+        for requested_width in widths:
+            width = min(requested_width, length)
+            scores = _wedge_start_scores_reference(tracks, length, period, width)
+            start = int(np.nanargmax(scores))
+            if best is None or float(scores[start]) > best[3]:
+                best = (start, start + width, period, float(scores[start]))
+    call = best_wedge_interval(tracks, length, periods, widths)
+    assert (call["start"], call["end"], call["period"], call["score"]) == best
+
+
+def test_shared_sums_refuse_other_tracks():
+    tracks = _wedge_tracks(128, 16.0, seed=1)
+    other = [np.array(track, copy=True) for track in tracks]
+    with pytest.raises(ValueError, match="different tracks"):
+        wedge_start_scores(
+            other, 128, 16.0, 96, diagonal_sums=DiagonalWindowSums(tracks, 128)
+        )
+
+
 # --------------------------------------------------------------- L2: records
 @pytest.mark.parametrize("length", [220, 400, 700])
 def test_process_attention_record_fields_agree(length):
@@ -223,11 +291,17 @@ def test_process_attention_record_fields_agree(length):
         "diagonal_mean_profile"
     ]
     fast_comb = physical_module.score_signals.__globals__["best_harmonic_comb"]
+    fast_wedge = best_wedge_interval.__globals__["wedge_start_scores"]
     attention_module.score_attention_window.__globals__["diagonal_mean_profile"] = (
         _diagonal_mean_profile_reference
     )
     physical_module.score_signals.__globals__["best_harmonic_comb"] = (
         _best_harmonic_comb_reference
+    )
+    best_wedge_interval.__globals__["wedge_start_scores"] = (
+        lambda *args, diagonal_sums=None, **kwargs: _wedge_start_scores_reference(
+            *args, **kwargs
+        )
     )
     try:
         reference = process_attention_record(build_task(length))
@@ -236,6 +310,7 @@ def test_process_attention_record_fields_agree(length):
             "diagonal_mean_profile"
         ] = fast_diagonal
         physical_module.score_signals.__globals__["best_harmonic_comb"] = fast_comb
+        best_wedge_interval.__globals__["wedge_start_scores"] = fast_wedge
 
     assert reference["status"] == optimized["status"]
     left, right = flatten_numeric(reference), flatten_numeric(optimized)
@@ -249,7 +324,7 @@ def test_process_attention_record_fields_agree(length):
         delta = abs(a - b) / max(abs(a), 1e-12)
         if delta > worst:
             worst, worst_key = delta, key
-    # Both replaced kernels are bit-exact, so the whole record must be too.
+    # Every replaced kernel is bit-exact, so the whole record must be too.
     assert worst == 0.0, f"{worst_key} drifted by {worst:.3e}"
 
 
