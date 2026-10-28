@@ -462,7 +462,9 @@ Validation (2026-10-28; Talea's development data plus a new cohort):
 
 The further search adds one wedge search per protein when nothing passes and
 one more per region found (2.4 per protein in the multi-region cohort), which
-roughly doubles postprocessing CPU time.
+roughly doubles postprocessing CPU time. On an M4 Max (MPS, 16 CPUs), 150
+proteins (140,609 residues) took 66.7 s against 58.6 s without it (+14%), and
+every other field of every row was identical.
 
 ## Benchmark
 
