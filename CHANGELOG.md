@@ -7,7 +7,7 @@
   neutralizing each call (`secondary_wedge_calls`), kept when the U-Net
   residue-state track supports them. On 455 RepeatsDB chains with two to four
   curated solenoid regions, coverage of curated regions rises from 60.0% to
-  76.3% at unchanged residue precision; single-region development proteins
+  76.7% at unchanged residue precision; single-region development proteins
   keep their residue F1. Window mode reports the union over windows. Detection
   scores, the primary call, registration and units are unchanged. See README
   "Repeat regions".

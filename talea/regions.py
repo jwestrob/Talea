@@ -4,9 +4,9 @@ The wedge returns the single best period and interval, so a protein with two
 repeat regions (a solenoid split by an insertion, or two repeat domains) is
 reported by one of them. Here the search continues ("peeling"): the diagonal
 values of every residue pair that touches the primary call's interval are set
-to that diagonal's median, and the wedge is searched again, up to three more
-times. The search stops at the first call whose wedge score falls below 12 or
-below half the primary call's score.
+to that diagonal's median, and the wedge is searched again. The search stops
+at the first call whose wedge score falls below 12 or below half the primary
+call's score (and after 20 further calls at most).
 
 A further call becomes a region when the U-Net residue-state track averages at
 least 0.2 over its interval. Each region extends half a period past its wedge
@@ -29,7 +29,7 @@ import numpy as np
 
 from talea.wedge import best_wedge_interval
 
-SECONDARY_MAXIMUM_CALLS = 3
+SECONDARY_MAXIMUM_CALLS = 20
 SECONDARY_MINIMUM_SCORE = 12.0
 SECONDARY_MINIMUM_RELATIVE_SCORE = 0.5
 SECONDARY_MINIMUM_STATE = 0.2
