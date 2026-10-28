@@ -18,7 +18,8 @@
   bit-identical (the original search is kept as the concordance oracle).
   Single-threaded postprocessing of 240 Omnitrophota proteins takes 15.6 s
   with repeat regions, against 18.3 s for v0.2.0 without them and 37.4 s for
-  repeat regions on the previous search.
+  repeat regions on the previous search; at 1,800-2,046 aa (24 proteins) it
+  takes 12.5 s, against 9.9 s and 22.8 s.
 - **Long proteins as windows.** `--long-proteins window` scores proteins
   above 2,046 aa as overlapping 2,000-aa windows every 1,000 residues (the
   giant-protein folding grid) and reports the best window in full-protein

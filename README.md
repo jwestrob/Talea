@@ -478,7 +478,10 @@ scores every period of a width together, with bit-identical results, so
 postprocessing with the further search takes less CPU time than v0.2.0
 postprocessing without it: 15.6 s against 18.3 s, single-threaded, for 240
 Omnitrophota proteins (96-2,046 aa, median 274) whose attention was captured
-once. Every other field of those 240 rows equals v0.2.0's.
+once. Every other field of those 240 rows equals v0.2.0's. Long proteins run
+more further searches (6.4 further calls per protein at 1,800-2,046 aa, the
+length of every window in window mode): 24 such proteins take 12.5 s against
+9.9 s for v0.2.0 (22.8 s on the previous search).
 
 ## Benchmark
 
