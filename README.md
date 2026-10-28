@@ -316,8 +316,8 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `status` | `ok` when a wedge was localized; otherwise `no_wedge_call` |
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
-| `secondary_wedge_calls` | Further wedge calls after the primary one (see Repeat regions) |
-| `repeat_regions` | Every repeat region: the registered primary region plus supported further calls, each with period, wedge score and mean residue-state probability |
+| `secondary_wedge_calls` | Further wedge calls after the primary one; those the residue-state track supports are registered into units as the primary call is (see Repeat regions) |
+| `repeat_regions` | Every repeat region: the registered primary region plus supported further calls, each with period, units, wedge score and mean residue-state probability |
 | `registration.units` | Repeat-unit boundaries in the registered extent |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
@@ -437,9 +437,15 @@ touches another merges into it.
 Regions locate Talea's repeat evidence; read them for proteins that rank high
 on the discovery score, since every protein with a wedge call has a primary
 region. The first region (`source: primary`) is the registered extent, and
-registration, units and every score describe it alone; further regions
+registration and every score describe it alone; further regions
 (`source: secondary`) carry a period, extent, wedge score and mean
-residue-state probability. In window mode, `repeat_regions` is the union of
+residue-state probability. Every region carries `units`: the primary region
+the registration's units, a further region the units of its own wedge call,
+registered and placed exactly as the primary call's are (only further calls
+that pass the region gate are registered). A merge adds the
+incoming units whose midpoints fall outside the region's units, a trimmed
+region keeps the units whose midpoints fall inside it, and units are clipped
+where they meet and to their region. In window mode, `repeat_regions` is the union of
 every window's supported regions in full-protein coordinates, with the window
 each came from: the best window's regions, plus the other windows' further
 regions and those of their primary regions that pass the same gate as a
@@ -471,6 +477,20 @@ Validation (2026-10-28; Talea's development data plus a new cohort):
   (+0.014 [+0.007, +0.022]). Proteins carry 1.05 regions on average here and
   1.47 in the multi-region cohort.
 
+- **Units in every region.** Scored with the benchmark's array scorer
+  (unit boundaries within 5 residues; curated units of every curated
+  region), units in the further regions raise boundary F1 on the
+  multi-region cohort from 0.289 to 0.318 (+0.028 [+0.017, +0.041], 176 Pfam
+  groups) against further regions that carry only their ends, with
+  matched-unit IoU 0.653 → 0.663 and unit-count error 6.25 → 5.43 (−0.82
+  [−1.63, −0.12]). Curated regions found by a further region get boundary
+  F1 0.316 and matched-unit IoU 0.631 there (primary-region matches 0.395
+  and 0.674), at a median unit count equal to the curated one. On the
+  2,286 single-region development records boundary F1 holds (0.537 vs
+  0.537; −0.0005 [−0.0045, +0.0029], 350 components) and unit-count error
+  rises by 0.20 units (+0.20 [+0.11, +0.31]), the units of the extra regions
+  that 4.7% of those proteins carry.
+
 The further search adds one wedge search per protein when nothing passes and
 one more per region found (2.4 per protein in the multi-region cohort). The
 wedge search computes each diagonal's interval sums once per search and
@@ -481,7 +501,9 @@ Omnitrophota proteins (96-2,046 aa, median 274) whose attention was captured
 once. Every other field of those 240 rows equals v0.2.0's. Long proteins run
 more further searches (6.4 further calls per protein at 1,800-2,046 aa, the
 length of every window in window mode): 24 such proteins take 12.5 s against
-9.9 s for v0.2.0 (22.8 s on the previous search).
+9.9 s for v0.2.0 (22.8 s on the previous search). Registering the units of
+supported further calls (567 of 1,081 calls in the multi-region cohort) adds
+no measurable time on the 240 natural proteins and 8% at window length.
 
 ## Benchmark
 
@@ -672,8 +694,10 @@ repeat-extraction benchmark and the helix/strand/loop probes.
   at the aliased length.
 - Unit placement gains are largest for α and α/β solenoids, where helix and
   loop probabilities oscillate strongly within each unit.
-- Secondary repeat regions carry a period and extent but no unit
-  registration; units are placed in the primary region only.
+- Units of further regions match curated unit counts (median ratio 1.0)
+  and place unit boundaries less precisely than the primary region's
+  (boundary F1 0.32 vs 0.39 on matched curated regions of the multi-region
+  cohort).
 - The 1,733–2,046-aa range is a declared length extrapolation. Proteins
   above 2,046 aa are scored only as 2,000-aa windows (`--long-proteins
   window`), which see at most 2,000 residues of context.

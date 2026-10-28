@@ -12,6 +12,14 @@
   supported regions and lists each window's regions under `windowing`. Detection
   scores, the primary call, registration and units are unchanged. See README
   "Repeat regions".
+- **Units in every repeat region.** Further wedge calls that the residue-state
+  track supports are registered and placed as the primary call is, so every
+  entry of `repeat_regions` carries `units`. On the multi-region cohort,
+  boundary F1 rises from 0.289 to 0.318 (+0.028 [+0.017, +0.041]) with
+  matched-unit IoU and unit-count error both improving; single-region
+  development records keep their boundary F1. Workers now receive the
+  residue-state track (the parent runs the U-Net teacher before submitting
+  postprocessing); scores, registrations and region extents are unchanged.
 - **Faster wedge search.** Each search computes every diagonal's interval
   sums once and scores all candidate periods of a width together, and the
   repeat-region search reuses one template plan per protein. Output is
