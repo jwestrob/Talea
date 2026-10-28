@@ -159,4 +159,86 @@ def test_topology_rows_list_further_calls_and_keep_the_primary_call():
     assert isinstance(row["secondary_wedge_calls"], list)
     for call in row["secondary_wedge_calls"]:
         assert call["score"] <= row["wedge_call"]["score"]
-        assert set(call) == {"rank", "start", "end", "period", "score"}
+        assert set(call) == {"rank", "start", "end", "period", "score", "units", "unit_placement"}
+
+
+def test_further_calls_are_registered_like_the_primary_call():
+    task = build_task(640)
+    matrix = (localized_banded_matrix(640, 40, 200, 20) + 0.7 * localized_banded_matrix(640, 380, 540, 32))
+    task["matrices"] = {13: matrix.astype(np.float32), 35: matrix.astype(np.float32)}
+    row = process_attention_record(task)
+    assert (row["wedge_call"]["start"], row["wedge_call"]["end"]) == (40, 200)
+    (call,) = row["secondary_wedge_calls"]
+    assert (call["start"], call["end"], call["period"]) == (380, 540, 32.0)
+    assert call["unit_placement"] == "comb"
+    lengths = [unit["end"] - unit["start"] for unit in call["units"]]
+    assert len(lengths) >= 5 and set(lengths) == {32}
+    state = np.full(640, 0.6)
+    regions = repeat_regions(row, state)
+    assert [len(region["units"]) for region in regions] == [len(row["registration"]["units"]), len(call["units"])]
+
+
+def test_only_further_calls_the_state_supports_are_registered():
+    task = build_task(640)
+    matrix = (localized_banded_matrix(640, 40, 200, 20) + 0.7 * localized_banded_matrix(640, 380, 540, 32))
+    task["matrices"] = {13: matrix.astype(np.float32), 35: matrix.astype(np.float32)}
+    task["residue_state_probabilities"] = np.full(640, 0.05)
+    (call,) = process_attention_record(task)["secondary_wedge_calls"]
+    assert call["units"] is None and call["unit_placement"] is None
+    task["residue_state_probabilities"][380:540] = 0.6
+    (call,) = process_attention_record(task)["secondary_wedge_calls"]
+    assert len(call["units"]) >= 5
+
+
+def test_the_worker_passes_the_state_track_through():
+    import talea.postprocess_pool as pool_module
+
+    task = build_task(640)
+    matrix = (localized_banded_matrix(640, 40, 200, 20) + 0.7 * localized_banded_matrix(640, 380, 540, 32))
+    task["matrices"] = {13: matrix.astype(np.float32), 35: matrix.astype(np.float32)}
+    state = np.full(640, 0.05)
+    saved = pool_module._CONFIGS
+    pool_module.initialize_worker({key: task[key] for key in (
+        "protein_calibration", "local_calibration", "wedge_config", "operational_config")})
+    try:
+        row = pool_module.run_record((task["metadata"], task["matrices"], task["window_sizes"], None, state))
+    finally:
+        pool_module._CONFIGS = saved
+    assert [call["units"] for call in row["secondary_wedge_calls"]] == [None]
+
+
+def test_each_region_keeps_its_own_units_inside_its_extent():
+    row = topology([
+        {"rank": 2, "start": 390, "end": 520, "period": 32.0, "score": 20.0,
+         "units": [{"start": s, "end": s + 32} for s in range(360, 560, 32)]},
+    ])
+    row["registration"]["units"] = [{"start": s, "end": s + 20} for s in range(40, 170, 20)]
+    state = np.full(600, 0.6)
+    primary, secondary = repeat_regions(row, state)
+    assert primary["units"][0] == {"start": 40, "end": 60} and len(primary["units"]) == 7
+    # The region spans 374-536; units whose midpoints fall outside it are dropped, the rest clipped.
+    assert (secondary["start"], secondary["end"]) == (374, 536)
+    assert secondary["units"][0] == {"start": 374, "end": 392}
+    assert secondary["units"][-1] == {"start": 488, "end": 520}
+    assert all(374 <= unit["start"] < unit["end"] <= 536 for unit in secondary["units"])
+
+
+def test_a_merge_adds_only_the_units_beyond_the_region():
+    regions = [{"start": 40, "end": 170, "period": 20.0, "wedge_score": 30.0, "source": "primary", "wedge_calls": 1,
+                "units": [{"start": s, "end": s + 20} for s in range(40, 170, 20)]}]
+    add_region(regions, {"start": 150, "end": 250, "period": 21.0, "wedge_score": 18.0, "source": "secondary",
+                         "wedge_calls": 1, "units": [{"start": s, "end": s + 21} for s in range(152, 250, 21)]})
+    (region,) = regions
+    starts = [unit["start"] for unit in region["units"]]
+    assert starts[:7] == list(range(40, 170, 20))
+    # 152-173 centres inside 160-180 and is dropped; 173-194 starts where 160-180 ends.
+    assert starts[7:] == [180, 194, 215, 236]
+    assert all(left["end"] <= right["start"] for left, right in zip(region["units"], region["units"][1:]))
+    assert region["units"][-1]["end"] <= region["end"] == 250
+
+
+def test_window_union_moves_units_into_the_protein_frame():
+    second = [{"start": 100, "end": 400, "period": 30.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
+               "mean_state_probability": 0.5, "units": [{"start": 100, "end": 130}, {"start": 130, "end": 160}]}]
+    union = union_window_regions([(0, []), (1000, second)], best=0)
+    assert union[0]["units"] == [{"start": 1100, "end": 1130}, {"start": 1130, "end": 1160}]

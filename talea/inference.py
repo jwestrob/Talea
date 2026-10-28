@@ -617,10 +617,25 @@ class TaleaPredictor:
                     probabilities = self.residue_structure_probabilities(
                         hidden_states, indices, batch_position
                     )
+                    # The residue-state track goes to the worker too: further
+                    # wedge calls are registered into units only where it
+                    # supports them.
+                    state_track, teacher_track = teacher_tracks_from_attention(
+                        self.teacher_model,
+                        matrices,
+                        self.teacher_contract,
+                        self.device,
+                    )
                     if postprocess_mode == "process":
                         future = pool.submit(
                             run_record,
-                            (record.metadata(), matrices, window_sizes, probabilities),
+                            (
+                                record.metadata(),
+                                matrices,
+                                window_sizes,
+                                probabilities,
+                                state_track,
+                            ),
                         )
                     else:
                         future = pool.submit(
@@ -630,10 +645,11 @@ class TaleaPredictor:
                                 "matrices": matrices,
                                 "window_sizes": window_sizes,
                                 "residue_structure_probabilities": probabilities,
+                                "residue_state_probabilities": state_track,
                                 **self.configs,
                             },
                         )
-                    compact.append((record, matrices, future))
+                    compact.append((record, future, state_track, teacher_track))
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )
@@ -647,15 +663,14 @@ class TaleaPredictor:
                     attentions,
                     hidden_states,
                 )
-                for (record, matrices, future), global_probability in zip(
+                for (
+                    record,
+                    future,
+                    state_track,
+                    teacher_track,
+                ), global_probability in zip(
                     compact, global_probabilities, strict=True
                 ):
-                    state_track, teacher_track = teacher_tracks_from_attention(
-                        self.teacher_model,
-                        matrices,
-                        self.teacher_contract,
-                        self.device,
-                    )
                     teacher_summary = summarize_teacher_prediction(
                         state_track,
                         teacher_track,

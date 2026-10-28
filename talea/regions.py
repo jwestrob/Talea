@@ -18,6 +18,13 @@ found, provided that stretch spans two periods.
 The primary region starts as the registered extent and grows only by merging.
 Registration, units and every score continue to describe the primary call
 alone.
+
+Each region carries units: the primary region the registration's units, a
+further region the units of its own call, registered and placed exactly as the
+primary call's are. A merge adds the incoming units whose midpoints fall
+outside the region's units, and a trimmed region keeps the units whose
+midpoints fall inside it; units are clipped where they meet and to their
+region's extent.
 """
 
 from __future__ import annotations
@@ -115,11 +122,45 @@ def _longest_free_stretch(start: int, end: int, regions: Sequence[Mapping]) -> t
     return best
 
 
+def _units_inside(units: Sequence[Mapping], start: int, end: int) -> list[dict]:
+    """Units whose midpoints lie in ``[start, end)``, clipped to it."""
+
+    inside = []
+    for unit in units:
+        first, last = int(unit["start"]), int(unit["end"])
+        if start <= (first + last) / 2 < end:
+            first, last = max(first, start), min(last, end)
+            if last > first:
+                inside.append({"start": first, "end": last})
+    return inside
+
+
+def _merge_units(existing: Sequence[Mapping], incoming: Sequence[Mapping]) -> list[dict]:
+    """Existing units plus incoming ones whose midpoints fall outside them, clipped where they meet."""
+
+    units = [{"start": int(unit["start"]), "end": int(unit["end"])} for unit in existing]
+    for unit in incoming:
+        first, last = int(unit["start"]), int(unit["end"])
+        middle = (first + last) / 2
+        if not any(other["start"] <= middle < other["end"] for other in units):
+            units.append({"start": first, "end": last})
+    units.sort(key=lambda unit: (unit["start"], unit["end"]))
+    resolved: list[dict] = []
+    for unit in units:
+        if resolved and unit["start"] < resolved[-1]["end"]:
+            unit = {"start": resolved[-1]["end"], "end": unit["end"]}
+            if unit["end"] <= unit["start"]:
+                continue
+        resolved.append(unit)
+    return resolved
+
+
 def add_region(regions: list[dict], candidate: Mapping) -> None:
     """Add ``candidate`` to ``regions`` in place, merging or trimming it as described above.
 
-    A merge extends the existing region and adds the candidate's wedge calls to
-    its count; every other field of the existing region is kept.
+    A merge extends the existing region, adds the candidate's wedge calls to
+    its count and its units to the region's; every other field of the
+    existing region is kept.
     """
 
     start, end = int(candidate["start"]), int(candidate["end"])
@@ -138,10 +179,16 @@ def add_region(regions: list[dict], candidate: Mapping) -> None:
         target["start"] = min(target["start"], start)
         target["end"] = max(target["end"], end)
         target["wedge_calls"] += int(candidate.get("wedge_calls", 1))
+        target["units"] = _units_inside(
+            _merge_units(target.get("units", []), candidate.get("units", [])),
+            target["start"],
+            target["end"],
+        )
         return
     start, end = _longest_free_stretch(start, end, regions)
     if end - start >= 2 * period:
-        regions.append({**candidate, "start": start, "end": end})
+        units = _units_inside(candidate.get("units", []), start, end)
+        regions.append({**candidate, "start": start, "end": end, "units": units})
 
 
 def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
@@ -165,6 +212,10 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
             "wedge_score": float(wedge["score"]),
             "source": "primary",
             "wedge_calls": 1,
+            "units": [
+                {"start": int(unit["start"]), "end": int(unit["end"])}
+                for unit in registration.get("units") or []
+            ],
         }
     ]
     for call in topology.get("secondary_wedge_calls") or []:
@@ -180,6 +231,7 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
                 "wedge_score": float(call["score"]),
                 "source": "secondary",
                 "wedge_calls": 1,
+                "units": call.get("units") or [],
             },
         )
     for region in regions:
@@ -216,6 +268,10 @@ def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best:
                 **region,
                 "start": int(region["start"]) + int(offset),
                 "end": int(region["end"]) + int(offset),
+                "units": [
+                    {"start": int(unit["start"]) + int(offset), "end": int(unit["end"]) + int(offset)}
+                    for unit in region.get("units", [])
+                ],
                 "window_index": index,
             }
             if index != best:

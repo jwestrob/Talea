@@ -9,7 +9,7 @@ import numpy as np
 from talea.application import frozen_operational_scores, frozen_spectrum_score
 from talea.attention import scan_attention_matrix, score_attention_window
 from talea.phase_ssm import apply_placement, place_units
-from talea.regions import secondary_wedge_calls
+from talea.regions import SECONDARY_MINIMUM_STATE, secondary_wedge_calls
 from talea.unit_registration import (
     register_periodic_units,
     registered_closure_score,
@@ -189,17 +189,20 @@ def process_attention_record(task: dict) -> dict:
         attention = matrices[
             int(registration_config["attention_layer_zero_based"])
         ].astype(np.float64)
+        registration_options = {
+            "extension_fraction": float(registration_config["extension_fraction"]),
+            "phase_step": float(registration_config["phase_step"]),
+            "minimum_terminal_fraction": float(
+                registration_config["minimum_terminal_fraction"]
+            ),
+            "edge_cv_penalty": float(registration_config["edge_cv_penalty"]),
+        }
         registration = register_periodic_units(
             attention,
             period=float(wedge_call["period"]),
             core_start=int(wedge_call["start"]),
             core_end=int(wedge_call["end"]),
-            extension_fraction=float(registration_config["extension_fraction"]),
-            phase_step=float(registration_config["phase_step"]),
-            minimum_terminal_fraction=float(
-                registration_config["minimum_terminal_fraction"]
-            ),
-            edge_cv_penalty=float(registration_config["edge_cv_penalty"]),
+            **registration_options,
         )
         closure = registered_closure_score(attention, registration["units"])
         boundary_scan = scan_plausible_boundary_pairs(attention, registration)
@@ -213,6 +216,35 @@ def process_attention_record(task: dict) -> dict:
                 registration,
                 place_units(registration, probabilities, tracks, phase_config),
             )
+        # Each further call that the residue-state track supports (the gate a
+        # call passes to become a repeat region) is registered and placed the
+        # same way, so every repeat region carries units. Without a state
+        # track every further call is registered.
+        state = task.get("residue_state_probabilities")
+        for call in secondary_calls:
+            if state is not None and float(
+                np.mean(np.asarray(state, dtype=np.float64)[int(call["start"]) : int(call["end"])])
+            ) < SECONDARY_MINIMUM_STATE:
+                call["units"] = None
+                call["unit_placement"] = None
+                continue
+            call_registration = register_periodic_units(
+                attention,
+                period=float(call["period"]),
+                core_start=int(call["start"]),
+                core_end=int(call["end"]),
+                **registration_options,
+            )
+            if phase_config is not None and probabilities is not None:
+                call_registration = apply_placement(
+                    call_registration,
+                    place_units(call_registration, probabilities, tracks, phase_config),
+                )
+            call["units"] = [
+                {"start": int(unit["start"]), "end": int(unit["end"])}
+                for unit in call_registration["units"]
+            ]
+            call["unit_placement"] = call_registration.get("unit_placement", "comb")
     operational = frozen_operational_scores(
         status,
         boundary_scan,
