@@ -418,6 +418,34 @@ Validation (2026-10-27; development data only):
   scored whole are among the windowed regions (2.24 regions per protein whole,
   2.68 windowed).
 
+Window region gate (2026-10-29). Another window's primary region joins
+`repeat_regions` when that window's discovery score is at least 1.5. Inside a
+2,000-aa window the U-Net residue-state track reads curated giant-protein tubes
+at the level of non-solenoid sequence (median 0.17 against 0.16), while the
+window score separates them; the score was set from controls built for the
+purpose and checked against curated giant-protein labels:
+
+- **Controls.** 40 pseudo-giants of 12–14.5 kaa concatenate CATH S20
+  non-solenoid domains outside the CATH lockbox; 20 also carry four CATH
+  solenoid domains of at least 200 aa. Scored in 2,000-aa windows, 0.9% of the
+  non-solenoid windows reach 1.5, against 28% that pass the previous gate
+  (mean state at least 0.2); 0.4% of further calls pass that gate when the
+  same domains are scored whole. Coverage of the solenoid spike-ins is 0.82
+  (0.80 before).
+- **Giant proteins.** Over 79 giant proteins, curated tube and solenoid spans
+  (34 pure-tube and 14 poorly resolved tube chunks, two other solenoid chunks
+  and seven 2,000-aa models labelled solenoid) are covered 0.82 on average
+  against 0.47, and the same rule is chosen on either half of the 26 labelled
+  proteins (held-out 0.90 against 0.46 and 0.76 against 0.47; protein bootstrap
+  +0.35 [+0.25, +0.48]).
+- **Precision on natural sequence.** Natural proteins at window length score
+  higher than concatenated domains: 75% of Omnitrophota and 56% of DPANN
+  proteins of 1,800–2,046 aa reach 1.5. On the giants, residues outside every
+  labelled span inside a region rise from 19% to 54%, and the one labelled
+  non-repeat domain (an OpgH-like membrane glycan synthase next to a tube) is
+  now inside a region. Structure review sets the precision of the added
+  regions. The threshold applies to the default 2,000-aa windows.
+
 Read window scores as a ranking. Like whole proteins above 1,000 aa, 2,000-aa
 windows score high in absolute terms: 99% of the 809 windows of the tube
 parents exceed the CATH-control cutoff that classifies 95% of CATH controls as
@@ -455,10 +483,11 @@ region keeps the units whose midpoints fall inside it, and units are clipped
 where they meet and to their region. In window mode, `repeat_regions` is the union of
 every window's supported regions in full-protein coordinates, with the window
 each came from: the best window's regions, plus the other windows' further
-regions and those of their primary regions that pass the same gate as a
-further call (mean residue-state probability at least 0.2, wedge score at
-least 12), since every window has a primary region whether or not it holds a
-repeat. Each window's own regions are listed under `windowing.windows`.
+regions and the primary regions of the windows whose discovery score is at
+least 1.5 (with a wedge score of at least 12), since every window has a
+primary region whether or not it holds a repeat. Each window's own regions are
+listed under `windowing.windows`; see Long proteins for how the window gate was
+set.
 
 Validation (2026-10-28; Talea's development data plus a new cohort):
 

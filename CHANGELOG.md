@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased (trial branch `window-score-gate`)
+
+- **Window region gate.** In window mode another window's primary region
+  joins `repeat_regions` when that window's discovery score is at least 1.5
+  (wedge score at least 12), in place of the residue-state test (mean state at
+  least 0.2). Curated giant-protein tube and solenoid spans are covered 0.82 on
+  average against 0.47; on CATH pseudo-giants 0.9% of non-solenoid windows
+  enter against 28%, and solenoid spike-in coverage holds (0.82 against 0.80).
+  Natural sequence at window length scores higher than those controls, so the
+  added regions await structure review. Rows of proteins within 2,046 aa are
+  unchanged. See README "Long proteins".
+
 ## 0.3.1
 
 - **Kept worker pool.** The predictor starts its postprocess pool on the

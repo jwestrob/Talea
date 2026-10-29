@@ -116,7 +116,7 @@ def test_window_union_merges_a_region_seen_by_two_windows():
         {"start": 1300, "end": 1700, "period": 40.0, "wedge_score": 20.0, "source": "secondary", "wedge_calls": 1,
          "mean_state_probability": 0.4},
     ]
-    union = union_window_regions([(0, first), (1000, second)], best=0)
+    union = union_window_regions([(0, first, 3.0), (1000, second, 2.0)], best=0)
     assert [(r["start"], r["end"], r["source"], r["window_index"]) for r in union] == [
         (1500, 1950, "primary", 0),
         (2300, 2700, "secondary", 1),
@@ -124,16 +124,17 @@ def test_window_union_merges_a_region_seen_by_two_windows():
     assert union[0]["wedge_calls"] == 2
 
 
-def test_other_windows_add_their_primary_region_only_when_it_is_supported():
+def test_other_windows_add_their_primary_region_only_when_the_window_scores():
     best = [{"start": 100, "end": 400, "period": 30.0, "wedge_score": 40.0, "source": "primary", "wedge_calls": 1,
              "mean_state_probability": 0.1}]
-    weak = [{"start": 800, "end": 1100, "period": 22.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
-             "mean_state_probability": 0.1}]
-    strong = [{"start": 800, "end": 1100, "period": 22.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
-               "mean_state_probability": 0.5}]
-    assert [r["source"] for r in union_window_regions([(0, best), (1000, weak)], best=0)] == ["primary"]
-    union = union_window_regions([(0, best), (1000, strong)], best=0)
+    other = [{"start": 800, "end": 1100, "period": 22.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
+              "mean_state_probability": 0.5}]
+    low_state = [{**other[0], "mean_state_probability": 0.1}]
+    weak_wedge = [{**other[0], "wedge_score": 11.0}]
+    assert [r["source"] for r in union_window_regions([(0, best, 3.0), (1000, other, 1.4)], best=0)] == ["primary"]
+    union = union_window_regions([(0, best, 3.0), (1000, low_state, 1.5)], best=0)
     assert [(r["start"], r["source"], r["window_index"]) for r in union] == [(100, "primary", 0), (1800, "secondary", 1)]
+    assert len(union_window_regions([(0, best, 3.0), (1000, weak_wedge, 2.0)], best=0)) == 1
 
 
 def test_windowed_rows_carry_the_union_of_window_regions():
@@ -240,5 +241,5 @@ def test_a_merge_adds_only_the_units_beyond_the_region():
 def test_window_union_moves_units_into_the_protein_frame():
     second = [{"start": 100, "end": 400, "period": 30.0, "wedge_score": 25.0, "source": "primary", "wedge_calls": 1,
                "mean_state_probability": 0.5, "units": [{"start": 100, "end": 130}, {"start": 130, "end": 160}]}]
-    union = union_window_regions([(0, []), (1000, second)], best=0)
+    union = union_window_regions([(0, [], 3.0), (1000, second, 2.0)], best=0)
     assert union[0]["units"] == [{"start": 1100, "end": 1130}, {"start": 1130, "end": 1160}]

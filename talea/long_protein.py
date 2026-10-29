@@ -163,7 +163,11 @@ def combine_window_rows(
     if any("repeat_regions" in row for row in rows):
         combined["repeat_regions"] = union_window_regions(
             [
-                (window_start, row.get("repeat_regions") or [])
+                (
+                    window_start,
+                    row.get("repeat_regions") or [],
+                    float(row["talea_discovery_score"]),
+                )
                 for (window_start, _), row in zip(spans, rows, strict=True)
             ],
             best,

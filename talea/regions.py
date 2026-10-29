@@ -41,6 +41,7 @@ SECONDARY_MINIMUM_SCORE = 12.0
 SECONDARY_MINIMUM_RELATIVE_SCORE = 0.5
 SECONDARY_MINIMUM_STATE = 0.2
 MERGE_PERIOD_TOLERANCE = 0.15
+WINDOW_MINIMUM_SCORE = 1.5
 
 
 def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> None:
@@ -239,27 +240,32 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
     return sorted(regions, key=lambda region: region["start"])
 
 
-def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best: int) -> list[dict]:
+def union_window_regions(
+    windows: Sequence[tuple[int, Sequence[Mapping], float]], best: int
+) -> list[dict]:
     """Every window's supported regions in the full-protein frame, as one list.
 
-    ``windows`` holds each window's ``(start, repeat_regions)`` with window
-    positions. The best window's regions enter first (its primary region stays
-    ``primary``). The other windows' regions enter strongest wedge score first,
-    labelled ``secondary``, and merge or trim exactly as within one protein;
-    their primary regions enter only when they pass the gate a further call
-    passes (mean residue-state probability >= 0.2, wedge score >= 12), since
-    every window has a primary region whether or not it holds a repeat. Each
-    region records the window it came from.
+    ``windows`` holds each window's ``(start, repeat_regions, discovery_score)``
+    with window positions. The best window's regions enter first (its primary
+    region stays ``primary``). The other windows' regions enter strongest wedge
+    score first, labelled ``secondary``, and merge or trim exactly as within one
+    protein. Every window has a primary region whether or not it holds a
+    repeat, so another window's primary region enters only when that window's
+    discovery score is at least ``WINDOW_MINIMUM_SCORE`` and the region's wedge
+    score at least 12. Inside a 2,000-aa window the residue-state track reads
+    tube repeats no higher than non-solenoid sequence, so the window's
+    discovery score makes this call. Each region records the window it came
+    from.
     """
 
     candidates = []
-    for index, (offset, regions) in enumerate(windows):
+    for index, (offset, regions, score) in enumerate(windows):
         for region in regions:
             if (
                 index != best
                 and region["source"] == "primary"
                 and not (
-                    float(region.get("mean_state_probability", 0.0)) >= SECONDARY_MINIMUM_STATE
+                    float(score) >= WINDOW_MINIMUM_SCORE
                     and float(region["wedge_score"]) >= SECONDARY_MINIMUM_SCORE
                 )
             ):
