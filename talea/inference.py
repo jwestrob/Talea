@@ -36,7 +36,6 @@ from talea.production import (
     compose_talea_score,
     global_head_probabilities,
     pooled_hidden_features_for_layers,
-    pooled_hidden_features_for_record,
     roundtrip_attention_storage,
     summarize_teacher_prediction,
     teacher_tracks_from_attention,
