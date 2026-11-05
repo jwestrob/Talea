@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.2
+
+- **State regions.** `repeat_regions` gains regions from the U-Net
+  residue-state track alone (`source: state`). The wedge proposes a region
+  only where attention forms stripes at multiples of one period, so a stretch
+  the U-Net flags can go unproposed (a run of beta hairpins, for one). Every stretch where the track stays at or above 0.5
+  for at least 40 residues becomes a region over its longest part outside the
+  wedge regions, if that part spans 40 residues. A state region has
+  `period: null`, `wedge_score: null`, `wedge_calls: 0` and no units. State
+  regions enter after every wedge region, also in the window union, and never
+  absorb one. On all 3,453 concordance proteins, scores, wedge regions and
+  primary units are identical to 0.3.1. Residue recall over all regions on
+  the localization cohort rises from 0.949 to 0.956 (509 short proteins) and
+  from 0.947 to 0.956 (60 long proteins) at unchanged precision. No control
+  gains a state region (0 of 1,942). See README "Repeat regions".
+
 ## 0.3.1
 
 - **Kept worker pool.** The predictor starts its postprocess pool on the

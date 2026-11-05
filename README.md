@@ -322,7 +322,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
 | `secondary_wedge_calls` | Further wedge calls after the primary one; those the residue-state track supports are registered into units as the primary call is (see Repeat regions) |
-| `repeat_regions` | Every repeat region: the registered primary region plus supported further calls, each with period, units, wedge score and mean residue-state probability |
+| `repeat_regions` | Every repeat region: the registered primary region, supported further calls (each with period, units, wedge score and mean residue-state probability) and state regions from the residue-state track alone (`source: state`) |
 | `registration.units` | Repeat-unit boundaries in the registered extent |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
@@ -460,6 +460,18 @@ further call (mean residue-state probability at least 0.2, wedge score at
 least 12), since every window has a primary region whether or not it holds a
 repeat. Each window's own regions are listed under `windowing.windows`.
 
+The residue-state track adds regions of its own (`source: state`). The wedge
+proposes a region only where attention forms stripes parallel to the diagonal
+at multiples of one period. A stretch the U-Net flags can therefore go
+unproposed, such as a run of beta hairpins, whose contacts cross the diagonal.
+Every stretch where the track stays at or above 0.5 for at least 40 residues
+becomes a region over its longest part outside the wedge regions, if that part
+spans 40 residues. A state region has `period: null`, `wedge_score: null`,
+`wedge_calls: 0` and empty `units`; it carries its mean residue-state
+probability like every region. State regions enter after every wedge region,
+in window mode too, and a wedge region never merges into one. The primary
+region, registration, units and every score stay as they were.
+
 Validation (2026-10-28; Talea's development data plus a new cohort):
 
 - **Proteins with several curated regions.** RepeatsDB class 3 chains with two
@@ -497,6 +509,14 @@ Validation (2026-10-28; Talea's development data plus a new cohort):
   0.537; −0.0005 [−0.0045, +0.0029], 350 components) and unit-count error
   rises by 0.20 units (+0.20 [+0.11, +0.31]), the units of the extra regions
   that 4.7% of those proteins carry.
+- **State regions** (2026-11-05). On all 3,453 proteins of the concordance
+  cohorts, scores, wedge regions and primary units are identical to v0.3.1.
+  On the native context localization cohort, residue recall over all
+  regions rises from 0.949 to 0.956 on 509 short proteins and from 0.947 to
+  0.956 on 60 proteins of 1,013 to 1,946 aa, with residue precision
+  unchanged (0.646 and 0.433). 15 and 3 of those proteins gain a state
+  region, and 66% and 72% of state region residues lie in curated repeats.
+  No control gains one (0 of 1,942 RepeatsDB, CATH and ECOD controls).
 
 The further search adds one wedge search per protein when nothing passes and
 one more per region found (2.4 per protein in the multi-region cohort). The
