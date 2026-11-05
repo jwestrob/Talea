@@ -19,6 +19,15 @@ The primary region starts as the registered extent and grows only by merging.
 Registration, units and every score continue to describe the primary call
 alone.
 
+The residue-state track adds regions of its own ("state" regions). The wedge
+proposes regions only where attention forms stripes parallel to the diagonal at
+multiples of one period, so a stretch the U-Net flags can go unproposed (a run
+of beta hairpins, whose contacts cross the diagonal, for one). Every stretch
+where the track stays at or above 0.5 for at least 40 residues becomes a region
+over its longest part outside the wedge regions, provided that part spans 40
+residues. A state region has no period, wedge score or units; wedge regions
+never merge into it.
+
 Each region carries units: the primary region the registration's units, a
 further region the units of its own call, registered and placed exactly as the
 primary call's are. A merge adds the incoming units whose midpoints fall
@@ -41,6 +50,8 @@ SECONDARY_MINIMUM_SCORE = 12.0
 SECONDARY_MINIMUM_RELATIVE_SCORE = 0.5
 SECONDARY_MINIMUM_STATE = 0.2
 MERGE_PERIOD_TOLERANCE = 0.15
+STATE_RUN_MINIMUM_PROBABILITY = 0.5
+STATE_RUN_MINIMUM_LENGTH = 40
 
 
 def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> None:
@@ -122,6 +133,22 @@ def _longest_free_stretch(start: int, end: int, regions: Sequence[Mapping]) -> t
     return best
 
 
+def state_runs(
+    state: np.ndarray,
+    minimum_probability: float = STATE_RUN_MINIMUM_PROBABILITY,
+    minimum_length: int = STATE_RUN_MINIMUM_LENGTH,
+) -> list[tuple[int, int]]:
+    """Maximal ``[start, end)`` stretches where ``state >= minimum_probability``, at least ``minimum_length`` long."""
+
+    above = np.concatenate([[False], np.asarray(state) >= minimum_probability, [False]])
+    edges = np.flatnonzero(np.diff(above.astype(np.int8)))
+    return [
+        (int(start), int(end))
+        for start, end in zip(edges[::2], edges[1::2])
+        if end - start >= minimum_length
+    ]
+
+
 def _units_inside(units: Sequence[Mapping], start: int, end: int) -> list[dict]:
     """Units whose midpoints lie in ``[start, end)``, clipped to it."""
 
@@ -160,16 +187,23 @@ def add_region(regions: list[dict], candidate: Mapping) -> None:
 
     A merge extends the existing region, adds the candidate's wedge calls to
     its count and its units to the region's; every other field of the
-    existing region is kept.
+    existing region is kept. A candidate without a period (a state region)
+    never merges: it keeps its longest free stretch if that spans 40 residues.
     """
 
     start, end = int(candidate["start"]), int(candidate["end"])
+    if candidate.get("period") is None:
+        start, end = _longest_free_stretch(start, end, regions)
+        if end - start >= STATE_RUN_MINIMUM_LENGTH:
+            regions.append({**candidate, "start": start, "end": end, "units": []})
+        return
     period = float(candidate["period"])
     target = next(
         (
             region
             for region in regions
-            if abs(period / region["period"] - 1.0) <= MERGE_PERIOD_TOLERANCE
+            if region.get("period") is not None
+            and abs(period / region["period"] - 1.0) <= MERGE_PERIOD_TOLERANCE
             and start <= region["end"] + min(period, region["period"])
             and end >= region["start"] - min(period, region["period"])
         ),
@@ -192,7 +226,7 @@ def add_region(regions: list[dict], candidate: Mapping) -> None:
 
 
 def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
-    """Primary region plus accepted further calls, sorted by position.
+    """Primary region, accepted further calls and state regions, sorted by position.
 
     ``topology`` is a ``process_attention_record`` row; ``state_track`` is the
     U-Net residue-state probability for the same protein.
@@ -234,6 +268,19 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
                 "units": call.get("units") or [],
             },
         )
+    for start, end in state_runs(state):
+        add_region(
+            regions,
+            {
+                "start": start,
+                "end": end,
+                "period": None,
+                "wedge_score": None,
+                "source": "state",
+                "wedge_calls": 0,
+                "units": [],
+            },
+        )
     for region in regions:
         region["mean_state_probability"] = float(np.mean(state[region["start"] : region["end"]]))
     return sorted(regions, key=lambda region: region["start"])
@@ -248,8 +295,9 @@ def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best:
     labelled ``secondary``, and merge or trim exactly as within one protein;
     their primary regions enter only when they pass the gate a further call
     passes (mean residue-state probability >= 0.2, wedge score >= 12), since
-    every window has a primary region whether or not it holds a repeat. Each
-    region records the window it came from.
+    every window has a primary region whether or not it holds a repeat.
+    State regions enter after every wedge region. Each region records the
+    window it came from.
     """
 
     candidates = []
@@ -274,14 +322,15 @@ def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best:
                 ],
                 "window_index": index,
             }
-            if index != best:
+            if index != best and region["source"] != "state":
                 shifted["source"] = "secondary"
             candidates.append(shifted)
     candidates.sort(
         key=lambda region: (
+            region["source"] == "state",
             region["window_index"] != best,
             region["source"] != "primary",
-            -float(region["wedge_score"]),
+            -float(region["wedge_score"] or 0.0),
         )
     )
     merged: list[dict] = []

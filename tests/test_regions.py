@@ -6,9 +6,11 @@ import numpy as np
 from talea.long_protein import combine_window_rows
 from talea.regions import (
     SECONDARY_MINIMUM_STATE,
+    STATE_RUN_MINIMUM_LENGTH,
     add_region,
     repeat_regions,
     secondary_wedge_calls,
+    state_runs,
     suppress_interval,
     union_window_regions,
 )
@@ -87,7 +89,8 @@ def test_regions_keep_the_registered_primary_and_add_supported_calls():
 
 
 def test_a_same_period_call_next_to_the_primary_merges_into_it():
-    state = np.full(400, 0.6)
+    state = np.full(400, 0.05)
+    state[40:270] = 0.6
     regions = repeat_regions(
         topology([{"rank": 2, "start": 180, "end": 260, "period": 21.0, "score": 18.0}]),
         state,
@@ -102,6 +105,60 @@ def test_an_overlapping_call_at_another_period_keeps_only_its_free_stretch():
     assert [(r["start"], r["end"]) for r in regions] == [(40, 170), (170, 260)]
     add_region(regions, {"start": 160, "end": 200, "period": 40.0, "wedge_score": 13.0, "source": "secondary", "wedge_calls": 1})
     assert len(regions) == 2
+
+
+def test_a_state_run_the_wedge_never_proposed_becomes_a_state_region():
+    state = np.full(500, 0.05)
+    state[300:400] = 0.8  # e.g. a run of beta hairpins
+    regions = repeat_regions(topology([]), state)
+    assert [(r["start"], r["end"], r["source"]) for r in regions] == [(40, 170, "primary"), (300, 400, "state")]
+    region = regions[1]
+    assert region["period"] is None and region["wedge_score"] is None and region["units"] == []
+    assert region["wedge_calls"] == 0 and region["mean_state_probability"] > 0.79
+
+
+def test_a_state_run_keeps_only_its_free_stretch_and_only_if_it_spans_the_minimum():
+    state = np.full(500, 0.05)
+    state[100:250] = 0.8  # overlaps the primary region 40-170
+    regions = repeat_regions(topology([]), state)
+    assert [(r["start"], r["end"], r["source"]) for r in regions] == [(40, 170, "primary"), (170, 250, "state")]
+    state = np.full(500, 0.05)
+    state[100:200] = 0.8  # free stretch 170-200 is too short
+    assert [r["source"] for r in repeat_regions(topology([]), state)] == ["primary"]
+
+
+def test_state_runs_shorter_than_the_minimum_are_ignored():
+    state = np.zeros(300)
+    state[10:10 + STATE_RUN_MINIMUM_LENGTH - 1] = 0.9
+    state[100:100 + STATE_RUN_MINIMUM_LENGTH] = 0.5
+    assert state_runs(state) == [(100, 100 + STATE_RUN_MINIMUM_LENGTH)]
+
+
+def test_wedge_regions_never_merge_into_a_state_region():
+    regions = [{"start": 300, "end": 400, "period": None, "wedge_score": None, "source": "state", "wedge_calls": 0, "units": []}]
+    add_region(regions, {"start": 280, "end": 420, "period": 30.0, "wedge_score": 15.0, "source": "secondary", "wedge_calls": 1})
+    assert [(r["start"], r["end"], r["source"]) for r in regions] == [(300, 400, "state")]
+
+
+def test_window_union_adds_state_regions_after_every_wedge_region():
+    best = [
+        {"start": 100, "end": 400, "period": 30.0, "wedge_score": 40.0, "source": "primary", "wedge_calls": 1},
+        {"start": 500, "end": 600, "period": None, "wedge_score": None, "source": "state", "wedge_calls": 0, "units": []},
+    ]
+    other = [{"start": 0, "end": 300, "period": 22.0, "wedge_score": 25.0, "source": "secondary", "wedge_calls": 1,
+              "mean_state_probability": 0.5}]
+    union = union_window_regions([(0, best), (400, other)], best=0)
+    assert [(r["start"], r["end"], r["source"]) for r in union] == [
+        (100, 400, "primary"),
+        (400, 700, "secondary"),
+    ]
+    other_state = [{"start": 200, "end": 300, "period": None, "wedge_score": None, "source": "state", "wedge_calls": 0,
+                    "units": []}]
+    union = union_window_regions([(0, best[:1]), (400, other_state)], best=0)
+    assert [(r["start"], r["end"], r["source"], r["window_index"]) for r in union] == [
+        (100, 400, "primary", 0),
+        (600, 700, "state", 1),
+    ]
 
 
 def test_no_wedge_call_means_no_regions():
@@ -174,7 +231,7 @@ def test_further_calls_are_registered_like_the_primary_call():
     lengths = [unit["end"] - unit["start"] for unit in call["units"]]
     assert len(lengths) >= 5 and set(lengths) == {32}
     state = np.full(640, 0.6)
-    regions = repeat_regions(row, state)
+    regions = [r for r in repeat_regions(row, state) if r["source"] != "state"]
     assert [len(region["units"]) for region in regions] == [len(row["registration"]["units"]), len(call["units"])]
 
 
@@ -214,7 +271,7 @@ def test_each_region_keeps_its_own_units_inside_its_extent():
     ])
     row["registration"]["units"] = [{"start": s, "end": s + 20} for s in range(40, 170, 20)]
     state = np.full(600, 0.6)
-    primary, secondary = repeat_regions(row, state)
+    primary, secondary = [r for r in repeat_regions(row, state) if r["source"] != "state"]
     assert primary["units"][0] == {"start": 40, "end": 60} and len(primary["units"]) == 7
     # The region spans 374-536; units whose midpoints fall outside it are dropped, the rest clipped.
     assert (secondary["start"], secondary["end"]) == (374, 536)
