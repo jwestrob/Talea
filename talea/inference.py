@@ -562,6 +562,10 @@ class TaleaPredictor:
         has run on the device and been submitted, so postprocessing overlaps
         the forward pass. Up to two batches of matrices wait in the pool.
 
+        A call with a single protein always postprocesses in this process: the
+        worker round trip would cost more than the work (~36 ms of pickling and
+        IPC per protein on an M4 Max), and the output is identical.
+
         ``postprocess_mode="thread"`` runs postprocessing in-process and
         defaults to one worker: the work is dominated by many small NumPy
         calls that hold the GIL, so a thread pool convoys rather than
@@ -579,6 +583,12 @@ class TaleaPredictor:
         if not values:
             return
         self._validate_records(values)
+        if postprocess_mode == "process" and len(values) == 1:
+            # One protein: the worker round trip (pickling its matrices) costs
+            # more than the postprocessing itself, so run it in this process.
+            # Output is identical in both modes.
+            postprocess_mode = "thread"
+            postprocess_workers = None
         postprocess_workers = resolve_postprocess_workers(
             postprocess_workers, postprocess_mode
         )
