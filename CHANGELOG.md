@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
 - **State-cut primary extent** (`--primary-extent state`, default). The
   primary repeat region and the registration are cut to the U-Net
