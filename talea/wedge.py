@@ -56,7 +56,88 @@ def candidate_periods_from_windows(
     return tuple(sorted(result))
 
 
+def _row_lerp(a: np.ndarray, b: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """numpy's quantile interpolation (``_lerp``), elementwise and bit-identical."""
+
+    diff = b - a
+    low = a + diff * t
+    high = b - diff * (1 - t)
+    return np.where(t >= 0.5, high, low)
+
+
+def _sorted_row_quantile(rows: np.ndarray, counts: np.ndarray, q: float) -> np.ndarray:
+    """``np.quantile(row[:n], q)`` (linear method) for every row of an ascending-sorted, right-padded array."""
+
+    virtual = counts * q + (1 + q * (1 - 1 - 1)) - 1
+    previous = np.floor(virtual).astype(np.intp)
+    following = np.minimum(previous + 1, counts - 1)
+    gamma = virtual - previous
+    index = np.arange(len(rows))
+    return _row_lerp(rows[index, previous], rows[index, following], gamma)
+
+
+def _sorted_row_median(rows: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """``np.median(row[:n])`` for every row of an ascending-sorted, right-padded array."""
+
+    index = np.arange(len(rows))
+    half = counts // 2
+    upper = rows[index, half]
+    lower = rows[index, np.maximum(half - 1, 0)]
+    return np.where(counts % 2 == 1, upper, (lower + upper) / 2)
+
+
 def robust_diagonal_tracks(
+    matrix: np.ndarray,
+    max_separation: int,
+    baseline_quantile: float = 0.25,
+    clip: float = 8.0,
+) -> list[np.ndarray]:
+    """Spatially normalized upper-diagonal tracks, all separations at once.
+
+    Arithmetically identical to ``_robust_diagonal_tracks_reference`` (the per-diagonal loop it replaces,
+    kept as the concordance oracle): each diagonal's quantile, median and MAD come from one ascending sort
+    of a padded separation-by-position array, with numpy's own interpolation formulas.
+    """
+    values = np.asarray(matrix, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        raise ValueError("attention matrix must be square")
+    if not 0.0 <= baseline_quantile < 0.5:
+        raise ValueError("baseline_quantile must be in [0, 0.5)")
+    if max_separation < 1:
+        raise ValueError("max_separation must be positive")
+    if clip <= 0:
+        raise ValueError("clip must be positive")
+    length = len(values)
+    maximum = min(int(max_separation), length - 1)
+    tracks = [np.empty(0, dtype=np.float64) for _ in range(maximum + 1)]
+    if maximum < 1:
+        return tracks
+    separations = np.arange(1, maximum + 1)
+    counts = length - separations
+    # Row d - 1 holds diagonal d, left-aligned and padded with +inf so padding sorts last.
+    padded = np.full((maximum, length - 1), np.inf)
+    position = np.arange(length - 1)
+    valid = position[None, :] < counts[:, None]
+    rows, columns = np.nonzero(valid)
+    padded[rows, columns] = values[columns, columns + rows + 1]
+    ordered = np.sort(padded, axis=1)
+    baseline = _sorted_row_quantile(ordered, counts, baseline_quantile)
+    centered_sorted = ordered - baseline[:, None]
+    median = _sorted_row_median(centered_sorted, counts)
+    deviation = np.where(valid, np.abs(padded - baseline[:, None] - median[:, None]), np.inf)
+    scale = 1.4826 * _sorted_row_median(np.sort(deviation, axis=1), counts)
+    centered = padded - baseline[:, None]
+    for row in np.flatnonzero(scale < 1e-12):  # rare: fall back to the standard deviation
+        scale[row] = float(np.std(centered[row, : counts[row]]))
+    usable = scale >= 1e-12
+    normalized = np.zeros_like(centered)
+    normalized[usable] = np.clip(centered[usable] / scale[usable, None], -clip, clip)
+    for separation, count in zip(separations, counts):
+        tracks[separation] = normalized[separation - 1, :count].copy()
+    return tracks
+
+
+def _robust_diagonal_tracks_reference(
     matrix: np.ndarray,
     max_separation: int,
     baseline_quantile: float = 0.25,

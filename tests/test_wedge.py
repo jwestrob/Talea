@@ -178,3 +178,18 @@ def test_residue_evidence_extension_is_asymmetric_and_never_contracts_seed():
     assert result["end"] >= 210
     assert result["start"] < 100
     assert result["end"] > 200
+
+
+def test_vectorized_diagonal_tracks_equal_the_reference_loop_exactly():
+    from talea.wedge import _robust_diagonal_tracks_reference
+
+    rng = np.random.default_rng(7)
+    for length in (12, 97, 130, 301):
+        matrix = rng.random((length, length)).astype(np.float32)
+        matrix = 0.5 * (matrix + matrix.T)
+        matrix[:, : length // 3] = 0.0  # constant stretches exercise the standard-deviation fallback
+        for separation in (5, 64, 256):
+            fast = robust_diagonal_tracks(matrix, max_separation=separation)
+            slow = _robust_diagonal_tracks_reference(matrix, max_separation=separation)
+            assert len(fast) == len(slow)
+            assert all(np.array_equal(a, b) for a, b in zip(fast, slow))
