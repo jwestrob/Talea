@@ -6,24 +6,25 @@
   residue-mean ESM++ hidden states (layers 7/15/23/31; new asset
   `openness_gate.json`) demotes proteins it calls closed repeats:
   `talea_discovery_score = ungated + min(0, logit p_open)`; the earlier score is
-  kept as `talea_discovery_score_ungated`. CATH AP +0.021 [+0.004, +0.040], ECOD
-  balanced AP 0.988 -> 0.992, RepeatsDB 452 and pMEGA4 unchanged.
+  kept as `talea_discovery_score_ungated`, with `openness_probability` and
+  `openness_penalty`. Validated end to end (release code, M4 Max): CATH S20 AP
+  0.810 -> 0.831 (+0.021 [+0.004, +0.040]), AUROC 0.941 -> 0.953; ECOD balanced
+  AP 0.988 -> 0.992; RepeatsDB 452 (0.996) and pMEGA4 (0.764) unchanged.
+- **Region-probe extension of the primary region.** A per-residue probe on ESM++
+  layer 35 (fitted on RepeatsDB class 3 development records; new asset
+  `region_probe.json`) extends the primary region where the U-Net state
+  under-fires; the registration's extent widens to match, its units unchanged.
+  Fresh-holdout region F1 0.691 -> 0.783; native-context localization median IoU
+  short 0.813 -> 0.817, long 0.734 -> 0.754 (mean 0.728 -> 0.732, 0.603 -> 0.612).
 - **`--capture-mode auto` is the default**: `sdpa` (uncaptured layers on the
   fast attention backend) on CUDA, `manual` on Apple MPS and CPU, where sdpa's
   memory grows over long, variable-length runs until they fail (reproduced on
   the 597-protein fresh holdout, also with per-batch cache clearing).
   `--capture-mode manual` reproduces the earlier numerics exactly; sdpa scores
   differ by at most ~0.006.
-- **Faster postprocessing.** Vectorized diagonal normalization (bit-identical)
-  and in-process postprocessing for single-protein calls.
-
-- **Region-probe extension of the primary region** (default `--primary-extent
-  state`). A per-residue probe on ESM++ layer 35 (fitted on RepeatsDB class 3
-  development records; new asset `region_probe.json`) extends the primary
-  region where the U-Net state under-fires; the registration's extent widens to
-  match, its units unchanged. Scores unchanged. Mean primary-region IoU +0.030
-  (fresh holdout), +0.016 (test), +0.009 (development), +0.005 / +0.008
-  (native-context short / long); fresh-holdout region F1 0.691 -> 0.783.
+- **Faster postprocessing.** Vectorized diagonal normalization (bit-identical
+  on 8,046 cached matrices) and in-process postprocessing for single-protein
+  calls; one-protein-at-a-time latency on an M4 Max 0.168 -> ~0.152 s.
 
 ## 0.3.4
 
