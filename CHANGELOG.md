@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.4
+
+- **Primary region chosen by residue-state mass** (default `--primary-extent
+  state`). When a further wedge region carries more than twice the primary
+  region's state mass and has at least three units, it becomes the primary
+  region (`selected_by: state_mass`) and the registration takes its units and
+  period (`registration.selected_region`, with the wedge call's registration
+  under `wedge_call_registration`). Scores and `wedge_call` are unchanged.
+  Mean primary-region IoU +0.010 [+0.002, +0.020] (509 short native-context
+  proteins, 9 switched) and +0.040 [-0.014, +0.099] (60 long, 5 switched);
+  boundary F1 +0.005 and unit IoU +0.006 (test), unit IoU +0.011 (fresh
+  holdout); neutral on development. `--primary-extent registered` still
+  reproduces 0.3.2.
+
 ## 0.3.3
 
 - **State-cut primary extent** (`--primary-extent state`, default). The

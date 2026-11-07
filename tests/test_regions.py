@@ -10,6 +10,7 @@ from talea.regions import (
     STATE_RUN_MINIMUM_LENGTH,
     add_region,
     max_sum_segment,
+    registration_for_primary,
     repeat_regions,
     secondary_wedge_calls,
     state_runs,
@@ -403,3 +404,34 @@ def test_trim_registration_keeps_the_units_the_wedge_floor_covers():
     assert trim_registration(registration, state) is registration  # two units only: kept as registered
     trimmed = trim_registration(registration, state, floor=(60, 160))
     assert (trimmed["start"], trimmed["end"], trimmed["n_units"]) == (60, 160, 5)
+
+
+def test_a_further_region_with_much_more_state_becomes_the_primary_region():
+    state = np.full(700, 0.05)
+    state[60:130] = 0.4  # weak state over the strongest wedge call (wedge 50-150)
+    state[380:560] = 0.9  # strong state over a further call
+    row = topology([{"rank": 2, "start": 390, "end": 550, "period": 32.0, "score": 20.0,
+                     "units": units_from(374, 566, 32)}])
+    row["registration"]["units"] = units_from(40, 170, 20)
+    regions = repeat_regions(row, state)
+    primary = next(r for r in regions if r["source"] == "primary")
+    assert primary["selected_by"] == "state_mass" and primary["period"] == 32.0
+    assert 374 <= primary["start"] < primary["end"] <= 566
+    assert any(r["source"] == "secondary" and r["period"] == 20.0 for r in regions)
+    registration = registration_for_primary(dict(row["registration"], n_units=6), regions)
+    assert registration["selected_region"] == "state_mass" and registration["period"] == 32.0
+    assert registration["wedge_call_registration"]["start"] == 40 and registration["n_units"] >= 3
+    assert "registration_units" not in primary
+
+
+def test_the_primary_region_stays_when_no_further_region_has_twice_its_state():
+    state = np.full(700, 0.05)
+    state[50:150] = 0.8
+    state[380:560] = 0.8
+    row = topology([{"rank": 2, "start": 390, "end": 550, "period": 32.0, "score": 20.0,
+                     "units": units_from(374, 566, 32)}])
+    regions = repeat_regions(row, state)
+    primary = next(r for r in regions if r["source"] == "primary")
+    assert primary["period"] == 20.0 and "selected_by" not in primary
+    registration = {"start": 40, "end": 170, "period": 20.0, "units": units_from(40, 170, 20)}
+    assert registration_for_primary(registration, regions) is registration

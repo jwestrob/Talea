@@ -326,6 +326,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `repeat_regions` | Every repeat region: the primary region (cut to the residue-state track by default), supported further calls (each with period, units, wedge score and mean residue-state probability) and state regions from the residue-state track alone (`source: state`) |
 | `registration.units` | Repeat-unit boundaries of the registration (by default the registered units at least half inside the state extent) |
 | `registration.registered_start`, `registered_end`, `registered_units` | The registered extent and units before the state cut (present when the cut applied) |
+| `registration.selected_region`, `wedge_call_registration` | Present when a further region carrying more than twice the state mass became the primary region: `state_mass`, and the wedge call's registration |
 | `primary_extent` | `state` or `registered` (see Repeat regions) |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
@@ -495,7 +496,20 @@ residues leaves the region as registered, and fewer than three surviving units
 leave the registration as registered. Scores are identical under both settings;
 `--primary-extent registered` reproduces v0.3.2.
 
-Validation (2026-11-07; mean residue IoU of the primary region against the
+When a further wedge region carries more than twice the primary region's
+residue-state mass (the sum of state - 0.2 over its own state extent, never cut
+inside its wedge interval) and has at least three units, it becomes the primary
+region (`selected_by: state_mass`) and the registration takes its whole units at
+least half inside, its period and their span (`registration.selected_region:
+state_mass`, with the wedge call's registration under
+`registration.wedge_call_registration`). `wedge_call` and every score still
+describe the strongest wedge call. The switch fires for 9 of 509 short and 5 of
+60 long native-context proteins; it raises mean primary-region IoU by +0.010
+[+0.002, +0.020] (short) and +0.040 [-0.014, +0.099] (long), boundary F1 by
++0.005 (test) and unit IoU by +0.006 (test) and +0.011 (fresh holdout), and is
+neutral on development.
+
+Validation of the state cut (2026-11-07; mean residue IoU of the primary region against the
 curated region, paired group bootstrap):
 
 | Cohort | n | registered | state | change [95% CI] |

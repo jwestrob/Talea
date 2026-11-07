@@ -29,7 +29,13 @@ registration adds around the wedge's own evidence; where the U-Net fires on
 part of a repeat it has not seen, the wedge interval is kept. The cut follows
 the further calls' merges and precedes the state regions; a further region then
 keeps only its longest stretch outside the primary region, provided that stretch
-spans two periods. 0.2 is the same threshold that admits a further call. The registration is cut the same way
+spans two periods. 0.2 is the same threshold that admits a further call.
+Then, when a further wedge region carries more than twice the primary region's
+residue-state mass (the sum of state - 0.2 over its own state extent), it becomes
+the primary region (``choose_primary_by_state``) and the registration takes its
+units and period (``registration_for_primary``); the wedge call's registration
+stays under ``wedge_call_registration``, and ``wedge_call`` and every score still
+describe the strongest wedge call. The registration is cut the same way
 (``trim_registration``, with the same wedge floor): it keeps the units at least
 half inside that stretch,
 whole, and spans them; the registered extent and units stay under
@@ -75,6 +81,7 @@ PRIMARY_EXTENTS = ("state", "registered")
 PRIMARY_STATE_THRESHOLD = SECONDARY_MINIMUM_STATE
 PRIMARY_MINIMUM_STRETCH = 8
 TRIMMED_MINIMUM_UNITS = 3
+STATE_CHOICE_RATIO = 2.0
 
 
 def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> None:
@@ -357,6 +364,99 @@ def cut_primary_to_state(
     regions[:] = kept
 
 
+def _state_mass(state: np.ndarray, start: int, end: int) -> float:
+    return float(np.sum(np.asarray(state[start:end], dtype=np.float64) - PRIMARY_STATE_THRESHOLD))
+
+
+def choose_primary_by_state(regions: list[dict], state: np.ndarray) -> None:
+    """Make a further region the primary one, in place, when it carries much more residue-state evidence.
+
+    Each further region's state extent is its maximum-sum stretch of (state - 0.2), never cut inside its
+    wedge interval (its extent less half a period on each side); its state mass is the sum of (state - 0.2)
+    over that extent, and the primary region's mass is taken over its own (already cut) extent. When the
+    region with the most mass is a further region with at least three units and its mass exceeds twice the
+    primary region's, it becomes the primary region (``selected_by: state_mass``) over its state extent with
+    its units inside, the former primary region becomes a further region, and every other region keeps only
+    its longest stretch outside the new primary region, if that stretch spans two of its periods. The new
+    primary region carries ``registration_units`` (its whole units at least half inside its extent) for
+    ``registration_for_primary``.
+    """
+
+    primary = regions[0]
+    best, best_mass, best_extent = primary, _state_mass(state, primary["start"], primary["end"]), None
+    primary_mass = best_mass
+    for region in regions[1:]:
+        if region.get("period") is None:
+            continue
+        period = float(region["period"])
+        floor = (int(round(region["start"] + 0.5 * period)), int(round(region["end"] - 0.5 * period)))
+        extent = state_extent(state, int(region["start"]), int(region["end"]), period, floor) or (
+            int(region["start"]),
+            int(region["end"]),
+        )
+        mass = _state_mass(state, *extent)
+        if mass > best_mass:
+            best, best_mass, best_extent = region, mass, extent
+    if (
+        best is primary
+        or len(best.get("units") or []) < TRIMMED_MINIMUM_UNITS
+        or best_mass <= STATE_CHOICE_RATIO * max(primary_mass, 1e-9)
+    ):
+        return
+    first, last = best_extent
+    whole = [
+        {"start": int(unit["start"]), "end": int(unit["end"])}
+        for unit in best["units"]
+        if min(last, int(unit["end"])) - max(first, int(unit["start"]))
+        >= 0.5 * (int(unit["end"]) - int(unit["start"]))
+    ]
+    primary["source"] = "secondary"
+    best.update(
+        source="primary",
+        selected_by="state_mass",
+        start=first,
+        end=last,
+        units=_units_inside(best["units"], first, last),
+        registration_units=whole,
+    )
+    kept = [best]
+    for region in regions:
+        if region is best:
+            continue
+        start, end = _longest_free_stretch(region["start"], region["end"], [best])
+        if end - start >= 2 * float(region["period"]):
+            region["start"], region["end"] = start, end
+            region["units"] = _units_inside(region.get("units", []), start, end)
+            kept.append(region)
+    regions[:] = kept
+
+
+def registration_for_primary(registration: Mapping | None, regions: Sequence[dict]) -> Mapping | None:
+    """The registration of a primary region chosen by state mass (unchanged otherwise).
+
+    Takes the new primary region's whole units at least half inside its extent, its period and their span;
+    the wedge call's registration stays under ``wedge_call_registration``. Fewer than three such units leave
+    the registration unchanged. Removes ``registration_units`` from the region either way.
+    """
+
+    primary = next((region for region in regions if region.get("source") == "primary"), None)
+    units = primary.pop("registration_units", None) if primary is not None else None
+    if registration is None or not units or len(units) < TRIMMED_MINIMUM_UNITS:
+        return registration
+    return {
+        **registration,
+        "wedge_call_registration": {
+            key: registration[key] for key in ("start", "end", "period", "units", "n_units") if key in registration
+        },
+        "selected_region": "state_mass",
+        "start": units[0]["start"],
+        "end": units[-1]["end"],
+        "period": float(primary["period"]),
+        "units": units,
+        "n_units": len(units),
+    }
+
+
 def repeat_regions(
     topology: Mapping, state_track: np.ndarray, primary_extent: str = "state"
 ) -> list[dict]:
@@ -409,6 +509,7 @@ def repeat_regions(
         )
     if primary_extent == "state":
         cut_primary_to_state(regions, state, (int(wedge["start"]), int(wedge["end"])))
+        choose_primary_by_state(regions, state)
     for start, end in state_runs(state):
         add_region(
             regions,

@@ -30,7 +30,12 @@ from talea.long_protein import (
 )
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
-from talea.regions import PRIMARY_EXTENTS, repeat_regions, trim_registration
+from talea.regions import (
+    PRIMARY_EXTENTS,
+    registration_for_primary,
+    repeat_regions,
+    trim_registration,
+)
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
@@ -626,10 +631,13 @@ class TaleaPredictor:
                 if self.primary_extent == "state" and wedge is not None:
                     topology = {
                         **topology,
-                        "registration": trim_registration(
-                            topology.get("registration"),
-                            state_track,
-                            (int(wedge["start"]), int(wedge["end"])),
+                        "registration": registration_for_primary(
+                            trim_registration(
+                                topology.get("registration"),
+                                state_track,
+                                (int(wedge["start"]), int(wedge["end"])),
+                            ),
+                            regions,
                         ),
                     }
                 scores = compose_talea_score(
