@@ -221,7 +221,7 @@ Talea writes:
 | `--square-budget` | Upper bound on batch size × padded sequence length² | 4,000,000 |
 | `--postprocess-workers` | CPU workers for topology decoding | all available CPUs (process mode); 1 (thread mode) |
 | `--postprocess-mode` | `process` to scale across CPU cores, or `thread` to stay in one process | `process` |
-| `--capture-mode` | `sdpa` (fast attention backend for uncaptured layers) or `manual` (reproduces the v0.1-v0.3.4 numerics exactly; scores differ by at most ~0.006) | `sdpa` |
+| `--capture-mode` | `sdpa` (fast attention backend for uncaptured layers), `manual` (reproduces the v0.1-v0.3.4 numerics exactly; scores differ by at most ~0.006), or `auto`: sdpa on CUDA, manual on Apple MPS and CPU (sdpa's MPS memory grows over long runs until they fail) | `auto` |
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
 | `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
@@ -374,7 +374,8 @@ length-sorts inputs and constrains batches by
 - ESM++ runs with selective capture: Talea retains only the two attention
   layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under
   `--capture-mode manual`, output is byte-identical to the full-capture path;
-  the default `sdpa` lets uncaptured layers use the fast backend.
+  the default `auto` uses the fast backend (`sdpa`) on CUDA and `manual`
+  elsewhere.
 - Attention matrices, residue embeddings, and residue-state tracks are reduced
   in memory and are not retained on disk.
 - For reproducibility and memory efficiency, run one Talea process per GPU.

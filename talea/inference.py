@@ -587,7 +587,7 @@ class TaleaPredictor:
         maximum_batch: int = 64,
         postprocess_workers: int | None = None,
         progress: bool = False,
-        capture_mode: str = "sdpa",
+        capture_mode: str = "auto",
         cache_clear_interval: int = 0,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
@@ -620,8 +620,10 @@ class TaleaPredictor:
         perf/bench_threads.py.
 
         ``capture_mode`` selects the attention-capture strategy in
-        talea.capture: "sdpa" (default) runs uncaptured layers on the fast
-        attention backend; "manual" reproduces the v0.1-v0.3.4 numerics exactly.
+        talea.capture: "sdpa" runs uncaptured layers on the fast attention
+        backend; "manual" reproduces the v0.1-v0.3.4 numerics exactly; "auto"
+        (default) uses sdpa on CUDA and manual on MPS and CPU, where sdpa's
+        memory grows until long runs fail.
 
         ``cache_clear_interval`` of 0 never calls empty_cache(); calling it per
         batch returns blocks to the driver and forces later reallocation.
@@ -631,6 +633,11 @@ class TaleaPredictor:
         if not values:
             return
         self._validate_records(values)
+        if capture_mode == "auto":
+            # sdpa is faster and fine on CUDA; on Apple MPS its kernels grow the
+            # driver's allocation over many long, variable-length batches until
+            # the process runs out of memory, so MPS and CPU keep manual capture.
+            capture_mode = "sdpa" if self.device.type == "cuda" else "manual"
         if postprocess_mode == "process" and len(values) == 1:
             # One protein: the worker round trip (pickling its matrices) costs
             # more than the postprocessing itself, so run it in this process.

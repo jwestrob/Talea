@@ -75,13 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--capture-mode",
-        choices=("manual", "sdpa"),
-        default="sdpa",
+        choices=("auto", "manual", "sdpa"),
+        default="auto",
         help=(
-            "attention capture strategy. 'sdpa' (default) lets the uncaptured "
-            "layers use the fast attention backend; 'manual' keeps every layer "
-            "on the kernel of the frozen v0.1-v0.3.4 runs and reproduces their "
-            "numerics exactly (scores differ by at most ~0.006)."
+            "attention capture strategy. 'sdpa' lets the uncaptured layers use "
+            "the fast attention backend; 'manual' keeps every layer on the "
+            "kernel of the frozen v0.1-v0.3.4 runs and reproduces their numerics "
+            "exactly (scores differ by at most ~0.006); 'auto' (default) uses "
+            "sdpa on CUDA and manual on Apple MPS and CPU, where sdpa's memory "
+            "grows over long runs until they fail."
         ),
     )
     parser.add_argument(
