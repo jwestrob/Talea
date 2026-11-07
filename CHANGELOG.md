@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Region-probe extension of the primary region** (default `--primary-extent
+  state`). A per-residue probe on ESM++ layer 35 (fitted on RepeatsDB class 3
+  development records; new asset `region_probe.json`) extends the primary
+  region where the U-Net state under-fires; the registration's extent widens to
+  match, its units unchanged. Scores unchanged. Mean primary-region IoU +0.030
+  (fresh holdout), +0.016 (test), +0.009 (development), +0.005 / +0.008
+  (native-context short / long); fresh-holdout region F1 0.691 -> 0.783.
+
 ## 0.3.4
 
 - **Primary region chosen by residue-state mass** (default `--primary-extent

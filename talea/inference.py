@@ -33,6 +33,7 @@ from talea.phase_ssm import probe_parameters, runtime_config
 from talea.regions import (
     PRIMARY_EXTENTS,
     registration_for_primary,
+    registration_for_probe,
     repeat_regions,
     trim_registration,
 )
@@ -362,6 +363,11 @@ class TaleaPredictor:
             phase_asset = json.loads(self.assets.phase_ssm.read_text())
             self.phase_ssm = phase_asset
             self.configs["phase_ssm"] = runtime_config(phase_asset)
+        region_probe = json.loads(self.assets.region_probe.read_text())
+        self.region_probe_settings = region_probe["extension"]
+        self.region_probe_layer = int(region_probe["hidden_state_layer_zero_based"])
+        self._region_probe_weights = np.asarray(region_probe["weights"], dtype=np.float32)
+        self._region_probe_bias = float(region_probe["bias"])
         self.global_bundle = joblib.load(self.assets.global_model)
         _validate_global_bundle(self.global_bundle, self.deployment)
         self.loaded_at = time.time()
@@ -478,6 +484,25 @@ class TaleaPredictor:
             .to(torch.float32)
         )
         logits = residues @ self.probe_weights + self.probe_bias
+        return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
+
+    def region_probabilities(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        indices: torch.Tensor,
+        batch_position: int,
+    ) -> np.ndarray | None:
+        """Per-residue probability of lying inside a repeat region (layer-35 region probe)."""
+
+        if self.primary_extent != "state" or self.region_probe_layer not in hidden_states:
+            return None
+        residues = (
+            hidden_states[self.region_probe_layer][batch_position]
+            .index_select(0, indices)
+            .to(torch.float32)
+        )
+        weights = torch.as_tensor(self._region_probe_weights, device=residues.device)
+        logits = residues @ weights + self._region_probe_bias
         return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
 
     @property
@@ -617,6 +642,7 @@ class TaleaPredictor:
                 future,
                 state_track,
                 teacher_track,
+                region_track,
             ), global_probability in zip(compact, global_probabilities, strict=True):
                 teacher_summary = summarize_teacher_prediction(
                     state_track,
@@ -626,16 +652,25 @@ class TaleaPredictor:
                 topology = postprocess_result(future)
                 # Regions are built from the untrimmed call, then the
                 # registration is cut to the same state track.
-                regions = repeat_regions(topology, state_track, self.primary_extent)
+                regions = repeat_regions(
+                    topology,
+                    state_track,
+                    self.primary_extent,
+                    region_track,
+                    self.region_probe_settings,
+                )
                 wedge = topology.get("wedge_call")
                 if self.primary_extent == "state" and wedge is not None:
                     topology = {
                         **topology,
-                        "registration": registration_for_primary(
-                            trim_registration(
-                                topology.get("registration"),
-                                state_track,
-                                (int(wedge["start"]), int(wedge["end"])),
+                        "registration": registration_for_probe(
+                            registration_for_primary(
+                                trim_registration(
+                                    topology.get("registration"),
+                                    state_track,
+                                    (int(wedge["start"]), int(wedge["end"])),
+                                ),
+                                regions,
                             ),
                             regions,
                         ),
@@ -801,7 +836,10 @@ class TaleaPredictor:
                                 **self.configs,
                             },
                         )
-                    compact.append((record, future, state_track, teacher_track))
+                    region_track = self.region_probabilities(
+                        hidden_states, indices, batch_position
+                    )
+                    compact.append((record, future, state_track, teacher_track, region_track))
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )

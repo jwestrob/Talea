@@ -35,7 +35,15 @@ residue-state mass (the sum of state - 0.2 over its own state extent), it become
 the primary region (``choose_primary_by_state``) and the registration takes its
 units and period (``registration_for_primary``); the wedge call's registration
 stays under ``wedge_call_registration``, and ``wedge_call`` and every score still
-describe the strongest wedge call. The registration is cut the same way
+describe the strongest wedge call.
+Finally, where a per-residue region probe is supplied (a linear map on ESM++
+layer 35 trained to mark residues inside curated repeat regions), the primary
+region joins its probe stretch (``extend_primary_by_probe``): from the wedge
+interval outward, as far as the sum of (probe probability - 0.5) keeps growing,
+inside the region widened by max(2 periods, half its length). The U-Net state
+under-fires on families it has not seen, and the probe recovers much of that
+extent; the registration's extent widens to match with its units unchanged
+(``registration_for_probe``). The registration is cut the same way
 (``trim_registration``, with the same wedge floor): it keeps the units at least
 half inside that stretch,
 whole, and spans them; the registered extent and units stay under
@@ -457,8 +465,89 @@ def registration_for_primary(registration: Mapping | None, regions: Sequence[dic
     }
 
 
+def probe_extent(
+    probability: np.ndarray,
+    start: int,
+    end: int,
+    period: float,
+    floor: tuple[int, int],
+    threshold: float = 0.5,
+    window_fraction: float = 0.5,
+    minimum_periods: float = 2.0,
+) -> tuple[int, int]:
+    """The stretch around ``floor`` that maximizes the sum of (probability - threshold) outside it.
+
+    The search window is ``[start, end)`` widened by max(``minimum_periods`` periods, ``window_fraction``
+    of its length) on each side; the stretch always contains ``floor`` and grows left and right to the
+    maximum suffix and prefix sums (an empty extension when every sum is negative).
+    """
+
+    values = np.asarray(probability, dtype=np.float64) - threshold
+    length = len(values)
+    pad = int(max(minimum_periods * float(period), window_fraction * (end - start)))
+    low, high = max(0, start - pad), min(length, end + pad)
+    first_floor, last_floor = int(floor[0]), int(floor[1])
+    left = np.concatenate([[0.0], np.cumsum(values[low:first_floor][::-1])])
+    right = np.concatenate([[0.0], np.cumsum(values[last_floor:high])])
+    return first_floor - int(np.argmax(left)), last_floor + int(np.argmax(right))
+
+
+def extend_primary_by_probe(
+    regions: list[dict], probability: np.ndarray, wedge_floor: tuple[int, int], settings: Mapping
+) -> None:
+    """Join the primary region, in place, with its region-probe stretch (see ``probe_extent``).
+
+    The floor is the wedge call's interval for the wedge primary region and the region itself for a
+    primary region chosen by state mass. The stretch is kept under ``probe_start`` and ``probe_end``;
+    every other region keeps only its longest stretch outside the grown primary region, if that stretch
+    spans two of its periods.
+    """
+
+    primary = regions[0]
+    floor = wedge_floor if primary.get("selected_by") != "state_mass" else (primary["start"], primary["end"])
+    first, last = probe_extent(
+        probability,
+        int(primary["start"]),
+        int(primary["end"]),
+        float(primary["period"]),
+        floor,
+        float(settings["probability_threshold"]),
+        float(settings["window_fraction"]),
+        float(settings["window_minimum_periods"]),
+    )
+    primary["probe_start"], primary["probe_end"] = first, last
+    if first >= primary["start"] and last <= primary["end"]:
+        return
+    primary["start"], primary["end"] = min(primary["start"], first), max(primary["end"], last)
+    kept = [primary]
+    for region in regions[1:]:
+        start, end = _longest_free_stretch(region["start"], region["end"], [primary])
+        if end - start >= 2 * float(region["period"]):
+            region["start"], region["end"] = start, end
+            region["units"] = _units_inside(region.get("units", []), start, end)
+            kept.append(region)
+    regions[:] = kept
+
+
+def registration_for_probe(registration: Mapping | None, regions: Sequence[dict]) -> Mapping | None:
+    """Widen the registration's extent over the primary region's probe stretch; units are unchanged."""
+
+    primary = next((region for region in regions if region.get("source") == "primary"), None)
+    if registration is None or primary is None or "probe_start" not in primary:
+        return registration
+    first = min(int(registration["start"]), int(primary["probe_start"]))
+    last = max(int(registration["end"]), int(primary["probe_end"]))
+    if (first, last) == (int(registration["start"]), int(registration["end"])):
+        return registration
+    return {**registration, "units_start": registration["start"], "units_end": registration["end"], "start": first, "end": last}
+
+
 def repeat_regions(
-    topology: Mapping, state_track: np.ndarray, primary_extent: str = "state"
+    topology: Mapping,
+    state_track: np.ndarray,
+    primary_extent: str = "state",
+    region_probability: np.ndarray | None = None,
+    probe_settings: Mapping | None = None,
 ) -> list[dict]:
     """Primary region, accepted further calls and state regions, sorted by position.
 
@@ -510,6 +599,8 @@ def repeat_regions(
     if primary_extent == "state":
         cut_primary_to_state(regions, state, (int(wedge["start"]), int(wedge["end"])))
         choose_primary_by_state(regions, state)
+        if region_probability is not None and probe_settings is not None:
+            extend_primary_by_probe(regions, region_probability, (int(wedge["start"]), int(wedge["end"])), probe_settings)
     for start, end in state_runs(state):
         add_region(
             regions,

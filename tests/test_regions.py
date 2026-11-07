@@ -10,7 +10,9 @@ from talea.regions import (
     STATE_RUN_MINIMUM_LENGTH,
     add_region,
     max_sum_segment,
+    probe_extent,
     registration_for_primary,
+    registration_for_probe,
     repeat_regions,
     secondary_wedge_calls,
     state_runs,
@@ -435,3 +437,39 @@ def test_the_primary_region_stays_when_no_further_region_has_twice_its_state():
     assert primary["period"] == 20.0 and "selected_by" not in primary
     registration = {"start": 40, "end": 170, "period": 20.0, "units": units_from(40, 170, 20)}
     assert registration_for_primary(registration, regions) is registration
+
+
+PROBE = {"probability_threshold": 0.5, "window_fraction": 0.5, "window_minimum_periods": 2.0}
+
+
+def test_probe_extent_grows_from_the_floor_while_the_probe_stays_high():
+    probability = np.full(400, 0.1)
+    probability[90:230] = 0.9
+    assert probe_extent(probability, 120, 200, 20.0, (130, 190)) == (90, 230)
+    # the window caps the growth at max(2 periods, half the length) beyond the region
+    probability[:] = 0.9
+    assert probe_extent(probability, 120, 200, 20.0, (130, 190)) == (80, 240)
+    # a low probe adds nothing outside the floor
+    assert probe_extent(np.full(400, 0.1), 120, 200, 20.0, (130, 190)) == (130, 190)
+
+
+def test_the_probe_extends_the_primary_region_and_its_registration_extent():
+    state = np.full(500, 0.05)
+    state[50:150] = 0.8
+    probability = np.full(500, 0.1)
+    probability[30:200] = 0.95  # the repeat continues past where the U-Net stops
+    row = topology([])
+    row["registration"]["units"] = units_from(40, 170, 20)
+    (primary,) = repeat_regions(row, state, "state", probability, PROBE)
+    assert (primary["start"], primary["end"]) == (30, 200)
+    assert (primary["probe_start"], primary["probe_end"]) == (30, 200)
+    registration = {"start": 40, "end": 160, "period": 20.0, "units": units_from(40, 160, 20)}
+    widened = registration_for_probe(registration, [primary])
+    assert (widened["start"], widened["end"]) == (30, 200)
+    assert (widened["units_start"], widened["units_end"]) == (40, 160) and widened["units"] == registration["units"]
+
+
+def test_without_a_probe_the_regions_are_those_of_v034():
+    state = np.full(500, 0.05)
+    state[50:150] = 0.8
+    assert repeat_regions(topology([]), state, "state", None, PROBE) == repeat_regions(topology([]), state, "state")

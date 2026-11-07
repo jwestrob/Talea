@@ -328,6 +328,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `registration.registered_start`, `registered_end`, `registered_units` | The registered extent and units before the state cut (present when the cut applied) |
 | `registration.selected_region`, `wedge_call_registration` | Present when a further region carrying more than twice the state mass became the primary region: `state_mass`, and the wedge call's registration |
 | `primary_extent` | `state` or `registered` (see Repeat regions) |
+| `registration.units_start`, `units_end` | Span of the registration's units when the region probe widened its extent |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
 | `closure` | Terminal-to-adjacent attention summary for the equal-period units |
@@ -508,6 +509,22 @@ describe the strongest wedge call. The switch fires for 9 of 509 short and 5 of
 [+0.002, +0.020] (short) and +0.040 [-0.014, +0.099] (long), boundary F1 by
 +0.005 (test) and unit IoU by +0.006 (test) and +0.011 (fresh holdout), and is
 neutral on development.
+
+Where the U-Net residue state under-fires (families it has not seen, often long
+helical repeats), the state cut stops short of the curated repeat. A per-residue
+region probe (`talea/assets/region_probe.json`: a linear map on ESM++ layer 35,
+fitted on RepeatsDB class 3 development records to mark residues inside curated
+repeat regions) then extends the primary region: from the wedge interval
+outward, as far as the sum of (probe probability - 0.5) keeps growing, inside
+the region widened by max(2 periods, half its length). The stretch is recorded
+as `probe_start` / `probe_end`; further regions give way to the grown region; the
+registration's extent widens to match (`registration.units_start` /
+`units_end` keep the span of its units, which are unchanged). Threshold and
+window were chosen on the development records. Mean primary-region IoU change:
+fresh RepeatsDB holdout +0.030 [+0.023, +0.037], repeat-extraction test +0.016
+[+0.007, +0.027], development +0.009, native-context short +0.005, long +0.008;
+region F1 on the fresh holdout 0.691 -> 0.783 (+0.092 [+0.060, +0.126]); unit
+metrics unchanged.
 
 Validation of the state cut (2026-11-07; mean residue IoU of the primary region against the
 curated region, paired group bootstrap):

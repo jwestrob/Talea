@@ -17,6 +17,8 @@ DEPLOYMENT_SHA256 = (
 PHASE_SSM_SHA256 = (
     "fecba553557eef59dae2b0b1b12982c21563c9d26c73c29c079638f685724595"
 )
+# The region probe (talea/assets/region_probe.json), likewise pinned here.
+REGION_PROBE_SHA256 = "22fd5d843116d0a0dca3a1a2053916b068c0a3db7a16376446914a8ef1b14c25"
 
 
 def sha256_file(path: Path) -> str:
@@ -52,6 +54,7 @@ class RuntimeAssets:
     wedge_config: Path
     topology_config: Path
     phase_ssm: Path
+    region_probe: Path
     sha256: dict[str, str]
 
 
@@ -66,6 +69,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         "wedge_config": ASSET_ROOT / "wedge_config.json",
         "topology_config": ASSET_ROOT / "topology_config.json",
         "phase_ssm": ASSET_ROOT / "phase_ssm.json",
+        "region_probe": ASSET_ROOT / "region_probe.json",
     }
     expected = {
         "teacher_model": deployment["teacher_model"]["sha256"],
@@ -84,6 +88,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
             "operational_config"
         ]["sha256"],
         "phase_ssm": PHASE_SSM_SHA256,
+        "region_probe": REGION_PROBE_SHA256,
     }
     observed: dict[str, str] = {}
     for name, path in paths.items():
@@ -105,5 +110,6 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         wedge_config=paths["wedge_config"],
         topology_config=paths["topology_config"],
         phase_ssm=paths["phase_ssm"],
+        region_probe=paths["region_probe"],
         sha256=observed,
     )
