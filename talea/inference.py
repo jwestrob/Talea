@@ -30,7 +30,7 @@ from talea.long_protein import (
 )
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
-from talea.regions import repeat_regions
+from talea.regions import PRIMARY_EXTENTS, repeat_regions, trim_registration
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
@@ -302,6 +302,7 @@ class TaleaPredictor:
         local_files_only: bool = False,
         deterministic: bool = False,
         unit_placement: str = "phase-ssm",
+        primary_extent: str = "state",
     ):
         """``unit_placement`` chooses how registered repeat units are placed.
 
@@ -309,10 +310,18 @@ class TaleaPredictor:
         phase-aware state-space decoder in talea.phase_ssm; "comb" keeps the
         equal-period comb, reproducing v0.1.0 output exactly. Detection scores
         and topology diagnostics are identical under both.
+
+        ``primary_extent`` "state" (default) cuts the primary repeat region and
+        the registration to the U-Net residue-state track; "registered" keeps
+        the registered extent, as v0.3.2 did (see talea.regions). Scores are
+        identical under both.
         """
         os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         if unit_placement not in UNIT_PLACEMENTS:
             raise ValueError(f"unsupported unit placement: {unit_placement}")
+        if primary_extent not in PRIMARY_EXTENTS:
+            raise ValueError(f"unsupported primary extent: {primary_extent}")
+        self.primary_extent = primary_extent
         self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self._postprocess_pool_workers = 0
         self.unit_placement = unit_placement
@@ -610,6 +619,19 @@ class TaleaPredictor:
                     self.teacher_contract,
                 )
                 topology = postprocess_result(future)
+                # Regions are built from the untrimmed call, then the
+                # registration is cut to the same state track.
+                regions = repeat_regions(topology, state_track, self.primary_extent)
+                wedge = topology.get("wedge_call")
+                if self.primary_extent == "state" and wedge is not None:
+                    topology = {
+                        **topology,
+                        "registration": trim_registration(
+                            topology.get("registration"),
+                            state_track,
+                            (int(wedge["start"]), int(wedge["end"])),
+                        ),
+                    }
                 scores = compose_talea_score(
                     teacher_summary["mean_probability"],
                     topology["topology_development_control_z"],
@@ -620,7 +642,8 @@ class TaleaPredictor:
                 yield {
                     **topology,
                     **scores,
-                    "repeat_regions": repeat_regions(topology, state_track),
+                    "repeat_regions": regions,
+                    "primary_extent": self.primary_extent,
                     "primary_score_field": "talea_discovery_score",
                     "teacher_state_summary": {
                         key: value

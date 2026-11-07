@@ -4,14 +4,17 @@ from pathlib import Path
 import numpy as np
 
 from talea.long_protein import combine_window_rows
+from talea.long_protein import shift_coordinates
 from talea.regions import (
     SECONDARY_MINIMUM_STATE,
     STATE_RUN_MINIMUM_LENGTH,
     add_region,
+    max_sum_segment,
     repeat_regions,
     secondary_wedge_calls,
     state_runs,
     suppress_interval,
+    trim_registration,
     union_window_regions,
 )
 from talea.topology import process_attention_record
@@ -119,12 +122,12 @@ def test_a_state_run_the_wedge_never_proposed_becomes_a_state_region():
 
 def test_a_state_run_keeps_only_its_free_stretch_and_only_if_it_spans_the_minimum():
     state = np.full(500, 0.05)
-    state[100:250] = 0.8  # overlaps the primary region 40-170
-    regions = repeat_regions(topology([]), state)
+    state[100:250] = 0.8  # overlaps the registered primary region 40-170
+    regions = repeat_regions(topology([]), state, primary_extent="registered")
     assert [(r["start"], r["end"], r["source"]) for r in regions] == [(40, 170, "primary"), (170, 250, "state")]
     state = np.full(500, 0.05)
     state[100:200] = 0.8  # free stretch 170-200 is too short
-    assert [r["source"] for r in repeat_regions(topology([]), state)] == ["primary"]
+    assert [r["source"] for r in repeat_regions(topology([]), state, primary_extent="registered")] == ["primary"]
 
 
 def test_state_runs_shorter_than_the_minimum_are_ignored():
@@ -299,3 +302,104 @@ def test_window_union_moves_units_into_the_protein_frame():
                "mean_state_probability": 0.5, "units": [{"start": 100, "end": 130}, {"start": 130, "end": 160}]}]
     union = union_window_regions([(0, []), (1000, second)], best=0)
     assert union[0]["units"] == [{"start": 1100, "end": 1130}, {"start": 1130, "end": 1160}]
+
+
+def units_from(start, end, period):
+    return [{"start": first, "end": first + period} for first in range(start, end, period)]
+
+
+def test_max_sum_segment_finds_the_heaviest_stretch():
+    values = np.array([-1.0, 2.0, -0.5, 3.0, -4.0, 1.0])
+    assert max_sum_segment(values, 0, len(values)) == (1, 4)
+    assert max_sum_segment(values, 4, 6) == (5, 6)
+
+
+def test_the_primary_region_is_cut_to_the_state_track():
+    state = np.full(500, 0.05)
+    state[45:160] = 0.8  # wedge 50-150; the registered extent 40-170 overshoots the state
+    row = topology([])
+    row["registration"]["units"] = units_from(40, 170, 20)
+    (primary,) = repeat_regions(row, state)
+    assert (primary["start"], primary["end"]) == (45, 160)
+    assert (primary["registered_start"], primary["registered_end"]) == (40, 170)
+    assert all(45 <= unit["start"] < unit["end"] <= 160 for unit in primary["units"])
+    (kept,) = repeat_regions(row, state, primary_extent="registered")
+    assert (kept["start"], kept["end"]) == (40, 170) and "registered_start" not in kept
+
+
+def test_the_state_never_cuts_inside_the_wedge_interval():
+    state = np.full(500, 0.05)
+    state[80:120] = 0.8  # the U-Net fires on only part of the wedge's repeat (50-150)
+    (primary,) = repeat_regions(topology([]), state)
+    assert (primary["start"], primary["end"]) == (50, 150)
+
+
+def test_a_flat_low_state_leaves_the_primary_registered():
+    (primary,) = repeat_regions(topology([]), np.full(500, 0.05))
+    assert (primary["start"], primary["end"]) == (40, 170) and "registered_start" not in primary
+
+
+def test_the_cut_primary_and_state_regions_never_overlap():
+    state = np.full(500, 0.05)
+    state[100:250] = 0.8  # the state extends past the registered end (170)
+    regions = repeat_regions(topology([]), state)
+    assert [(r["start"], r["end"], r["source"]) for r in regions] == [(50, 235, "primary")]
+
+
+def test_an_unknown_primary_extent_is_rejected():
+    try:
+        repeat_regions(topology([]), np.full(500, 0.05), primary_extent="wedge")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_trim_registration_keeps_whole_units_at_least_half_inside():
+    state = np.full(400, 0.05)
+    state[75:150] = 0.8
+    registration = {"start": 40, "end": 180, "period": 20.0, "n_units": 7, "units": units_from(40, 180, 20)}
+    trimmed = trim_registration(registration, state)
+    assert [(u["start"], u["end"]) for u in trimmed["units"]] == [(80, 100), (100, 120), (120, 140), (140, 160)]
+    assert (trimmed["start"], trimmed["end"], trimmed["n_units"]) == (80, 160, 4)
+    assert (trimmed["registered_start"], trimmed["registered_end"]) == (40, 180)
+    assert trimmed["registered_units"] == registration["units"]
+    assert registration["start"] == 40 and len(registration["units"]) == 7  # input untouched
+
+
+def test_trim_registration_keeps_the_registration_when_fewer_than_three_units_survive():
+    state = np.full(400, 0.05)
+    state[80:120] = 0.8
+    registration = {"start": 40, "end": 180, "period": 20.0, "n_units": 7, "units": units_from(40, 180, 20)}
+    assert trim_registration(registration, state) is registration
+    assert trim_registration(None, state) is None
+
+
+def test_trimmed_registration_moves_into_the_protein_frame_in_window_mode():
+    state = np.full(400, 0.05)
+    state[75:150] = 0.8
+    registration = {"start": 40, "end": 180, "period": 20.0, "n_units": 7, "units": units_from(40, 180, 20)}
+    shifted = shift_coordinates(trim_registration(registration, state), 1000)
+    assert (shifted["start"], shifted["registered_start"], shifted["registered_end"]) == (1080, 1040, 1180)
+    assert shifted["registered_units"][0] == {"start": 1040, "end": 1060}
+
+
+def test_a_further_region_gives_way_to_the_cut_primary():
+    state = np.full(600, 0.05)
+    state[60:260] = 0.8  # the primary's state stretch runs into the further call's interval
+    state[260:400] = 0.6
+    regions = repeat_regions(
+        topology([{"rank": 2, "start": 200, "end": 400, "period": 32.0, "score": 20.0}]), state
+    )
+    primary, further = regions
+    assert primary["source"] == "primary" and further["source"] == "secondary"
+    assert primary["end"] <= further["start"]
+    assert further["end"] - further["start"] >= 2 * 32
+
+
+def test_trim_registration_keeps_the_units_the_wedge_floor_covers():
+    state = np.full(400, 0.05)
+    state[100:140] = 0.8
+    registration = {"start": 40, "end": 180, "period": 20.0, "n_units": 7, "units": units_from(40, 180, 20)}
+    assert trim_registration(registration, state) is registration  # two units only: kept as registered
+    trimmed = trim_registration(registration, state, floor=(60, 160))
+    assert (trimmed["start"], trimmed["end"], trimmed["n_units"]) == (60, 160, 5)

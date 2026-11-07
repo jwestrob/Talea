@@ -19,6 +19,25 @@ The primary region starts as the registered extent and grows only by merging.
 Registration, units and every score continue to describe the primary call
 alone.
 
+The registered extent overshoots the curated repeat by most of a unit on each
+side, so by default ("state" primary extent) the primary region is then cut to
+the U-Net residue-state track: its extent becomes the maximum-sum stretch of
+(state - 0.2) inside the region widened by max(2 periods, half its length),
+widened again to cover the wedge call's interval, and its units are those whose
+midpoints fall inside, clipped to it. The state therefore trims only what the
+registration adds around the wedge's own evidence; where the U-Net fires on
+part of a repeat it has not seen, the wedge interval is kept. The cut follows
+the further calls' merges and precedes the state regions; a further region then
+keeps only its longest stretch outside the primary region, provided that stretch
+spans two periods. 0.2 is the same threshold that admits a further call. The registration is cut the same way
+(``trim_registration``, with the same wedge floor): it keeps the units at least
+half inside that stretch,
+whole, and spans them; the registered extent and units stay under
+``registered_start``, ``registered_end`` and ``registered_units``. A stretch
+shorter than 8 residues leaves the region unchanged, and one that keeps fewer
+than three units leaves the registration unchanged. "registered" keeps v0.3.2's
+regions and registration.
+
 The residue-state track adds regions of its own ("state" regions). The wedge
 proposes regions only where attention forms stripes parallel to the diagonal at
 multiples of one period, so a stretch the U-Net flags can go unproposed (a run
@@ -52,6 +71,10 @@ SECONDARY_MINIMUM_STATE = 0.2
 MERGE_PERIOD_TOLERANCE = 0.15
 STATE_RUN_MINIMUM_PROBABILITY = 0.5
 STATE_RUN_MINIMUM_LENGTH = 40
+PRIMARY_EXTENTS = ("state", "registered")
+PRIMARY_STATE_THRESHOLD = SECONDARY_MINIMUM_STATE
+PRIMARY_MINIMUM_STRETCH = 8
+TRIMMED_MINIMUM_UNITS = 3
 
 
 def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> None:
@@ -225,12 +248,128 @@ def add_region(regions: list[dict], candidate: Mapping) -> None:
         regions.append({**candidate, "start": start, "end": end, "units": units})
 
 
-def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
+def max_sum_segment(values: np.ndarray, start: int, end: int) -> tuple[int, int]:
+    """The ``[first, last)`` stretch of ``values[start:end]`` with the largest sum (earliest on ties)."""
+
+    best, best_first, best_last = -math.inf, start, start
+    running, running_first = 0.0, start
+    for index in range(start, end):
+        value = float(values[index])
+        if running <= 0.0:
+            running, running_first = value, index
+        else:
+            running += value
+        if running > best:
+            best, best_first, best_last = running, running_first, index + 1
+    return best_first, best_last
+
+
+def state_extent(
+    state: np.ndarray,
+    start: int,
+    end: int,
+    period: float,
+    floor: tuple[int, int] | None = None,
+) -> tuple[int, int] | None:
+    """Maximum-sum stretch of (state - 0.2) inside ``[start, end)`` widened by max(2 periods, half its length).
+
+    The stretch is widened to cover ``floor`` (the wedge call's interval), so
+    the state never cuts into the wedge's own repeat evidence. None when the
+    stretch is shorter than 8 residues.
+    """
+
+    values = np.asarray(state, dtype=np.float64)
+    pad = int(max(2.0 * float(period), 0.5 * (end - start)))
+    first, last = max_sum_segment(
+        values - PRIMARY_STATE_THRESHOLD, max(0, start - pad), min(len(values), end + pad)
+    )
+    if last - first < PRIMARY_MINIMUM_STRETCH:
+        return None
+    if floor is not None:
+        first, last = min(first, int(floor[0])), max(last, int(floor[1]))
+    return first, last
+
+
+def trim_registration(
+    registration: Mapping | None,
+    state_track: np.ndarray,
+    floor: tuple[int, int] | None = None,
+) -> Mapping | None:
+    """The registration cut to the residue-state track (see the module docstring).
+
+    ``floor`` is the wedge call's interval, which the cut never enters.
+    """
+
+    if registration is None or not registration.get("units"):
+        return registration
+    start, end = int(registration["start"]), int(registration["end"])
+    extent = state_extent(state_track, start, end, float(registration["period"]), floor)
+    if extent is None:
+        return registration
+    first, last = extent
+    kept = [
+        {"start": int(unit["start"]), "end": int(unit["end"])}
+        for unit in registration["units"]
+        if min(last, int(unit["end"])) - max(first, int(unit["start"]))
+        >= 0.5 * (int(unit["end"]) - int(unit["start"]))
+    ]
+    if len(kept) < TRIMMED_MINIMUM_UNITS:
+        return registration
+    return {
+        **registration,
+        "registered_start": start,
+        "registered_end": end,
+        "registered_units": [
+            {"start": int(unit["start"]), "end": int(unit["end"])} for unit in registration["units"]
+        ],
+        "start": kept[0]["start"],
+        "end": kept[-1]["end"],
+        "units": kept,
+        "n_units": len(kept),
+    }
+
+
+def cut_primary_to_state(
+    regions: list[dict], state: np.ndarray, floor: tuple[int, int] | None = None
+) -> None:
+    """Cut ``regions[0]`` (the primary region) in place to its state extent (never inside ``floor``).
+
+    The registered extent is kept under ``registered_start`` and
+    ``registered_end``. Every further region then keeps only its longest
+    stretch outside the primary region, with the units inside it, and is
+    dropped unless that stretch spans two of its periods.
+    """
+
+    primary = regions[0]
+    extent = state_extent(state, primary["start"], primary["end"], primary["period"], floor)
+    if extent is None:
+        return
+    primary["registered_start"], primary["registered_end"] = primary["start"], primary["end"]
+    primary["start"], primary["end"] = extent
+    primary["units"] = _units_inside(primary["units"], *extent)
+    kept = [primary]
+    for region in regions[1:]:
+        start, end = _longest_free_stretch(region["start"], region["end"], [primary])
+        if end - start >= 2 * float(region["period"]):
+            region["start"], region["end"] = start, end
+            region["units"] = _units_inside(region.get("units", []), start, end)
+            kept.append(region)
+    regions[:] = kept
+
+
+def repeat_regions(
+    topology: Mapping, state_track: np.ndarray, primary_extent: str = "state"
+) -> list[dict]:
     """Primary region, accepted further calls and state regions, sorted by position.
 
     ``topology`` is a ``process_attention_record`` row; ``state_track`` is the
-    U-Net residue-state probability for the same protein.
+    U-Net residue-state probability for the same protein. ``primary_extent``
+    "state" cuts the primary region to the state track, "registered" keeps the
+    registered extent (see the module docstring).
     """
+
+    if primary_extent not in PRIMARY_EXTENTS:
+        raise ValueError(f"unsupported primary extent: {primary_extent}")
 
     wedge = topology.get("wedge_call")
     registration = topology.get("registration")
@@ -268,6 +407,8 @@ def repeat_regions(topology: Mapping, state_track: np.ndarray) -> list[dict]:
                 "units": call.get("units") or [],
             },
         )
+    if primary_extent == "state":
+        cut_primary_to_state(regions, state, (int(wedge["start"]), int(wedge["end"])))
     for start, end in state_runs(state):
         add_region(
             regions,

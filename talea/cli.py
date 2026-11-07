@@ -116,6 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--primary-extent",
+        choices=("state", "registered"),
+        default="state",
+        help=(
+            "extent of the primary repeat region and its registration. 'state' "
+            "(default) cuts both to the U-Net residue-state track, which removes "
+            "most of the registered extent's overshoot; 'registered' keeps the "
+            "registered extent and reproduces v0.3.2. Scores are identical."
+        ),
+    )
+    parser.add_argument(
         "--long-proteins",
         choices=LONG_PROTEIN_MODES,
         default="reject",
@@ -208,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         local_files_only=args.local_files_only,
         deterministic=args.deterministic,
         unit_placement=args.unit_placement,
+        primary_extent=args.primary_extent,
     )
     prediction_options = {
         "square_budget": args.square_budget,
@@ -264,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
+        "primary_extent": args.primary_extent,
         "long_proteins": args.long_proteins,
         "window_length": args.window_length,
         "window_stride": args.window_stride,

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **State-cut primary extent** (`--primary-extent state`, default). The
+  primary repeat region and the registration are cut to the U-Net
+  residue-state track: the maximum-sum stretch of (state - 0.2) around the
+  registered extent, never inside the wedge call's interval. The registration
+  keeps its units at least half inside; the registered extent and units stay
+  under `registered_start`, `registered_end` and `registered_units`. Scores are
+  identical; `--primary-extent registered` reproduces 0.3.2. Mean residue IoU
+  of the primary region: native-context short 0.648 -> 0.719 (+0.070
+  [+0.055, +0.084]), long 0.495 -> 0.558 (+0.064 [+0.027, +0.104]),
+  repeat-extraction development 0.729 -> 0.790, fresh holdout 0.623 -> 0.659.
+  Boundary F1 +0.023 / +0.026 / +0.011 (development / test / fresh), unit-count
+  error down 0.85-1.44, matched-unit IoU within 0.004. See README "Primary
+  extent".
+
 ## 0.3.2
 
 - **State regions.** `repeat_regions` gains regions from the U-Net

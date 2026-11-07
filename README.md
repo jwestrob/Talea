@@ -225,6 +225,7 @@ Talea writes:
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
 | `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
+| `--primary-extent` | `state` cuts the primary region and registration to the residue-state track; `registered` keeps v0.3.2's registered extent | `state` |
 | `--long-proteins` | `reject` proteins above 2,046 aa, or score them as overlapping `window`s | `reject` |
 | `--window-length` | Residues per window in window mode | 2,000 |
 | `--window-stride` | Residues between window starts in window mode | 1,000 |
@@ -322,8 +323,10 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
 | `secondary_wedge_calls` | Further wedge calls after the primary one; those the residue-state track supports are registered into units as the primary call is (see Repeat regions) |
-| `repeat_regions` | Every repeat region: the registered primary region, supported further calls (each with period, units, wedge score and mean residue-state probability) and state regions from the residue-state track alone (`source: state`) |
-| `registration.units` | Repeat-unit boundaries in the registered extent |
+| `repeat_regions` | Every repeat region: the primary region (cut to the residue-state track by default), supported further calls (each with period, units, wedge score and mean residue-state probability) and state regions from the residue-state track alone (`source: state`) |
+| `registration.units` | Repeat-unit boundaries of the registration (by default the registered units at least half inside the state extent) |
+| `registration.registered_start`, `registered_end`, `registered_units` | The registered extent and units before the state cut (present when the cut applied) |
+| `primary_extent` | `state` or `registered` (see Repeat regions) |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
 | `closure` | Terminal-to-adjacent attention summary for the equal-period units |
@@ -471,6 +474,47 @@ spans 40 residues. A state region has `period: null`, `wedge_score: null`,
 probability like every region. State regions enter after every wedge region,
 in window mode too, and a wedge region never merges into one. The primary
 region, registration, units and every score stay as they were.
+
+### Primary extent
+
+The registered extent contains the curated repeat but overshoots it by most of
+a unit on each side (residue precision 0.74 on the 509 short native-context
+proteins). By default (`--primary-extent state`) Talea cuts the primary region
+to the U-Net residue-state track: the new extent is the maximum-sum stretch of
+(state - 0.2) inside the region widened by max(2 periods, half its length),
+widened again to cover the wedge call's interval. The state therefore trims only
+what registration adds around the wedge's own evidence. 0.2 is the gate that
+admits a further call. The region keeps the units whose midpoints fall inside,
+clipped to it, and records its registered extent as `registered_start` and
+`registered_end`. A further region keeps only its longest stretch outside the
+cut primary region, if that stretch spans two of its periods; state regions are
+placed after the cut. The registration is cut the same way: it keeps its units
+at least half inside the stretch, whole, and spans them, with the registered
+extent and units under `registration.registered_*`. A stretch shorter than 8
+residues leaves the region as registered, and fewer than three surviving units
+leave the registration as registered. Scores are identical under both settings;
+`--primary-extent registered` reproduces v0.3.2.
+
+Validation (2026-11-07; mean residue IoU of the primary region against the
+curated region, paired group bootstrap):
+
+| Cohort | n | registered | state | change [95% CI] |
+| --- | ---: | ---: | ---: | --- |
+| Native-context short | 509 | 0.648 | 0.719 | +0.070 [+0.055, +0.084] |
+| Native-context long | 60 | 0.495 | 0.558 | +0.064 [+0.027, +0.104] |
+| Repeat-extraction development | 2,285 | 0.729 | 0.790 | +0.061 [+0.038, +0.087] |
+| Repeat-extraction test | 570 | 0.774 | 0.802 | +0.028 [-0.006, +0.066] |
+| Fresh RepeatsDB holdout | 597 | 0.623 | 0.659 | +0.036 [-0.002, +0.077] |
+
+On the repeat-extraction benchmark (boundary tolerance 5, equal-source macro),
+boundary F1 rises by +0.023 (development), +0.026 (test) and +0.011 (fresh
+holdout), unit-count error falls by 0.85 to 1.44 units, and matched-unit IoU
+and the half-length-unit fraction stay within 0.004 of v0.3.2. The U-Net was
+trained on RepeatsDB structures. On proteins with no MMseqs2 homolog in its
+training set, the change is +0.066 (short native-context, 133), +0.071 (long,
+37), +0.049 (test, 165) and -0.020 [-0.059, +0.024] (fresh holdout, 214): on
+families the U-Net has not seen it fires on only part of the repeat, and the
+wedge floor keeps that loss small.
 
 Validation (2026-10-28; Talea's development data plus a new cohort):
 
