@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.5
+
+- **Open-versus-closed gate on the discovery score.** A linear probe on
+  residue-mean ESM++ hidden states (layers 7/15/23/31; new asset
+  `openness_gate.json`) demotes proteins it calls closed repeats:
+  `talea_discovery_score = ungated + min(0, logit p_open)`; the earlier score is
+  kept as `talea_discovery_score_ungated`. CATH AP +0.021 [+0.004, +0.040], ECOD
+  balanced AP 0.988 -> 0.992, RepeatsDB 452 and pMEGA4 unchanged.
+- **`--capture-mode sdpa` is the default** (uncaptured layers use the fast
+  attention backend; ~8% faster per protein on an M4 Max). `--capture-mode
+  manual` reproduces the earlier numerics exactly; scores differ by at most
+  ~0.006.
+- **Faster postprocessing.** Vectorized diagonal normalization (bit-identical)
+  and in-process postprocessing for single-protein calls.
 
 - **Region-probe extension of the primary region** (default `--primary-extent
   state`). A per-residue probe on ESM++ layer 35 (fitted on RepeatsDB class 3

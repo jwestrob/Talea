@@ -221,7 +221,7 @@ Talea writes:
 | `--square-budget` | Upper bound on batch size × padded sequence length² | 4,000,000 |
 | `--postprocess-workers` | CPU workers for topology decoding | all available CPUs (process mode); 1 (thread mode) |
 | `--postprocess-mode` | `process` to scale across CPU cores, or `thread` to stay in one process | `process` |
-| `--capture-mode` | `manual` (numerically identical to the frozen run) or `sdpa` (faster, small numerical drift) | `manual` |
+| `--capture-mode` | `sdpa` (fast attention backend for uncaptured layers) or `manual` (reproduces the v0.1-v0.3.4 numerics exactly; scores differ by at most ~0.006) | `sdpa` |
 | `--cache-clear-interval` | Release accelerator caches every N batches; 0 never does | 0 |
 | `--deterministic` | Pin cuDNN to deterministic convolution algorithms | off |
 | `--unit-placement` | `phase-ssm`, or `comb` for the v0.1.0 equal-period units | `phase-ssm` |
@@ -328,6 +328,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `registration.registered_start`, `registered_end`, `registered_units` | The registered extent and units before the state cut (present when the cut applied) |
 | `registration.selected_region`, `wedge_call_registration` | Present when a further region carrying more than twice the state mass became the primary region: `state_mass`, and the wedge call's registration |
 | `primary_extent` | `state` or `registered` (see Repeat regions) |
+| `talea_discovery_score_ungated`, `openness_probability`, `openness_penalty` | The discovery score before the open-versus-closed gate, the gate's probability that the protein is an open repeat, and the penalty applied (`talea_discovery_score` = ungated + penalty) |
 | `registration.units_start`, `units_end` | Span of the registration's units when the region probe widened its extent |
 | `registration.unit_placement` | `phase_ssm`, or `comb_fallback` when fewer than three units decode |
 | `registration.comb_units` | The v0.1.0 equal-period units, retained for comparison |
@@ -371,8 +372,9 @@ length-sorts inputs and constrains batches by
 - Batches are pipelined: each batch's postprocessing runs in the pool while
   the next batch is on the device, and rows keep their order and values.
 - ESM++ runs with selective capture: Talea retains only the two attention
-  layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under the default
-  `--capture-mode manual`, output is byte-identical to the full-capture path.
+  layers it reads (288 MB rather than 5.06 GB at 2,046 aa). Under
+  `--capture-mode manual`, output is byte-identical to the full-capture path;
+  the default `sdpa` lets uncaptured layers use the fast backend.
 - Attention matrices, residue embeddings, and residue-state tracks are reduced
   in memory and are not retained on disk.
 - For reproducibility and memory efficiency, run one Talea process per GPU.
@@ -430,6 +432,21 @@ negative. Compare windows with windows, and rank within a protein to localize.
 Windows put several 2,000-aa sequences in one batch only when `--square-budget`
 allows it (about 4,008,000 per window); raise it on large GPUs so their
 postprocessing runs in parallel.
+
+## Open-versus-closed gate
+
+Closed repeats (rings, propellers, toroids) are Talea's main false-positive
+class. Since 0.3.5 the discovery score passes through a gate: a linear probe on
+residue-mean ESM++ hidden states (transformer layers 7, 15, 23 and 31;
+`talea/assets/openness_gate.json`) estimates the probability that the protein is
+an open rather than a closed repeat, and proteins it calls closed are demoted:
+`talea_discovery_score = ungated + 1.0 * min(0, logit p_open)`. Proteins called
+open are never promoted. The probe was trained on Kinsey Long's SAERepeat
+training split (open vs closed repeats) after removing every protein with a
+homolog in any Talea benchmark and every CATH-lockbox superfamily, and its
+weight was chosen on her held-out-family split. CATH S20 AP 0.810 -> 0.831
+(+0.021 [+0.004, +0.040]); ECOD balanced AP 0.988 -> 0.992; RepeatsDB 452 and
+pMEGA4 unchanged. `talea_discovery_score_ungated` keeps the earlier score.
 
 ## Repeat regions
 

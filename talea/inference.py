@@ -368,6 +368,11 @@ class TaleaPredictor:
         self.region_probe_layer = int(region_probe["hidden_state_layer_zero_based"])
         self._region_probe_weights = np.asarray(region_probe["weights"], dtype=np.float32)
         self._region_probe_bias = float(region_probe["bias"])
+        gate = json.loads(self.assets.openness_gate.read_text())
+        self.openness_layers = tuple(int(layer) for layer in gate["hidden_state_layers_zero_based"])
+        self._openness_weights = np.asarray(gate["weights"], dtype=np.float32)
+        self._openness_bias = float(gate["bias"])
+        self.openness_penalty_weight = float(gate["penalty_weight"])
         self.global_bundle = joblib.load(self.assets.global_model)
         _validate_global_bundle(self.global_bundle, self.deployment)
         self.loaded_at = time.time()
@@ -505,6 +510,23 @@ class TaleaPredictor:
         logits = residues @ weights + self._region_probe_bias
         return torch.sigmoid(logits).cpu().numpy().astype(np.float64)
 
+    def openness_logit(
+        self,
+        hidden_states: dict[int, torch.Tensor],
+        indices: torch.Tensor,
+        batch_position: int,
+    ) -> float:
+        """Logit of the open-versus-closed gate from residue-mean hidden states."""
+
+        pooled = torch.cat(
+            [
+                hidden_states[layer][batch_position].index_select(0, indices).to(torch.float32).mean(dim=0)
+                for layer in self.openness_layers
+            ]
+        )
+        weights = torch.as_tensor(self._openness_weights, device=pooled.device)
+        return float(pooled @ weights + self._openness_bias)
+
     @property
     def maximum_length(self) -> int:
         return int(self.deployment["input_contract"]["maximum_residues"])
@@ -565,7 +587,7 @@ class TaleaPredictor:
         maximum_batch: int = 64,
         postprocess_workers: int | None = None,
         progress: bool = False,
-        capture_mode: str = "manual",
+        capture_mode: str = "sdpa",
         cache_clear_interval: int = 0,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
@@ -598,7 +620,8 @@ class TaleaPredictor:
         perf/bench_threads.py.
 
         ``capture_mode`` selects the attention-capture strategy in
-        talea.capture; "manual" preserves the frozen numerics exactly.
+        talea.capture: "sdpa" (default) runs uncaptured layers on the fast
+        attention backend; "manual" reproduces the v0.1-v0.3.4 numerics exactly.
 
         ``cache_clear_interval`` of 0 never calls empty_cache(); calling it per
         batch returns blocks to the driver and forces later reallocation.
@@ -653,6 +676,7 @@ class TaleaPredictor:
                 state_track,
                 teacher_track,
                 region_track,
+                gate_logit,
             ), global_probability in zip(compact, global_probabilities, strict=True):
                 teacher_summary = summarize_teacher_prediction(
                     state_track,
@@ -691,6 +715,15 @@ class TaleaPredictor:
                     float(global_probability),
                     self.deployment["score_contract"],
                 )
+                # Open-versus-closed gate: demote proteins the probe calls closed.
+                penalty = self.openness_penalty_weight * min(0.0, gate_logit)
+                scores = {
+                    **scores,
+                    "talea_discovery_score_ungated": scores["talea_discovery_score"],
+                    "talea_discovery_score": scores["talea_discovery_score"] + penalty,
+                    "openness_probability": float(1.0 / (1.0 + np.exp(-gate_logit))),
+                    "openness_penalty": penalty,
+                }
                 above_reference = bool(record.length > reference_maximum)
                 yield {
                     **topology,
@@ -742,7 +775,7 @@ class TaleaPredictor:
                 selective_capture(
                     self.esm_model,
                     self.expected_layers,
-                    self.expected_layers,
+                    tuple(sorted(set(self.expected_layers) | set(self.openness_layers))),
                     mode=capture_mode,
                 )
             )
@@ -849,7 +882,10 @@ class TaleaPredictor:
                     region_track = self.region_probabilities(
                         hidden_states, indices, batch_position
                     )
-                    compact.append((record, future, state_track, teacher_track, region_track))
+                    gate_logit = self.openness_logit(hidden_states, indices, batch_position)
+                    compact.append(
+                        (record, future, state_track, teacher_track, region_track, gate_logit)
+                    )
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )

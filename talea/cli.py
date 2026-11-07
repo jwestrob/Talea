@@ -76,12 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--capture-mode",
         choices=("manual", "sdpa"),
-        default="manual",
+        default="sdpa",
         help=(
-            "attention capture strategy. 'manual' keeps every layer on the "
-            "kernel the frozen run used and is numerically identical; 'sdpa' "
-            "lets the 34 uncaptured layers use the fast backend, which is "
-            "faster but not bit-identical."
+            "attention capture strategy. 'sdpa' (default) lets the uncaptured "
+            "layers use the fast attention backend; 'manual' keeps every layer "
+            "on the kernel of the frozen v0.1-v0.3.4 runs and reproduces their "
+            "numerics exactly (scores differ by at most ~0.006)."
         ),
     )
     parser.add_argument(

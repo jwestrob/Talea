@@ -27,6 +27,7 @@ def test_deployment_and_runtime_artifacts_verify() -> None:
         "topology_config",
         "phase_ssm",
         "region_probe",
+        "openness_gate",
     }
 
 

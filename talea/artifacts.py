@@ -19,6 +19,8 @@ PHASE_SSM_SHA256 = (
 )
 # The region probe (talea/assets/region_probe.json), likewise pinned here.
 REGION_PROBE_SHA256 = "22fd5d843116d0a0dca3a1a2053916b068c0a3db7a16376446914a8ef1b14c25"
+# The open-versus-closed gate (talea/assets/openness_gate.json), likewise pinned here.
+OPENNESS_GATE_SHA256 = "837966c5f5f37455df0e1743b10a0821eba4d9b2f57f9684e8f5bd4f291d7519"
 
 
 def sha256_file(path: Path) -> str:
@@ -55,6 +57,7 @@ class RuntimeAssets:
     topology_config: Path
     phase_ssm: Path
     region_probe: Path
+    openness_gate: Path
     sha256: dict[str, str]
 
 
@@ -70,6 +73,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         "topology_config": ASSET_ROOT / "topology_config.json",
         "phase_ssm": ASSET_ROOT / "phase_ssm.json",
         "region_probe": ASSET_ROOT / "region_probe.json",
+        "openness_gate": ASSET_ROOT / "openness_gate.json",
     }
     expected = {
         "teacher_model": deployment["teacher_model"]["sha256"],
@@ -89,6 +93,7 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         ]["sha256"],
         "phase_ssm": PHASE_SSM_SHA256,
         "region_probe": REGION_PROBE_SHA256,
+        "openness_gate": OPENNESS_GATE_SHA256,
     }
     observed: dict[str, str] = {}
     for name, path in paths.items():
@@ -111,5 +116,6 @@ def verified_runtime_assets(deployment: dict | None = None) -> RuntimeAssets:
         topology_config=paths["topology_config"],
         phase_ssm=paths["phase_ssm"],
         region_probe=paths["region_probe"],
+        openness_gate=paths["openness_gate"],
         sha256=observed,
     )
