@@ -68,6 +68,20 @@ def resolve_device(requested: str | torch.device) -> torch.device:
     return device
 
 
+def _device_autocast_enabled(device_type: str) -> bool:
+    """Query the calling thread's autocast state for this backend."""
+    available = getattr(torch.amp, "is_autocast_available", None)
+    if available is not None:
+        # PyTorch 2.4 added the device overload, initially without MPS support.
+        return available(device_type) and torch.is_autocast_enabled(device_type)
+    # PyTorch 2.2/2.3 expose CUDA via the no-argument API and separate
+    # backend-specific functions for CPU and other supported devices.
+    if device_type == "cuda":
+        return torch.is_autocast_enabled()
+    query = getattr(torch, f"is_autocast_{device_type}_enabled", None)
+    return query() if query is not None else False
+
+
 def resolve_dtype(
     requested: str, device: torch.device
 ) -> tuple[str, torch.dtype]:
@@ -531,7 +545,7 @@ class TaleaPredictor:
     def _get_teacher_graphs(self, requested, record_workers, *, replace_stream=False):
         self.teacher_cuda_graph_active = False
         if (not requested or record_workers != 1 or self.device.type != "cuda"
-                or torch.is_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
+                or _device_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
             return None
         with torch.cuda.device(self.device):
             if torch.cuda.is_current_stream_capturing():
@@ -852,7 +866,7 @@ class TaleaPredictor:
             raise ValueError("record_workers must be positive")
         if prefetch_forward and self.device.type not in ("cuda", "mps"):
             raise ValueError("forward prefetch requires a CUDA or MPS device")
-        if prefetch_forward and torch.is_autocast_enabled(self.device.type):
+        if prefetch_forward and _device_autocast_enabled(self.device.type):
             raise ValueError("forward prefetch requires an explicit model dtype with autocast disabled")
         values = list(records)
         if not values:
@@ -1029,7 +1043,7 @@ class TaleaPredictor:
                     teacher_cuda_graph, record_workers, replace_stream=graph_prefetch
                 )
             record_pool = None
-            if record_workers > 1 and not torch.is_autocast_enabled(self.device.type):
+            if record_workers > 1 and not _device_autocast_enabled(self.device.type):
                 # The normal readout path uses the caller's original CUDA stream.
                 stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
                 record_pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(

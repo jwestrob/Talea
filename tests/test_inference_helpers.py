@@ -293,3 +293,35 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     assert readout_graph is not cached and readout_graph.stream is current[0]
     assert predictor._get_teacher_graphs(True, 1, replace_stream=True) is readout_graph
     assert predictor.teacher_cuda_graph_active
+
+
+def test_device_autocast_uses_legacy_torch22_queries(monkeypatch):
+    from talea.inference import _device_autocast_enabled
+
+    monkeypatch.delattr(torch.amp, "is_autocast_available", raising=False)
+    monkeypatch.setattr(torch, "is_autocast_enabled", lambda: False)
+    monkeypatch.setattr(torch, "is_autocast_cpu_enabled", lambda: True)
+    assert _device_autocast_enabled("cpu")
+    assert not _device_autocast_enabled("cuda")
+    assert not _device_autocast_enabled("mps")
+
+
+def test_device_autocast_skips_unsupported_backend(monkeypatch):
+    from talea.inference import _device_autocast_enabled
+
+    monkeypatch.setattr(torch.amp, "is_autocast_available", lambda backend: backend == "cpu", raising=False)
+    def supported_only(backend):
+        assert backend == "cpu"
+        return True
+    monkeypatch.setattr(torch, "is_autocast_enabled", supported_only)
+    assert _device_autocast_enabled("cpu")
+    assert not _device_autocast_enabled("mps")
+
+
+def test_device_autocast_matches_cpu_context():
+    from talea.inference import _device_autocast_enabled
+
+    with torch.autocast("cpu", enabled=False):
+        assert not _device_autocast_enabled("cpu")
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert _device_autocast_enabled("cpu")
