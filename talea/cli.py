@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="prepare tiles in record workers and run the teacher in order on the predictor thread")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
+    parser.add_argument("--fused-apc", choices=("off", "sym", "full"), default="off",
+                        help="fuse fp16 APC pointwise operations on an RTX A5000")
     parser.add_argument("--group-equal-apc", action="store_true",
                         help="group CUDA attention correction for records with identical residue spans")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
@@ -261,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         "group_equal_apc": args.group_equal_apc,
+        "fused_apc": args.fused_apc,
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph,
         "postprocess_mode": args.postprocess_mode,
@@ -318,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
+        **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active}
+           if args.fused_apc != "off" else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
