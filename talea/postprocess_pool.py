@@ -36,6 +36,7 @@ def initialize_worker(configs: dict, attention_buffer=None) -> None:
     _CONFIGS = configs
     from talea.wedge import enable_compiled_wedge_scores
     enable_compiled_wedge_scores()
+    _enable_compiled_topology_kernels()
     # Each worker is single-threaded NumPy; letting every one spin up a full
     # BLAS thread pool oversubscribes the node and undoes the parallelism.
     for variable in (
@@ -45,6 +46,21 @@ def initialize_worker(configs: dict, attention_buffer=None) -> None:
         "NUMEXPR_NUM_THREADS",
     ):
         os.environ.setdefault(variable, "1")
+
+
+def _enable_compiled_topology_kernels() -> None:
+    try:
+        from numba import config
+        if config.DISABLE_JIT:
+            return
+        from talea._attention_numba import diagonal_prefix_f32, integral_image_f32
+        from talea._phase_numba import transitions
+    except ImportError:
+        return
+    from talea import attention, phase_ssm, unit_registration
+    attention._compiled_diagonal_prefix = diagonal_prefix_f32
+    unit_registration._compiled_integral_image = integral_image_f32
+    phase_ssm._compiled_transitions = transitions
 
 
 def run_record(payload: tuple) -> dict:

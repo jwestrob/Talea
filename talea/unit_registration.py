@@ -15,12 +15,18 @@ from collections.abc import Sequence
 import numpy as np
 
 
+_compiled_integral_image = None
+
+
 def integral_image(matrix: np.ndarray) -> np.ndarray:
     """Return a padded 2-D summed-area table."""
 
-    values = np.asarray(matrix, dtype=np.float64)
+    values = np.asarray(matrix)
     if values.ndim != 2 or values.shape[0] != values.shape[1]:
         raise ValueError("attention matrix must be square")
+    if _compiled_integral_image is not None and values.dtype == np.float32:
+        return _compiled_integral_image(values)
+    values = np.asarray(values, dtype=np.float64)
     if not np.isfinite(values).all():
         raise ValueError("attention matrix contains nonfinite values")
     with np.errstate(all="ignore"):
