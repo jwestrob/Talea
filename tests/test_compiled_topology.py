@@ -88,6 +88,50 @@ def test_packed_median_suppression_matches_per_diagonal_partition():
             assert packed.tobytes() == np.concatenate(tracks).tobytes()
 
 
+@pytest.mark.parametrize("mode", ["continuous", "ties", "tiny", "large"])
+def test_median_reuse_preserves_each_suppression_step(mode):
+    from talea._wedge_numba import suppress_packed
+    rng = np.random.default_rng(271)
+    size = 97
+    separations = np.arange(1, size)
+    offsets = np.r_[0, 0, np.cumsum(size - separations)]
+    values = rng.normal(size=offsets[-1])
+    if mode == "ties":
+        values = np.rint(values)
+    elif mode == "tiny":
+        values = np.rint(values) * np.nextafter(0., 1.)
+    elif mode == "large":
+        values = rng.choice([1., np.finfo(float).max], size=len(values))
+    values[values == 0] = 0.
+    actual = values.copy()
+    state = np.empty(len(separations)), np.zeros(len(separations), np.uint8)
+    for _ in range(20):
+        start = rng.integers(-10, size)
+        end = rng.integers(start, size + 10)
+        suppress_packed(values, offsets, separations, start, end)
+        suppress_packed(actual, offsets, separations, start, end, state)
+        assert actual.tobytes() == values.tobytes()
+
+
+@pytest.mark.parametrize("starts", [767, 768, 769, 1025])
+def test_blocked_wedge_preserves_start_and_period_ties(starts):
+    from talea._wedge_numba import best_from_prefixes, scores_from_prefixes
+    rng = np.random.default_rng(82)
+    width = 16
+    used = np.array([1, 2, 3, 6])
+    indices = np.array([[0, 1], [0, 1], [2, 3]])
+    weights = np.array([[1., -.25], [1., -.25], [1., -.25]])
+    counts = np.array([2, 2, 2])
+    denominators = np.array([2., 2., 2.])
+    periods = np.array([13., 7., 21.])
+    prefix = np.cumsum(rng.integers(-2, 5, size=(7, width + starts)), axis=1, dtype=np.float64)
+    for values in (prefix, np.zeros_like(prefix)):
+        args = (values, width, used, indices, weights, counts, denominators)
+        scores = scores_from_prefixes(*args)
+        wanted = min(zip(*np.where(scores == scores.max())), key=lambda pair: (periods[pair[0]], pair[1]))
+        assert best_from_prefixes(*args, periods) == (*wanted, scores[wanted])
+
+
 def test_compiled_wedge_peak_and_row_normalization_match_reference(monkeypatch):
     from talea import wedge
     rng = np.random.default_rng(92)

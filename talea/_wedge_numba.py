@@ -118,8 +118,51 @@ def scores_from_prefixes(prefix, width, used, indices, weights, counts, denomina
 
 
 @njit(cache=True, fastmath=False)
+def _best_blocked(prefix, width, used, indices, weights, counts, denominators, periods):
+    """Reuse a block of diagonal window sums across every period template."""
+    starts = prefix.shape[1] - width
+    block = 128
+    sums = np.empty((len(used), block), dtype=np.float64)
+    scores = np.empty(block, dtype=np.float64)
+    maxima = np.full(len(counts), -np.inf)
+    first = np.zeros(len(counts), dtype=np.int64)
+    finite = np.zeros(len(counts), dtype=np.bool_)
+    for base in range(0, starts, block):
+        size = min(block, starts - base)
+        for k, separation in enumerate(used):
+            span = width - separation
+            for j in range(size):
+                sums[k, j] = prefix[separation, base + j + span] - prefix[separation, base + j]
+        for row in range(len(counts)):
+            scores[:size] = 0.0
+            for slot in range(counts[row]):
+                values = sums[indices[row, slot]]
+                weight = weights[row, slot]
+                for j in range(size):
+                    scores[j] += weight * values[j]
+            top, at, ok = maxima[row], first[row], finite[row]
+            for j in range(size):
+                score = scores[j] / denominators[row]
+                if np.isfinite(score):
+                    ok = True
+                if score > top:
+                    top, at = score, base + j
+            maxima[row], first[row], finite[row] = top, at, ok
+    best, start, score = -1, -1, -np.inf
+    for row in range(len(counts)):
+        if finite[row] and (best < 0 or maxima[row] > score
+                            or (maxima[row] == score and periods[row] < periods[best])):
+            best, start, score = row, first[row], maxima[row]
+    return best, start, score
+
+
+@njit(cache=True, fastmath=False)
 def best_from_prefixes(prefix, width, used, indices, weights, counts, denominators, periods):
     """Keep only the best start and template for this width, in stock tie order."""
+    # The full-width gather wins on short searches. For long searches its
+    # working set exceeds cache; each block then supplies every template.
+    if prefix.shape[1] - width >= 768:
+        return _best_blocked(prefix, width, used, indices, weights, counts, denominators, periods)
     sums = _window_sums(prefix, width, used)
     scores = np.empty(sums.shape[1], dtype=np.float64)
     best_row, best_start, best_score = -1, -1, -np.inf
@@ -158,38 +201,85 @@ def padded_diagonals_f32(matrix, maximum):
 
 
 @njit(cache=True, fastmath=False)
-def suppress_packed(values, offsets, separations, start, end):
-    """Set touched residue pairs in the selected diagonals to their current medians."""
-    for separation in separations:
+def _initial_median(row):
+    size = len(row)
+    ordered = row.copy()
+    middle = size // 2
+    low, high = 0, size - 1
+    while low < high:
+        # Hoare partition, searching only for the upper middle element.
+        pivot = ordered[(low + high) // 2]
+        i, j = low, high
+        while i <= j:
+            while ordered[i] < pivot:
+                i += 1
+            while ordered[j] > pivot:
+                j -= 1
+            if i <= j:
+                ordered[i], ordered[j] = ordered[j], ordered[i]
+                i += 1
+                j -= 1
+        if middle <= j:
+            high = j
+        elif middle >= i:
+            low = i
+        else:
+            break
+    median = ordered[middle]
+    if size % 2:
+        return median, True
+    lower = np.max(ordered[:middle])
+    return (lower + median) / 2.0, lower == median
+
+
+@njit(cache=True, fastmath=False)
+def _median_after_suppression(row, previous):
+    # Replacing values by the previous median cannot increase the number
+    # on either side. Each middle order statistic is therefore either that
+    # median or the nearest remaining value on its side.
+    below, above = 0, 0
+    lower, upper = -np.inf, np.inf
+    for value in row:
+        if value < previous:
+            below += 1
+            lower = max(lower, value)
+        elif value > previous:
+            above += 1
+            upper = min(upper, value)
+    half = len(row) // 2
+    if below < half:
+        lower = previous
+    if above < half:
+        upper = previous
+    return (lower + upper) / 2.0, lower == upper
+
+
+@njit(cache=True, fastmath=False)
+def suppress_packed(values, offsets, separations, start, end, median_state=None):
+    """Set overlapping pairs to each track's current median; reuse known middle ranks."""
+    for i, separation in enumerate(separations):
         first, last = offsets[separation], offsets[separation + 1]
         row = values[first:last]
         size = len(row)
         if size == 0:
             continue
-        ordered = row.copy()
-        middle = size // 2
-        low, high = 0, size - 1
-        while low < high:
-            # Hoare partition, searching only for the upper middle element.
-            pivot = ordered[(low + high) // 2]
-            i, j = low, high
-            while i <= j:
-                while ordered[i] < pivot:
-                    i += 1
-                while ordered[j] > pivot:
-                    j -= 1
-                if i <= j:
-                    ordered[i], ordered[j] = ordered[j], ordered[i]
-                    i += 1
-                    j -= 1
-            if middle <= j:
-                high = j
-            elif middle >= i:
-                low = i
+        # State 0 is the first visit, 1 has a stable median, 2 needs the
+        # neighboring ranks, and 3 permanently requests fresh partitions.
+        mode = 0 if median_state is None else median_state[1][i]
+        if mode == 1:
+            median, stable = median_state[0][i], True
+        elif mode == 2:
+            median, stable = _median_after_suppression(row, median_state[0][i])
+        else:
+            median, stable = _initial_median(row)
+        if median_state is not None:
+            medians, modes = median_state
+            medians[i] = median
+            # A replacement can introduce a signed zero or infinity that
+            # the original input guard did not see. Retain partition ties.
+            if mode == 3 or not np.isfinite(median) or (median == 0 and np.signbit(median)):
+                modes[i] = 3
             else:
-                break
-        median = ordered[middle]
-        if size % 2 == 0:
-            median = (np.max(ordered[:middle]) + median) / 2.0
+                modes[i] = 1 if stable else 2
         row[max(0, start):min(size, max(0, end))] = median
         row[max(0, start - separation):min(size, max(0, end - separation))] = median
