@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from typing import NamedTuple
+from itertools import cycle
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 
@@ -297,7 +298,7 @@ def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMEN
         start = stop
 
 
-def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None):
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, handoff=False):
     """Yield one device map per layer and protein, or the scalar singleton path."""
     heads = attentions[layers[0]].shape[1]
     for start, stop in (_equal_apc_groups(indices_by_record, heads) if groups is None else groups):
@@ -315,8 +316,10 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
         if stats is not None:
             stats["executed_groups"] += 1
             stats["executed_records"] += stop - start
+        ready = stream.record_event() if handoff else None
         for offset in range(stop - start):
-            yield start + offset, {layer: maps[layer][offset] for layer in layers}
+            item = start + offset, {layer: maps[layer][offset] for layer in layers}
+            yield (*item, ready) if handoff else item
 
 
 class _PendingCapture(NamedTuple):
@@ -1021,6 +1024,7 @@ class TaleaPredictor:
         capture_mode: str = "auto",
         cache_clear_interval: int = 0,
         record_workers: int = 1,
+        readout_streams: int = 0,
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
         readout_square_budget: int = 1024 ** 2,
@@ -1116,6 +1120,12 @@ class TaleaPredictor:
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
         if shared_attention_mib < 0:
             raise ValueError("shared_attention_mib must be nonnegative")
+        if not 0 <= readout_streams <= record_workers:
+            raise ValueError("readout_streams must be between zero and record_workers")
+        if readout_streams:
+            if self.device.type != "cuda" or _device_autocast_enabled("cuda"):
+                raise ValueError("independent readout streams require CUDA with an explicit model dtype")
+            teacher_owner_thread = True
         if record_workers < 1:
             raise ValueError("record_workers must be positive")
         if prefetch_forward and self.device.type not in ("cuda", "mps"):
@@ -1321,6 +1331,19 @@ class TaleaPredictor:
                     teacher_cuda_graph, replace_stream=graph_prefetch, owner_thread=teacher_owner_thread,
                     pack_tracks=teacher_graph_tracks,
                 )
+            private_streams = [torch.cuda.Stream(device=self.device) for _ in range(readout_streams)]
+            worker_local = threading.local()
+            if private_streams:
+                if readout_stream is None:
+                    readout_stream = torch.cuda.current_stream(self.device)
+                available_streams = cycle(private_streams)
+
+                def bind_private_stream():
+                    worker_local.stream = next(available_streams)
+                    torch.cuda.set_stream(worker_local.stream)
+
+                for private in private_streams:
+                    stack.callback(private.synchronize)
             record_pool = None
             if record_workers > 1 and not _device_autocast_enabled(self.device.type):
                 # Bind every worker to the graph's readout stream, including
@@ -1328,8 +1351,8 @@ class TaleaPredictor:
                 stream = _record_worker_stream(self.device, readout_stream)
                 record_pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(
                     max_workers=record_workers,
-                    initializer=torch.cuda.set_stream if stream is not None else None,
-                    initargs=(stream,) if stream is not None else (),
+                    initializer=bind_private_stream if private_streams else (torch.cuda.set_stream if stream is not None else None),
+                    initargs=(stream,) if stream is not None and not private_streams else (),
                 ))
             stack.callback(cancel_outstanding)
             stack.enter_context(torch.inference_mode())
@@ -1473,6 +1496,22 @@ class TaleaPredictor:
                 if early_apc:
                     layer_maps = {layer: _collect_capture(item, consumer) for layer, item in attentions.items()}
                     self.early_apc_layers += len(layer_maps)
+                if private_streams:
+                    # Model capture and grouped operations belong to the owner stream.
+                    # Publish the immutable separation-mask blocks there as well.
+                    with torch.cuda.stream(readout_stream):
+                        device = next(iter(hidden_states.values())).device
+                        capacities = {1 << (record.length - 1).bit_length() for record in batch}
+                        masks = [_separation_mask_block(cap, minimum_separation, device) for cap in capacities] if minimum_separation else []
+                        available = readout_stream.record_event()
+                    for private in private_streams:
+                        _handoff_capture(private, available, {} if early_apc else attentions, hidden_states, residue_indices)
+                        for mask in masks:
+                            mask.record_stream(private)
+                        if early_apc:
+                            for maps in layer_maps.values():
+                                for tensor in maps:
+                                    tensor.record_stream(private)
                 compact = []
                 pooled_rows = []
 
@@ -1533,9 +1572,14 @@ class TaleaPredictor:
                 readout_capacity = max(1, readout_square_budget // batch[-1].length ** 2)
                 width = min(record_workers, readout_capacity)
 
-                def stream_readout(*args):
-                    with torch.cuda.stream(readout_stream):
-                        return readout(*args)
+                def stream_readout(position, grouped=None, group_ready=None):
+                    stream = getattr(worker_local, "stream", readout_stream) if private_streams else readout_stream
+                    with torch.cuda.stream(stream):
+                        if group_ready is not None:
+                            stream.wait_event(group_ready)
+                            for tensor in grouped.values():
+                                tensor.record_stream(stream)
+                        return readout(position, grouped)
 
                 read = readout if readout_stream is None else stream_readout
                 if group_equal_apc:
@@ -1562,7 +1606,7 @@ class TaleaPredictor:
                 if group_equal_apc and self.device.type == "cuda" and not early_apc:
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
-                        device_storage_dtype, readout_stream, groups, stats,
+                        device_storage_dtype, readout_stream, groups, stats, handoff=bool(private_streams),
                     )
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:

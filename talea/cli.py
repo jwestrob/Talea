@@ -73,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="group CUDA attention correction for records with identical residue spans")
     parser.add_argument("--readout-square-budget", type=int, default=1024 ** 2,
                         help="square residue elements available for concurrent per-record readouts")
+    parser.add_argument("--readout-streams", type=int, default=0,
+                        help="number of independent CUDA streams for record workers (zero shares one stream)")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
     parser.add_argument(
         "--prefetch-forward", action="store_true",
@@ -264,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
+        **({"readout_streams": args.readout_streams} if args.readout_streams else {}),
         **({"device_teacher_tiles": True} if args.device_teacher_tiles else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
@@ -327,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
+        **({"readout_streams": args.readout_streams} if args.readout_streams else {}),
         **({"device_teacher_tiles": True} if args.device_teacher_tiles else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),

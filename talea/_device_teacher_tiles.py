@@ -47,6 +47,9 @@ class DeviceTeacherTiles:
     @contextmanager
     def input_batch(self, start, size, device, graphs):
         if self.device_tables is None:
+            # The graph owner may consume maps created on another CUDA stream.
+            for tensor in self.maps:
+                tensor.record_stream(torch.cuda.current_stream(device))
             self.device_tables = torch.from_numpy(self.tables).to(device, non_blocking=True)
         shape = (size, 3, self.side, self.side)
         buffer = graphs.input_buffer(size) if graphs is not None else nullcontext(
