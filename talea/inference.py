@@ -5,7 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import gc
-from functools import lru_cache
+from functools import lru_cache, partial
 import hashlib
 import json
 import multiprocessing
@@ -49,6 +49,7 @@ from talea.production import (
     teacher_tracks_from_attention,
 )
 from talea.topology import process_attention_record
+from talea.shared_attention import SharedAttentionArena
 
 
 def automatic_device() -> torch.device:
@@ -555,6 +556,7 @@ class TaleaPredictor:
         self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self._postprocess_pool_workers = 0
         self.apc_group_stats = None
+        self._attention_arena = None
         self._teacher_graphs = None
         self._graph_readout_stream = None
         self.teacher_cuda_graph_active = False
@@ -633,7 +635,9 @@ class TaleaPredictor:
         self.teacher_cuda_graph_active = True
         return self._teacher_graphs
 
-    def _process_pool(self, workers: int) -> concurrent.futures.ProcessPoolExecutor:
+    def _process_pool(
+        self, workers: int, shared_attention_mib: int = 0,
+    ) -> concurrent.futures.ProcessPoolExecutor:
         """The postprocess worker pool, started once and kept for later calls.
 
         Each new worker re-imports the calling script, torch included when
@@ -643,20 +647,27 @@ class TaleaPredictor:
         by a dead worker, gets a new pool.
         """
 
+        if shared_attention_mib < 0:
+            raise ValueError("shared_attention_mib must be nonnegative")
         pool = self._postprocess_pool
+        arena = getattr(self, "_attention_arena", None)
+        capacity = shared_attention_mib * 1024**2
         if pool is not None and (
             workers != self._postprocess_pool_workers
+            or capacity != (arena.capacity_bytes if arena is not None else 0)
             or getattr(pool, "_broken", False)
         ):
             pool.shutdown(wait=True, cancel_futures=True)
-            pool = None
+            self._postprocess_pool = self._attention_arena = pool = None
         if pool is None:
+            arena = SharedAttentionArena(capacity) if capacity else None
             pool = concurrent.futures.ProcessPoolExecutor(
                 max_workers=workers,
                 mp_context=postprocess_pool_context(),
                 initializer=initialize_worker,
-                initargs=(self.configs,),
+                initargs=(self.configs, arena.buffer if arena is not None else None),
             )
+            self._attention_arena = arena
             self._postprocess_pool = pool
             self._postprocess_pool_workers = workers
         return pool
@@ -667,6 +678,7 @@ class TaleaPredictor:
         self._teacher_graphs = None
         self._graph_readout_stream = None
         pool, self._postprocess_pool = self._postprocess_pool, None
+        self._attention_arena = None
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
 
@@ -887,6 +899,7 @@ class TaleaPredictor:
         fused_rotary: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
+        shared_attention_mib: int = 0,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
@@ -909,6 +922,10 @@ class TaleaPredictor:
         With prefetch_forward enabled, one ESM forward can run ahead of the
         current batch's readouts when accelerator memory permits. On CUDA these
         use separate streams. MPS overlaps its GPU queue with host preparation.
+
+        shared_attention_mib reserves this much shared process memory for APC
+        inputs. When a record cannot fit, it uses the normal process queue.
+        The default of zero sends all matrices through the queue.
 
         Batches are pipelined: a batch's rows are yielded after the next batch
         has run on the device and been submitted, so postprocessing overlaps
@@ -943,6 +960,8 @@ class TaleaPredictor:
                 "eligible_squared_lengths": 0, "group_size_counts": {},
                 "element_budget": _APC_GROUP_ELEMENTS,
             }
+        if shared_attention_mib < 0:
+            raise ValueError("shared_attention_mib must be nonnegative")
         if record_workers < 1:
             raise ValueError("record_workers must be positive")
         if prefetch_forward and self.device.type not in ("cuda", "mps"):
@@ -982,7 +1001,7 @@ class TaleaPredictor:
         )
         if postprocess_mode == "process":
             pool_context = contextlib.nullcontext(
-                self._process_pool(postprocess_workers)
+                self._process_pool(postprocess_workers, shared_attention_mib)
             )
         else:
             pool_context = concurrent.futures.ThreadPoolExecutor(
@@ -1096,6 +1115,9 @@ class TaleaPredictor:
         attention_staging = _AttentionStaging() if self.device.type == "cuda" else None
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)
+            submit_record = pool.submit
+            if postprocess_mode == "process" and shared_attention_mib:
+                submit_record = partial(self._attention_arena.submit, pool)
             overlap_enabled = prefetch_forward and len(batches) > 1
             forward_stream = readout_stream = None
             graph_prefetch = (
@@ -1301,7 +1323,7 @@ class TaleaPredictor:
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
                     if postprocess_mode == "process":
-                        future = pool.submit(
+                        future = submit_record(
                             run_record,
                             (
                                 record.metadata(),

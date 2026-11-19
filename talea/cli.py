@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="overlap one ESM forward with the preceding batch's readouts on CUDA or MPS",
     )
     parser.add_argument("--maximum-batch", type=int, default=64)
+    parser.add_argument(
+        "--shared-attention-mib", type=int, default=0,
+        help="MiB for shared APC matrix storage between process workers (default: 0)",
+    )
     parser.add_argument("--square-budget", type=int, default=4_000_000)
     parser.add_argument(
         "--postprocess-workers",
@@ -235,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     prediction_options = {
         "square_budget": args.square_budget,
+        "shared_attention_mib": args.shared_attention_mib,
         "maximum_batch": args.maximum_batch,
         "postprocess_workers": args.postprocess_workers,
         "progress": not args.quiet,
@@ -291,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
+        **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}

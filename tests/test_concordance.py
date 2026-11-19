@@ -505,6 +505,29 @@ def test_worker_entry_point_reproduces_direct_call():
     assert direct == viaworker
 
 
+def test_actual_worker_pool_with_shared_attention_matches_complete_topology():
+    from talea.inference import TaleaPredictor
+    from talea.postprocess_pool import run_record
+
+    task = build_task(129, seed=189)
+    predictor = object.__new__(TaleaPredictor)
+    predictor.configs = {key: task[key] for key in (
+        "protein_calibration", "local_calibration", "wedge_config", "operational_config"
+    )}
+    predictor._postprocess_pool = None
+    inputs = (task["metadata"], {k: v.astype(np.float32) for k, v in task["matrices"].items()},
+              task["window_sizes"])
+    with predictor:
+        pool = predictor._process_pool(2, 1)
+        ring = predictor._attention_arena
+        reference = pool.submit(run_record, inputs).result()
+        shared = ring.submit(pool, run_record, inputs).result()
+        assert ring.shared_records == 1 and reference == shared
+        assert predictor._process_pool(2, 1) is pool
+        assert predictor._process_pool(2, 0) is not pool
+        assert predictor._attention_arena is None
+
+
 @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
 def test_batched_window_spectra_match_individual_windows(dtype):
     from talea.attention import compact_window_calls, score_attention_window

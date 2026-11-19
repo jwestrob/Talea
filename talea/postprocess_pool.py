@@ -19,17 +19,20 @@ from __future__ import annotations
 import os
 
 from talea.topology import process_attention_record
+from talea.shared_attention import AttentionSpan
 
 _CONFIGS: dict | None = None
+_SHARED_ATTENTION_BUFFER = None
 
 
-def initialize_worker(configs: dict) -> None:
+def initialize_worker(configs: dict, attention_buffer=None) -> None:
     """Stash the frozen calibration configs once per worker.
 
     They are identical for every record, so shipping them per task would
     repickle a few hundred kilobytes per protein for nothing.
     """
-    global _CONFIGS
+    global _CONFIGS, _SHARED_ATTENTION_BUFFER
+    _SHARED_ATTENTION_BUFFER = attention_buffer
     _CONFIGS = configs
     from talea.wedge import enable_compiled_wedge_scores
     enable_compiled_wedge_scores()
@@ -49,6 +52,8 @@ def run_record(payload: tuple) -> dict:
     metadata, matrices, window_sizes, *rest = payload
     if _CONFIGS is None:
         raise RuntimeError("postprocess worker was not initialized")
+    if isinstance(matrices, AttentionSpan):
+        matrices = matrices.matrices(_SHARED_ATTENTION_BUFFER)
     return process_attention_record(
         {
             "metadata": metadata,
