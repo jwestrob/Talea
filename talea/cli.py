@@ -51,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
+    parser.add_argument(
+        "--prefetch-forward", action="store_true",
+        help="overlap one ESM forward with the preceding batch's readouts on CUDA or MPS",
+    )
     parser.add_argument("--maximum-batch", type=int, default=64)
     parser.add_argument("--square-budget", type=int, default=4_000_000)
     parser.add_argument(
@@ -232,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
+        "prefetch_forward": args.prefetch_forward,
         "postprocess_mode": args.postprocess_mode,
     }
     if args.long_proteins == "window":
@@ -279,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
         "record_workers": args.record_workers,
+        **({"prefetch_forward": True} if args.prefetch_forward else {}),
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
         "primary_extent": args.primary_extent,

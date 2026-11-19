@@ -205,6 +205,13 @@ class SelectiveCapture:
         self.attentions.clear()
         self.hidden_states.clear()
 
+    def take(self):
+        """Detach one forward's dictionaries from the sinks held by the hooks."""
+        self.require()
+        attentions, hidden_states = self.attentions.copy(), self.hidden_states.copy()
+        self.reset()
+        return attentions, hidden_states
+
     # ------------------------------------------------------------------ output
     def finalize(self, last_hidden_state: torch.Tensor) -> None:
         """Supply ``last_hidden_state`` for any layer that resolves to it."""

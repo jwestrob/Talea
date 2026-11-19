@@ -328,6 +328,50 @@ def _ordered_readouts(function, count, executor, width):
             future.cancel()
 
 
+def _forward_pair(batch, following, future, forward, producer, can_overlap):
+    """Release the current capture to its consumer and schedule at most one successor."""
+    current = forward(batch) if future is None else future.result()
+    upcoming = None
+    if (producer is not None and following is not None
+            and can_overlap(batch, following, current)):
+        upcoming = producer.submit(forward, following)
+    return current, upcoming
+
+
+def _handoff_capture(stream, ready, attentions, hidden_states, residue_indices):
+    stream.wait_event(ready)
+    # Producer-owned storage must remain valid through consumer operations.
+    for tensor in (*attentions.values(), *hidden_states.values()):
+        tensor.record_stream(stream)
+    for indices, _ in residue_indices:
+        indices.record_stream(stream)
+
+
+def _prefetch_memory_required(current, following, attention, hidden, width):
+    """Conservative working-set estimate in addition to the live captures."""
+    tokens = following[-1].length + max(2, attention.shape[-1] - current[-1].length)
+    batch_size = len(following)
+    # Allow six full fp32 score/softmax/capture maps plus block activations,
+    # alongside current APC/teacher scratch. Original batch shapes stay fixed.
+    head_bytes = attention.shape[1] * max(4, attention.element_size())
+    forward = 6 * batch_size * tokens**2 * head_bytes
+    forward += 24 * batch_size * tokens * hidden.shape[-1] * max(4, hidden.element_size())
+    readout = 6 * width * current[-1].length**2 * head_bytes
+    return forward + readout + (768 << 20)
+
+
+def _prefetch_headroom(device):
+    if device.type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        # Discount cached blocks for fragmentation and leave space for the
+        # runtime's allocations outside the PyTorch caching allocator.
+        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        return int(.8 * (free + max(0, cached) // 2))
+    if hasattr(torch.mps, "recommended_max_memory"):
+        return int(.8 * (torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory()))
+    return 0
+
+
 def make_batches(
     records: Sequence[SequenceRecord],
     square_budget: int,
@@ -728,6 +772,7 @@ class TaleaPredictor:
         capture_mode: str = "auto",
         cache_clear_interval: int = 0,
         record_workers: int = 1,
+        prefetch_forward: bool = False,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
@@ -746,6 +791,10 @@ class TaleaPredictor:
 
         With record_workers > 1, threads prepare independent proteins using
         their original teacher batch shapes. Results are collected in order.
+
+        With prefetch_forward enabled, one ESM forward can run ahead of the
+        current batch's readouts when accelerator memory permits. On CUDA these
+        use separate streams. MPS overlaps its GPU queue with host preparation.
 
         Batches are pipelined: a batch's rows are yielded after the next batch
         has run on the device and been submitted, so postprocessing overlaps
@@ -773,6 +822,10 @@ class TaleaPredictor:
 
         if record_workers < 1:
             raise ValueError("record_workers must be positive")
+        if prefetch_forward and self.device.type not in ("cuda", "mps"):
+            raise ValueError("forward prefetch requires a CUDA or MPS device")
+        if prefetch_forward and torch.is_autocast_enabled(self.device.type):
+            raise ValueError("forward prefetch requires an explicit model dtype with autocast disabled")
         values = list(records)
         if not values:
             return
@@ -920,9 +973,21 @@ class TaleaPredictor:
         attention_staging = _AttentionStaging() if self.device.type == "cuda" else None
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)
+            overlap_enabled = prefetch_forward and len(batches) > 1
+            forward_stream = readout_stream = None
+            if overlap_enabled:
+                # On cancellation, join both thread pools before synchronizing
+                # their streams. Capture storage can then be safely released.
+                if self.device.type == "cuda":
+                    forward_stream = torch.cuda.current_stream(self.device)
+                    readout_stream = torch.cuda.Stream(device=self.device)
+                    stack.callback(readout_stream.synchronize)
+                    stack.callback(forward_stream.synchronize)
+                else:
+                    stack.callback(torch.mps.synchronize)
             record_pool = None
             if record_workers > 1 and not torch.is_autocast_enabled(self.device.type):
-                # Read from captured tensors on their original CUDA stream.
+                # The normal readout path uses the caller's original CUDA stream.
                 stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
                 record_pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(
                     max_workers=record_workers,
@@ -939,7 +1004,17 @@ class TaleaPredictor:
                     mode=capture_mode,
                 )
             )
-            for batch_index, batch in enumerate(batches, start=1):
+            producer = None
+            if overlap_enabled:
+                # Join the producer before restoring the ESM hooks.
+                producer = stack.enter_context(concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    initializer=torch.cuda.set_stream if forward_stream is not None else None,
+                    initargs=(forward_stream,) if forward_stream is not None else (),
+                ))
+
+            @torch.inference_mode()
+            def forward(batch):
                 tokenized = self.tokenizer(
                     [record.sequence for record in batch],
                     return_tensors=None,
@@ -957,17 +1032,53 @@ class TaleaPredictor:
                     if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
                 capture.reset()
-                model_output = self.esm_model(
-                    **model_inputs,
-                    compute_logits=False,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    return_dict=True,
+                try:
+                    model_output = self.esm_model(
+                        **model_inputs,
+                        compute_logits=False,
+                        output_attentions=False,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+                    capture.finalize(model_output.last_hidden_state)
+                    attentions, hidden_states = capture.take()
+                except BaseException:
+                    capture.reset()
+                    raise
+                ready = None
+                if readout_stream is not None:
+                    ready = torch.cuda.current_stream(self.device).record_event()
+                return residue_indices, attentions, hidden_states, ready
+
+            def can_overlap(current, following, captured):
+                _, attention, hidden, _ = captured
+                width = min(record_workers, max(1, 1024 ** 2 // current[-1].length ** 2))
+                required = _prefetch_memory_required(
+                    current, following, next(iter(attention.values())), next(iter(hidden.values())), width,
                 )
-                capture.finalize(model_output.last_hidden_state)
-                capture.require()
-                attentions = capture.attentions
-                hidden_states = capture.hidden_states
+                return required <= _prefetch_headroom(self.device)
+
+            next_forward = None
+            prefetched = 0
+
+            def cancel_forward():
+                if next_forward is not None:
+                    next_forward.cancel()
+
+            stack.callback(cancel_forward)
+            for batch_index, batch in enumerate(batches, 1):
+                following = batches[batch_index] if batch_index < len(batches) else None
+                if cache_clear_interval and batch_index % cache_clear_interval == 0:
+                    following = None
+                captured, next_forward = _forward_pair(
+                    batch, following, next_forward, forward, producer, can_overlap
+                )
+                if next_forward is not None:
+                    prefetched += 1
+                residue_indices, attentions, hidden_states, ready = captured
+                del captured
+                if ready is not None:
+                    _handoff_capture(readout_stream, ready, attentions, hidden_states, residue_indices)
                 compact = []
                 pooled_rows = []
                 @torch.inference_mode()
@@ -1005,7 +1116,13 @@ class TaleaPredictor:
 
                 # Bound concurrent quadratic APC scratch as records get longer.
                 width = min(record_workers, max(1, 1024 ** 2 // batch[-1].length ** 2))
-                readouts = _ordered_readouts(readout, len(batch), record_pool, width)
+
+                def stream_readout(position):
+                    with torch.cuda.stream(readout_stream):
+                        return readout(position)
+
+                read = readout if readout_stream is None else stream_readout
+                readouts = _ordered_readouts(read, len(batch), record_pool, width)
                 for record, outputs in zip(batch, readouts, strict=True):
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
@@ -1038,16 +1155,7 @@ class TaleaPredictor:
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )
-                capture.reset()
-                del (
-                    model_output,
-                    tokenized,
-                    model_inputs,
-                    residue_indices,
-                    attentions,
-                    hidden_states,
-                    pooled_rows,
-                )
+                del residue_indices, attentions, hidden_states, pooled_rows
                 # empty_cache() returns blocks to the driver and forces later
                 # cudaMalloc; gc.collect() walks every generation. Both were
                 # unconditional per batch. Interval 0 disables them entirely,
@@ -1064,5 +1172,8 @@ class TaleaPredictor:
                 if pending is not None:
                     yield from collect(*pending)
                 pending = (batch_index, compact, global_probabilities)
+            if prefetch_forward and progress:
+                print(f"Talea: prefetched {prefetched}/{len(batches) - 1} batch boundaries",
+                      file=sys.stderr, flush=True)
             if pending is not None:
                 yield from collect(*pending)
