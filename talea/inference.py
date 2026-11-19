@@ -601,6 +601,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.fused_rotary_calls = 0
+        self.unit_residual_blocks = 0
         self.fused_swiglu_calls = 0
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
@@ -946,6 +947,7 @@ class TaleaPredictor:
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
+        unit_residual: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         shared_attention_mib: int = 0,
@@ -1225,6 +1227,10 @@ class TaleaPredictor:
                     mode=capture_mode,
                 )
             )
+            self.unit_residual_blocks = 0
+            if unit_residual:
+                from talea.capture import unit_residual_context
+                self.unit_residual_blocks = stack.enter_context(unit_residual_context(capture.blocks))
             self.fused_rotary_calls = 0
             if fused_rotary:
                 from talea.rotary import fused_rotary_context
