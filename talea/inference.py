@@ -890,11 +890,26 @@ class TaleaPredictor:
         )
         self._openness_bias = float(gate["bias"])
         self.openness_penalty_weight = float(gate["penalty_weight"])
-        self.global_bundle = joblib.load(self.assets.global_model)
-        _validate_global_bundle(self.global_bundle, self.deployment)
+        from talea._frozen_classifier import prepare_frozen_classifier
+
+        bundle = joblib.load(self.assets.global_model)
+        _validate_global_bundle(bundle, self.deployment)
+        self.global_bundle = bundle
+        self._prediction_global_bundle = prepare_frozen_classifier(bundle, self.assets.sha256["global_model"])
         self.loaded_at = time.time()
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
+
+    @property
+    def global_bundle(self):
+        """Expose the mutable sklearn bundle and use it for subsequent predictions."""
+        # A caller can edit fitted arrays or refit the pipeline returned here.
+        self._prediction_global_bundle = self._global_bundle
+        return self._global_bundle
+
+    @global_bundle.setter
+    def global_bundle(self, bundle):
+        self._global_bundle = self._prediction_global_bundle = bundle
 
     def _get_teacher_graphs(self, requested, *, replace_stream=False, owner_thread=False, pack_tracks=False, shared_pool=False):
         self.teacher_cuda_graph_active = False
@@ -1902,7 +1917,7 @@ class TaleaPredictor:
                         (record, future, state_track, teacher_track, region_track, gate_logit)
                     )
                 global_probabilities = global_head_probabilities(
-                    self.global_bundle, pooled_rows
+                    self._prediction_global_bundle, pooled_rows
                 )
                 if early_apc:
                     del layer_maps
