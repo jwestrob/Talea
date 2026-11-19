@@ -7,7 +7,9 @@ import math
 import numpy as np
 
 from talea.application import frozen_operational_scores, frozen_spectrum_score
-from talea.attention import compact_window_calls, score_attention_window
+from talea.attention import (
+    DIAGONAL_FAST_PATH_MAXIMUM, compact_window_calls, score_attention_window, whole_and_window_calls,
+)
 from talea.physical import window_plan
 from talea.phase_ssm import apply_placement, place_units
 from talea.regions import SECONDARY_MINIMUM_STATE, secondary_wedge_calls
@@ -58,18 +60,24 @@ def fused_local_windows(
     minimum_window_size: int = 1,
 ) -> list[dict]:
     layers = tuple(int(value) for value in calibration["layers_zero_based"])
-    parameters = {
-        int(key): value for key, value in calibration["parameters"].items()
-    }
     whole_scores = {} if whole_scores is None else whole_scores
-    spans = sorted(
-        (start, end) for start, end in window_plan(protein_length, window_sizes=window_sizes)
-        if end - start >= minimum_window_size
-    )
+    spans = _local_spans(protein_length, window_sizes, minimum_window_size)
     scores = {
         layer: compact_window_calls(matrices[layer], spans, whole_scores.get(layer))
         for layer in layers
     }
+    return _fuse_local_calls(protein_length, calibration, layers, spans, scores)
+
+
+def _local_spans(protein_length, window_sizes, minimum_window_size):
+    return sorted(
+        (start, end) for start, end in window_plan(protein_length, window_sizes=window_sizes)
+        if end - start >= minimum_window_size
+    )
+
+
+def _fuse_local_calls(protein_length, calibration, layers, spans, scores):
+    parameters = {int(key): value for key, value in calibration["parameters"].items()}
     fused = []
     for start, end in spans:
         window_size = end - start
@@ -114,10 +122,28 @@ def process_attention_record(task: dict) -> dict:
     local_calibration = task["local_calibration"]
     wedge_config = task["wedge_config"]
     operational_config = task["operational_config"]
-    whole_scores = {
-        layer: score_attention_window(matrix, include_diagnostics=False)
-        for layer, matrix in sorted(matrices.items())
-    }
+    period_config = wedge_config["period_candidates"]
+    minimum_window_size = int(period_config["minimum_window_size"])
+    window_sizes = tuple(task["window_sizes"])
+    if length > DIAGONAL_FAST_PATH_MAXIMUM:
+        spans = _local_spans(length, window_sizes, minimum_window_size)
+        layers = tuple(int(value) for value in local_calibration["layers_zero_based"])
+        whole_scores, local_calls = {}, {}
+        for layer, matrix in sorted(matrices.items()):
+            if layer in layers:
+                whole_scores[layer], local_calls[layer] = whole_and_window_calls(matrix, spans)
+            else:
+                whole_scores[layer] = score_attention_window(matrix, include_diagnostics=False)
+        windows = _fuse_local_calls(length, local_calibration, layers, spans, local_calls)
+    else:
+        whole_scores = {
+            layer: score_attention_window(matrix, include_diagnostics=False)
+            for layer, matrix in sorted(matrices.items())
+        }
+        windows = fused_local_windows(
+            matrices, length, local_calibration, window_sizes, whole_scores,
+            minimum_window_size=minimum_window_size,
+        )
     spectrum_input = {
         "layer_features": [
             {"layer": layer, **score} for layer, score in whole_scores.items()
@@ -125,14 +151,6 @@ def process_attention_record(task: dict) -> dict:
     }
     spectrum = frozen_spectrum_score(
         spectrum_input, length, protein_calibration
-    )
-    period_config = wedge_config["period_candidates"]
-    minimum_window_size = int(period_config["minimum_window_size"])
-    # Local scores feed only the candidate-period filter, so score just the
-    # intervals it can select. The independent whole-protein score is retained.
-    windows = fused_local_windows(
-        matrices, length, local_calibration, tuple(task["window_sizes"]),
-        whole_scores, minimum_window_size=minimum_window_size,
     )
     periods = candidate_periods_from_windows(
         windows,

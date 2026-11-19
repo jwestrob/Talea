@@ -101,7 +101,12 @@ def score_attention_window(
     include_diagnostics: bool = True,
 ) -> dict:
     """Score periodic off-diagonal bands in one APC attention window."""
-    profile = diagonal_mean_profile(matrix)
+    return _score_diagonal_profile(
+        diagonal_mean_profile(matrix), min_period, max_period, min_cycles, include_diagnostics
+    )
+
+
+def _score_diagonal_profile(profile, min_period, max_period, min_cycles, include_diagnostics):
     residual = local_distance_residual(profile)
     effective_maximum = min(max_period, len(residual) / max(min_cycles, 1))
     call = score_signals(
@@ -304,7 +309,26 @@ def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
     return prefix
 
 
-def compact_window_calls(matrix: np.ndarray, spans: list[tuple[int, int]], whole: dict | None) -> dict:
+_compiled_diagonal_profiles = None
+
+
+def whole_and_window_calls(matrix, spans):
+    """Prepare shared diagonal sums for the whole matrix and overlapping windows."""
+    length = len(matrix)
+    width = max((end - start for start, end in spans if end - start < length), default=0)
+    if (_compiled_diagonal_profiles is not None and len(spans) >= 8 and 1 < width < length <= 8192
+            and matrix.ndim == 2 and matrix.shape[1] == length and matrix.dtype == np.float32
+            and matrix.flags.c_contiguous):
+        prepared = _compiled_diagonal_profiles(matrix, width, length > DIAGONAL_FAST_PATH_MAXIMUM)
+        if prepared is not None:
+            profile, prefix = prepared
+            whole = _score_diagonal_profile(profile, 5.0, 250.0, 3, False)
+            return whole, compact_window_calls(matrix, spans, whole, prefix=prefix)
+    whole = score_attention_window(matrix, include_diagnostics=False)
+    return whole, compact_window_calls(matrix, spans, whole)
+
+
+def compact_window_calls(matrix: np.ndarray, spans: list[tuple[int, int]], whole: dict | None, *, prefix=None) -> dict:
     """Score the fields consumed by the topology calibration, batched by window length."""
     by_size: dict[int, list[tuple[int, int]]] = {}
     result = {}
@@ -313,8 +337,7 @@ def compact_window_calls(matrix: np.ndarray, spans: list[tuple[int, int]], whole
             result[(start, end)] = whole
         else:
             by_size.setdefault(end - start, []).append((start, end))
-    prefix = None
-    if by_size and len(spans) >= 8:
+    if prefix is None and by_size and len(spans) >= 8:
         prefix = _exact_diagonal_prefix(matrix, max(by_size))
     for width, group in by_size.items():
         if len(group) < 2 or width < 8:

@@ -68,6 +68,38 @@ def diagonal_means_f32(values, require_grid):
 
 
 @njit(cache=True, fastmath=False)
+def diagonal_profiles_f32(matrix, width, positive_zero):
+    """Share exact band-prefix accumulators between local and full-protein means."""
+    length = len(matrix)
+    for value in matrix.reshape(matrix.size):
+        scaled = np.float64(value) * 16777216.0
+        if abs(value) > 65504.0 or scaled != np.rint(scaled):
+            return None
+    sums = np.empty(length - 1, np.float64)
+    # Only the in-bounds upper diagonals are used: prefix[i, d] is the sum of
+    # the first i entries at separation d. Write contiguous separations together.
+    prefix = np.empty((length + 1, width), np.float64)
+    prefix[0, :] = 0.0
+    for separation in range(1, length):
+        sums[separation - 1] = matrix[0, separation]
+    for separation in range(1, width):
+        prefix[1, separation] = matrix[0, separation]
+    for i in range(1, length):
+        stop = min(length - i, width)
+        for separation in range(1, stop):
+            prefix[i + 1, separation] = prefix[i, separation] + matrix[i, i + separation]
+        for separation in range(stop, length - i):
+            sums[separation - 1] += matrix[i, i + separation]
+    for separation in range(1, width):
+        sums[separation - 1] = prefix[length - separation, separation]
+    for separation in range(1, length):
+        if positive_zero:
+            sums[separation - 1] += 0.0
+        sums[separation - 1] /= length - separation
+    return sums, prefix.T
+
+
+@njit(cache=True, fastmath=False)
 def interval_medians(edges):
     """Medians of all adjacent-edge ranges of length >= 2, in (left, right) order."""
     n = len(edges)

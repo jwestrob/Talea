@@ -176,3 +176,37 @@ def test_zero_padded_fft_preserves_the_individual_transform_powers(monkeypatch):
                 for enabled in (False, verified_build):
                     monkeypatch.setattr(attention, "_PADDED_SCALAR_FFT", enabled)
                     assert np.abs(attention._window_fft(rows)).tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize('length,width', [(57,13), (129,127), (1024,64), (1025,96)])
+def test_whole_and_local_diagonal_profiles_share_exact_in_bounds_prefixes(length,width):
+    from talea._attention_numba import diagonal_means_f32, diagonal_profiles_f32
+    rng = np.random.default_rng(32)
+    matrix = rng.normal(size=(length,length)).astype(np.float16).astype(np.float32)
+    # Signed zeros across an entire diagonal exercise the scalar/pairwise cutoff.
+    np.fill_diagonal(matrix[:, 6:], -0.0)
+    require_grid = length > attention.DIAGONAL_FAST_PATH_MAXIMUM
+    whole, prefix = diagonal_profiles_f32(matrix,width,require_grid)
+    expected = diagonal_prefix_f32(matrix,width)
+    assert whole.tobytes() == diagonal_means_f32(matrix,require_grid).tobytes()
+    for separation in range(1,width):
+        stop = length-separation+1
+        assert prefix[separation,:stop].tobytes() == expected[separation,:stop].tobytes()
+    for unsupported in [np.nextafter(np.float32(0),np.float32(1)),np.nan,np.inf,65505.0]:
+        matrix[-1,0]=unsupported
+        assert diagonal_profiles_f32(matrix,width,require_grid) is None
+
+
+def test_shared_and_fallback_window_calls_match_independent_scores(monkeypatch):
+    from talea._attention_numba import diagonal_profiles_f32
+    from talea.physical import window_plan
+    rng = np.random.default_rng(431)
+    matrix = rng.uniform(0, 1, (225, 225)).astype(np.float16).astype(np.float32)
+    spans = window_plan(len(matrix),window_sizes=(24,48,96,160))
+    monkeypatch.setattr(attention, '_compiled_diagonal_profiles', diagonal_profiles_f32)
+    off_grid = matrix.copy()
+    off_grid[-1,0] = 1.0e-15
+    for values in (matrix,matrix.T,off_grid):
+        whole = attention.score_attention_window(values,include_diagnostics=False)
+        expected = attention.compact_window_calls(values,spans,whole)
+        assert attention.whole_and_window_calls(values,spans) == (whole,expected)
