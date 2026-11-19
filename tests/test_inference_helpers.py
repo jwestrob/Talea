@@ -191,6 +191,12 @@ def test_packed_readouts_equal_individual_heads(dtype, extent, phase):
         )
         np.testing.assert_array_equal(region, predictor.region_probabilities(hidden, indices, 1))
         assert gate == predictor.openness_logit(hidden, indices, 1)
+        from talea.inference import _pool_gate_layer
+        for grouped in (True, False):
+            compact = dict(hidden)
+            for layer in predictor.openness_layers:
+                compact[layer] = _pool_gate_layer(hidden[layer], [(indices, span)] * 2, grouped)
+            assert predictor._hidden_readouts(compact, indices, 1, span)[3] == gate
 
 
 def test_batch_token_positions_with_internal_specials_and_padding():

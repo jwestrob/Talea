@@ -109,7 +109,8 @@ class SelectiveCapture:
         )
         self.attentions = {}
         self.transform_attention = None
-        self.hidden_states: dict[int, torch.Tensor] = {}
+        self.hidden_states = {}
+        self.transform_hidden = None
         self._handles: list = []
         self._patched: list[tuple[torch.nn.Module, object]] = []
 
@@ -182,7 +183,8 @@ class SelectiveCapture:
     def _hook_hidden(self, block_index: int, layer: int) -> None:
         def hook(module, args, output):
             # A block returns (x, attn_weights, s_max); hidden_states stores x.
-            self.hidden_states[layer] = output[0].detach()
+            value = output[0].detach()
+            self.hidden_states[layer] = value if self.transform_hidden is None else self.transform_hidden(layer, value)
 
         self._handles.append(self.blocks[block_index].register_forward_hook(hook))
 
