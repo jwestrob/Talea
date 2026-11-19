@@ -133,7 +133,9 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     slopes = np.sum(centered * time, axis=1, keepdims=True) / np.dot(time, time)
     centered -= time * slopes
     deviations = centered.std(axis=1, keepdims=True)
-    normalized = np.divide(centered, deviations, out=np.zeros_like(centered), where=deviations > 1e-12)
+    normalized = np.divide(
+        centered, deviations, out=np.zeros_like(centered), where=deviations > 1e-12
+    )
     window = np.hanning(n)
     transformed = np.stack([np.fft.rfft(row) for row in normalized * window])
     log_power = np.log1p(np.abs(transformed) ** 2 / np.sum(window**2))
@@ -144,7 +146,9 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     scale = 1.4826 * np.median(np.abs(usable - center), axis=1, keepdims=True)
     small = scale[:, 0] < 1e-8
     scale[small, 0] = usable[small].std(axis=1)
-    spectral_z = np.divide(residual - center, scale, out=np.zeros_like(residual), where=scale >= 1e-8)
+    spectral_z = np.divide(
+        residual - center, scale, out=np.zeros_like(residual), where=scale >= 1e-8
+    )
     return _compact_harmonic_calls(spectral_z, n)
 
 
@@ -187,10 +191,12 @@ def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dic
         if top == 0.0:
             results.append({"score": 0.0, "period": float(signal_length / bins[0]), "n_harmonics": 0})
             continue
-        cutoff = top - (128 * np.finfo(np.float64).eps) * top
-        # An overflowed preliminary score can mask other overflowing candidates.
-        # Evaluate all of them with the original arithmetic in that case.
-        candidates = np.flatnonzero(scores >= cutoff) if np.isfinite(top) else range(len(scores))
+        if np.isfinite(top):
+            cutoff = top - (128 * np.finfo(np.float64).eps) * top
+            candidates = np.flatnonzero(scores >= cutoff)
+        else:
+            # Overflow can mask other contenders. Use the original arithmetic.
+            candidates = range(len(scores))
         best_key = (-1.0, -1)
         for i in candidates:
             k = counts[i]
@@ -199,9 +205,12 @@ def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dic
             if (score, significant) > best_key:
                 best_key = (score, significant)
                 best_bin = bins[i]
-        results.append({"score": best_key[0], "period": float(signal_length / best_bin), "n_harmonics": best_key[1]})
+        results.append({
+            "score": best_key[0],
+            "period": float(signal_length / best_bin),
+            "n_harmonics": best_key[1],
+        })
     return results
-
 
 
 def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
@@ -230,7 +239,6 @@ def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
     prefix[:, 0] = 0.0
     np.cumsum(diagonals, axis=1, dtype=np.float64, out=prefix[:, 1:])
     return prefix
-
 
 
 def compact_window_calls(matrix: np.ndarray, spans: list[tuple[int, int]], whole: dict | None) -> dict:

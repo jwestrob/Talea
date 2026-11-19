@@ -24,6 +24,9 @@ def enable_compiled_wedge_scores() -> None:
     """Compile on first use in long-lived process workers when Numba is installed."""
     global _compiled_wedge_scores, _compiled_mad
     try:
+        from numba import config
+        if config.DISABLE_JIT:
+            return
         from talea._wedge_numba import accumulate_scores, median_absolute_deviations
     except ImportError:
         return
