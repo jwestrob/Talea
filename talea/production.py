@@ -195,12 +195,53 @@ def standardized_probability_z(
     return (probability_logit(float(probability)) - mean) / standard_deviation
 
 
+class CudaTeacherGraphs:
+    """Replay the frozen U-Net at its original tile-batch sizes on one stream."""
+
+    @torch.inference_mode()
+    def __init__(self, model, contract, device):
+        self.stream = torch.cuda.current_stream(device)
+        self.graphs = {}
+        tile_size = int(contract["attention"]["tile_size"])
+        channels = int(contract["input_channels"])
+        # CUDA requires a non-default capture stream. If the caller already
+        # owns one (as in forward prefetch), capture and replay there.
+        side = self.stream
+        if side == torch.cuda.default_stream(device):
+            side = torch.cuda.Stream(device=device)
+            side.wait_stream(self.stream)
+        with torch.cuda.device(device), torch.cuda.stream(side):
+            for size in range(1, int(contract["model"]["batch_size"]) + 1):
+                static = torch.zeros((size, channels, tile_size, tile_size),
+                                     dtype=torch.float32, device=device)
+                # Pre-initialize cuDNN on the capture stream for this exact shape.
+                for _ in range(3):
+                    model(static)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=side):
+                    output = model(static)
+                # Independent graph pools allow arbitrary replay order.
+                self.graphs[size] = graph, static, output
+        if side != self.stream:
+            self.stream.wait_stream(side)
+
+    def __call__(self, host_tiles):
+        # The caller completes the diagonal readouts on this stream before the
+        # next protein reuses this shape's static input or output.
+        graph, static, output = self.graphs[len(host_tiles)]
+        static.copy_(host_tiles)
+        graph.replay()
+        return output
+
+
 @torch.inference_mode()
 def teacher_tracks_from_attention(
     model: torch.nn.Module,
     matrices: Mapping[int, np.ndarray],
     contract: Mapping,
     device: torch.device,
+    *,
+    cuda_graphs: CudaTeacherGraphs | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode one protein's state and teacher-class tracks from attention.
 
@@ -246,7 +287,11 @@ def teacher_tracks_from_attention(
     for batch_start in range(0, len(spans), batch_size):
         batch_spans = spans[batch_start : batch_start + batch_size]
         tile_batch = tiles[batch_start : batch_start + len(batch_spans)]
-        output = model(torch.from_numpy(tile_batch).to(device))
+        host_tiles = torch.from_numpy(tile_batch)
+        if cuda_graphs is None:
+            output = model(host_tiles.to(device))
+        else:
+            output = cuda_graphs(host_tiles)
         if output.shape[1] != 1 + teacher_classes:
             raise ValueError("teacher model output channels disagree with its contract")
         diagonal = output[:, :, diagonal_indices, diagonal_indices]

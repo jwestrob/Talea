@@ -132,3 +132,30 @@ def test_bundled_teacher_loads_and_emits_valid_tracks() -> None:
     assert teacher_track.shape == (80, len(contract["teacher"]["class_names"]))
     np.testing.assert_allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5)
     assert 0.0 <= summary["mean_probability"] <= 1.0
+
+
+def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
+    import json
+    assets = verified_runtime_assets()
+    contract = json.loads(assets.teacher_contract.read_text())
+    contract["model"]["batch_size"] = 3
+    model = AttentionStateTeacherUNet(
+        input_channels=contract["input_channels"],
+        teacher_classes=len(contract["teacher"]["class_names"]),
+        base_channels=contract["model"]["base_channels"],
+    )
+    model.load_state_dict(torch.load(assets.teacher_model, map_location="cpu", weights_only=True))
+    rng = np.random.default_rng(7783)
+    observed_sizes = []
+
+    def replay_on_cpu(host):
+        observed_sizes.append(len(host))
+        return model(host)
+
+    for length in (1, 63, 64, 129, 257):
+        matrices = {layer: rng.random((length, length), dtype=np.float32) for layer in (13, 35)}
+        eager = teacher_tracks_from_attention(model, matrices, contract, torch.device("cpu"))
+        replay = teacher_tracks_from_attention(model, matrices, contract, torch.device("cpu"),
+                                              cuda_graphs=replay_on_cpu)
+        assert all(a.tobytes() == b.tobytes() for a, b in zip(eager, replay, strict=True))
+    assert observed_sizes == [1, 1, 1, 3, 3, 2]

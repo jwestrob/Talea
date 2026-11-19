@@ -42,6 +42,7 @@ from talea.regions import (
 )
 from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
+    CudaTeacherGraphs,
     compose_talea_score,
     global_head_probabilities,
     summarize_teacher_prediction,
@@ -471,6 +472,9 @@ class TaleaPredictor:
         self.primary_extent = primary_extent
         self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self._postprocess_pool_workers = 0
+        self._teacher_graphs = None
+        self._graph_readout_stream = None
+        self.teacher_cuda_graph_active = False
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
         if self.deterministic:
@@ -524,6 +528,27 @@ class TaleaPredictor:
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
 
+    def _get_teacher_graphs(self, requested, record_workers, *, replace_stream=False):
+        self.teacher_cuda_graph_active = False
+        if (not requested or record_workers != 1 or self.device.type != "cuda"
+                or torch.is_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
+            return None
+        with torch.cuda.device(self.device):
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            stream = torch.cuda.current_stream(self.device)
+            if self._teacher_graphs is not None and self._teacher_graphs.stream != stream:
+                if not replace_stream:
+                    return None
+                # A preceding graph-only warm-up used another stream. Finish
+                # its replays before releasing the old graph pools.
+                self._teacher_graphs.stream.synchronize()
+                self._teacher_graphs = None
+            if self._teacher_graphs is None:
+                self._teacher_graphs = CudaTeacherGraphs(self.teacher_model, self.teacher_contract, self.device)
+        self.teacher_cuda_graph_active = True
+        return self._teacher_graphs
+
     def _process_pool(self, workers: int) -> concurrent.futures.ProcessPoolExecutor:
         """The postprocess worker pool, started once and kept for later calls.
 
@@ -555,6 +580,8 @@ class TaleaPredictor:
     def close(self) -> None:
         """Stop the postprocess worker pool; a later call starts a new one."""
 
+        self._teacher_graphs = None
+        self._graph_readout_stream = None
         pool, self._postprocess_pool = self._postprocess_pool, None
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
@@ -773,6 +800,7 @@ class TaleaPredictor:
         cache_clear_interval: int = 0,
         record_workers: int = 1,
         prefetch_forward: bool = False,
+        teacher_cuda_graph: bool = False,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
@@ -975,16 +1003,31 @@ class TaleaPredictor:
             pool = stack.enter_context(pool_context)
             overlap_enabled = prefetch_forward and len(batches) > 1
             forward_stream = readout_stream = None
-            if overlap_enabled:
-                # On cancellation, join both thread pools before synchronizing
-                # their streams. Capture storage can then be safely released.
+            graph_prefetch = (
+                prefetch_forward and teacher_cuda_graph and record_workers == 1
+                and self.device.type == "cuda"
+            )
+            if overlap_enabled or graph_prefetch:
+                # Also use the same stream for single-batch warm-up so its
+                # static graph inputs and outputs survive into the timed call.
                 if self.device.type == "cuda":
                     forward_stream = torch.cuda.current_stream(self.device)
-                    readout_stream = torch.cuda.Stream(device=self.device)
+                    if graph_prefetch:
+                        if self._graph_readout_stream is None:
+                            self._graph_readout_stream = torch.cuda.Stream(device=self.device)
+                        readout_stream = self._graph_readout_stream
+                    else:
+                        readout_stream = torch.cuda.Stream(device=self.device)
+                    readout_stream.wait_stream(forward_stream)
                     stack.callback(readout_stream.synchronize)
                     stack.callback(forward_stream.synchronize)
                 else:
                     stack.callback(torch.mps.synchronize)
+            # Capture and warm every teacher shape before starting the producer.
+            with torch.cuda.stream(readout_stream) if graph_prefetch else contextlib.nullcontext():
+                teacher_graphs = self._get_teacher_graphs(
+                    teacher_cuda_graph, record_workers, replace_stream=graph_prefetch
+                )
             record_pool = None
             if record_workers > 1 and not torch.is_autocast_enabled(self.device.type):
                 # The normal readout path uses the caller's original CUDA stream.
@@ -1111,6 +1154,7 @@ class TaleaPredictor:
                         matrices,
                         self.teacher_contract,
                         self.device,
+                        cuda_graphs=teacher_graphs,
                     )
                     return pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track
 

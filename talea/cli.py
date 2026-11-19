@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fp16", "fp32", "bf16"),
         default="auto",
     )
+    parser.add_argument("--teacher-cuda-graph", action="store_true",
+                        help="replay the teacher U-Net with CUDA graphs for one record worker")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
     parser.add_argument(
         "--prefetch-forward", action="store_true",
@@ -237,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
         "prefetch_forward": args.prefetch_forward,
+        "teacher_cuda_graph": args.teacher_cuda_graph,
         "postprocess_mode": args.postprocess_mode,
     }
     if args.long_proteins == "window":
@@ -285,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         "record_workers": args.record_workers,
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
+        "teacher_cuda_graph": args.teacher_cuda_graph,
+        "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
         "primary_extent": args.primary_extent,
