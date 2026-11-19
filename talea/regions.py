@@ -100,7 +100,21 @@ def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> Non
         size = len(track)
         if not size:
             continue
-        median = float(np.median(track))
+        if track.dtype == np.float64 and track.ndim == 1:
+            # Partition a copy so spatial positions stay intact. Including the
+            # last element preserves np.median's propagation of NaNs.
+            middle = size // 2
+            ordered = track.copy()
+            if size % 2:
+                ordered.partition((middle, size - 1))
+                median = ordered[middle]
+            else:
+                ordered.partition((middle - 1, middle, size - 1))
+                median = (ordered[middle - 1] + ordered[middle]) / 2
+            if np.isnan(ordered[-1]):
+                median = np.nan
+        else:
+            median = float(np.median(track))
         # Index i of diagonal d is the pair (i, i + d).
         first, last = max(0, start), min(size, end)
         if last > first:

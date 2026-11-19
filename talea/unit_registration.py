@@ -105,10 +105,11 @@ def register_periodic_units(
     phase_step: float = 1.0,
     minimum_terminal_fraction: float = 0.45,
     edge_cv_penalty: float = 0.1,
+    prefix: np.ndarray | None = None,
 ) -> dict:
     """Register and locally extend equal-period units without labelled truth."""
 
-    values = np.asarray(attention, dtype=np.float64)
+    values = np.asarray(attention)
     sequence_length = values.shape[0]
     if not (0 <= core_start < core_end <= sequence_length):
         raise ValueError("core interval lies outside the attention matrix")
@@ -116,7 +117,8 @@ def register_periodic_units(
         raise ValueError("extension fraction must be nonnegative")
     if phase_step <= 0:
         raise ValueError("phase step must be positive")
-    prefix = integral_image(values)
+    if prefix is None:
+        prefix = integral_image(values)
     candidates: list[dict] = []
     offsets = np.arange(0.0, max(float(period), phase_step), phase_step)
     for offset in offsets:
@@ -206,13 +208,16 @@ def register_periodic_units(
     }
 
 
-def registered_closure_score(attention: np.ndarray, units: Sequence[dict]) -> dict:
+def registered_closure_score(
+    attention: np.ndarray, units: Sequence[dict], *, prefix: np.ndarray | None = None
+) -> dict:
     """Score an open path by terminal attention relative to adjacent units."""
 
     intervals = [(int(unit["start"]), int(unit["end"])) for unit in units]
     if len(intervals) < 3:
         raise ValueError("closure score requires at least three units")
-    prefix = integral_image(attention)
+    if prefix is None:
+        prefix = integral_image(attention)
     adjacent = np.asarray(
         [
             block_mean(prefix, intervals[index], intervals[index + 1])
@@ -233,7 +238,9 @@ def registered_closure_score(attention: np.ndarray, units: Sequence[dict]) -> di
     }
 
 
-def scan_plausible_boundary_pairs(attention: np.ndarray, registration: dict) -> dict:
+def scan_plausible_boundary_pairs(
+    attention: np.ndarray, registration: dict, *, prefix: np.ndarray | None = None
+) -> dict:
     """Scan every period-consistent span containing the registered wedge core.
 
     This converts boundary uncertainty into an explicit hypothesis set.  The
@@ -242,7 +249,7 @@ def scan_plausible_boundary_pairs(attention: np.ndarray, registration: dict) -> 
     can correct the extreme-value statistic rather than hiding its multiplicity.
     """
 
-    values = np.asarray(attention, dtype=np.float64)
+    values = np.asarray(attention)
     units = periodic_tiles(
         values.shape[0],
         float(registration["period"]),
@@ -254,7 +261,8 @@ def scan_plausible_boundary_pairs(attention: np.ndarray, registration: dict) -> 
     )
     if len(core_indices) < 3:
         raise ValueError("registered core does not contain three consecutive tiles")
-    prefix = integral_image(values)
+    if prefix is None:
+        prefix = integral_image(values)
     edge_scores = np.asarray(
         [
             block_mean(prefix, units[index], units[index + 1])

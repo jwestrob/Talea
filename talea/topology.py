@@ -11,6 +11,7 @@ from talea.attention import scan_attention_matrix, score_attention_window
 from talea.phase_ssm import apply_placement, place_units
 from talea.regions import SECONDARY_MINIMUM_STATE, secondary_wedge_calls
 from talea.unit_registration import (
+    integral_image,
     register_periodic_units,
     registered_closure_score,
     scan_plausible_boundary_pairs,
@@ -188,8 +189,10 @@ def process_attention_record(task: dict) -> dict:
         registration_config = operational_config["registration"]
         attention = matrices[
             int(registration_config["attention_layer_zero_based"])
-        ].astype(np.float64)
+        ]
+        prefix = integral_image(attention)
         registration_options = {
+            "prefix": prefix,
             "extension_fraction": float(registration_config["extension_fraction"]),
             "phase_step": float(registration_config["phase_step"]),
             "minimum_terminal_fraction": float(
@@ -204,8 +207,8 @@ def process_attention_record(task: dict) -> dict:
             core_end=int(wedge_call["end"]),
             **registration_options,
         )
-        closure = registered_closure_score(attention, registration["units"])
-        boundary_scan = scan_plausible_boundary_pairs(attention, registration)
+        closure = registered_closure_score(attention, registration["units"], prefix=prefix)
+        boundary_scan = scan_plausible_boundary_pairs(attention, registration, prefix=prefix)
         status = "ok"
         # Unit placement runs last: closure, boundary scan and every score
         # above describe the comb registration and are unchanged by it.
