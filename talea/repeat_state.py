@@ -376,3 +376,24 @@ def summarize_state_track(
         "longest_run_length": end - start,
         "longest_run_fraction": float((end - start) / len(values)),
     }
+
+
+def summarize_teacher_prediction(
+    state_track: np.ndarray,
+    teacher_track: np.ndarray,
+    contract: Mapping,
+) -> dict:
+    """Create the compact per-protein teacher output retained in discovery runs."""
+
+    names = tuple(str(value) for value in contract["teacher"]["class_names"])
+    teacher_values = np.asarray(teacher_track, dtype=np.float64)
+    if teacher_values.ndim != 2 or teacher_values.shape[1] != len(names):
+        raise ValueError("teacher track dimensions disagree with the class contract")
+    threshold = float(contract["output"]["state_threshold"])
+    return {
+        **summarize_state_track(state_track, threshold=threshold),
+        "predicted_teacher_mean_class_probability": {
+            name: float(value)
+            for name, value in zip(names, teacher_values.mean(axis=0))
+        },
+    }

@@ -712,3 +712,33 @@ def union_window_regions(windows: Sequence[tuple[int, Sequence[Mapping]]], best:
     for candidate in candidates:
         add_region(merged, candidate)
     return sorted(merged, key=lambda region: region["start"])
+
+
+def finish_regions(topology, state_track, region_track, primary_extent, region_settings):
+    """Build final regions and clip the primary registration to their selected extent."""
+    # Regions are built from the untrimmed call, then the
+    # registration is cut to the same state track.
+    regions = repeat_regions(
+        topology,
+        state_track,
+        primary_extent,
+        region_track,
+        region_settings,
+    )
+    wedge = topology.get("wedge_call")
+    if primary_extent == "state" and wedge is not None:
+        topology = {
+            **topology,
+            "registration": registration_for_probe(
+                registration_for_primary(
+                    trim_registration(
+                        topology.get("registration"),
+                        state_track,
+                        (int(wedge["start"]), int(wedge["end"])),
+                    ),
+                    regions,
+                ),
+                regions,
+            ),
+        }
+    return topology, regions

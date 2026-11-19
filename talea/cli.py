@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
                         help="group ordered teacher probability transfers for up to this many proteins")
+    parser.add_argument("--worker-finalization", action="store_true",
+                        help="finish region boundaries and teacher summaries in process workers")
     parser.add_argument("--teacher-quantile-histogram", action="store_true",
                         help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
     parser.add_argument("--teacher-owner-thread", action="store_true",
@@ -262,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph,
         "postprocess_mode": args.postprocess_mode,
+        **({"worker_finalization": True} if args.worker_finalization else {}),
     }
     if args.long_proteins == "window":
         rows = iter_windowed_predictions(
@@ -307,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
+        **({"worker_finalization": True} if args.worker_finalization else {}),
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
