@@ -17,6 +17,7 @@ import math
 import threading
 import warnings
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -239,9 +240,15 @@ class CudaTeacherGraphs:
                         self.track_outputs[size] = _pack_teacher_diagonal(diagonal, len(contract["teacher"]["class_names"]))
                 # Independent graph pools allow arbitrary replay order.
                 self.graphs[size] = graph, static, output
-                self._locks[size] = threading.Lock()
+                self._locks[size] = threading.RLock()
         if side != self.stream:
             self.stream.wait_stream(side)
+
+    @contextmanager
+    def input_buffer(self, size):
+        """Reserve this graph's input through a direct write and the ensuing replay."""
+        with self._locks[size]:
+            yield self.graphs[size][1]
 
     def __call__(self, host_tiles):
         # The static output is borrowed until the calling thread releases the
@@ -249,7 +256,8 @@ class CudaTeacherGraphs:
         graph, static, output = self.graphs[len(host_tiles)]
         # The per-protein tile tensor stays alive through the synchronous
         # state/class host reads; replay is ordered behind the H2D on this stream.
-        static.copy_(host_tiles, non_blocking=True)
+        if host_tiles is not static:
+            static.copy_(host_tiles, non_blocking=True)
         graph.replay()
         return output
 
@@ -353,17 +361,21 @@ def teacher_device_probabilities(model, prepared_tiles, contract, device, cuda_g
         diagonal_indices = prepare_teacher_readout(model, contract, device)
     probability_batches = []
     for batch_start in range(0, len(tiles), batch_size):
-        tile_batch = tiles[batch_start : batch_start + batch_size]
-        host_tiles = torch.from_numpy(tile_batch)
-        if getattr(cuda_graphs, "pack_tracks", False):
-            probability_batches.append(cuda_graphs.probabilities(host_tiles))
-            continue
-        if cuda_graphs is None:
-            output = model(host_tiles.to(device))
-            diagonal = output[:, :, diagonal_indices, diagonal_indices]
+        size = min(batch_size, len(tiles) - batch_start)
+        if isinstance(tiles, np.ndarray):
+            batch = nullcontext(torch.from_numpy(tiles[batch_start : batch_start + size]))
         else:
-            diagonal = cuda_graphs.diagonal(host_tiles, diagonal_indices)
-        if diagonal.shape[0] != len(tile_batch):
+            batch = tiles.input_batch(batch_start, size, device, cuda_graphs)
+        with batch as inputs:
+            if getattr(cuda_graphs, "pack_tracks", False):
+                probability_batches.append(cuda_graphs.probabilities(inputs))
+                continue
+            if cuda_graphs is None:
+                output = model(inputs.to(device))
+                diagonal = output[:, :, diagonal_indices, diagonal_indices]
+            else:
+                diagonal = cuda_graphs.diagonal(inputs, diagonal_indices)
+        if diagonal.shape[0] != size:
             raise ValueError("teacher model returned a different number of tiles")
         probability_batches.append(_pack_teacher_diagonal(diagonal, teacher_classes))
     # Central spans tile the sequence consecutively. Only the last tile is padded.

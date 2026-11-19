@@ -1026,6 +1026,7 @@ class TaleaPredictor:
         readout_square_budget: int = 1024 ** 2,
         teacher_quantile_histogram: bool = False,
         native_half_readout: bool = False,
+        device_teacher_tiles: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -1151,12 +1152,21 @@ class TaleaPredictor:
         device_storage_dtype = torch.float16 if storage_dtype == "fp16" else None
         quantile_function = compiled_teacher_quantile() if teacher_quantile_histogram and storage_dtype == "fp16" else None
         half_decoder = None
-        if native_half_readout and self.device.type == "cuda" and storage_dtype == "fp16":
+        if (native_half_readout or device_teacher_tiles) and self.device.type == "cuda" and storage_dtype == "fp16":
             if compiled_teacher_quantile() is not None:
                 from talea._teacher_histogram import native_half_tiles
                 half_decoder = native_half_tiles
                 teacher_owner_thread = True
         self.native_half_readout_active = half_decoder is not None
+        self.device_teacher_tile_records = 0
+        device_tile_plan = None
+        contract_attention = self.teacher_contract["attention"]
+        if device_teacher_tiles and half_decoder is not None and len(self.expected_layers) == 2:
+            try:
+                from talea._device_teacher_tiles import DeviceTeacherTiles as device_tile_plan
+                from talea._teacher_histogram import native_half_tables
+            except ImportError:
+                pass
         self.teacher_quantile_histogram_active = quantile_function is not None
         minimum_separation = int(
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
@@ -1480,6 +1490,7 @@ class TaleaPredictor:
                     record = batch[batch_position]
                     indices, residue_slice = residue_indices[batch_position]
                     matrices = {}
+                    device_maps = [] if device_tile_plan is not None else None
                     for layer in self.expected_layers:
                         if early_apc:
                             tensor = layer_maps[layer][batch_position]
@@ -1490,6 +1501,8 @@ class TaleaPredictor:
                             )
                         else:
                             tensor = grouped[layer]
+                        if device_maps is not None:
+                            device_maps.append(tensor)
                         if attention_staging is None:
                             host = tensor.to("cpu", dtype=torch.float32).numpy()
                             matrices[layer] = _checked_attention_matrix(host, record.length)
@@ -1503,6 +1516,15 @@ class TaleaPredictor:
                         # stream as both enqueued attention copies.
                         matrices = attention_staging.unpack_after_readouts(record.length, native_half=half_decoder is not None)
                     inputs = pooled, matrices, probabilities, region_track, gate_logit
+                    if device_maps is not None and all(t.dtype == torch.float16 and t.is_contiguous() for t in device_maps):
+                        tables = native_half_tables(
+                            tuple(matrices[layer] for layer in self.expected_layers),
+                            float(contract_attention["normalization_quantile"]),
+                            float(contract_attention["normalization_clip"]),
+                        )
+                        tiles = device_tile_plan(tuple(device_maps), tables, int(contract_attention["tile_size"]),
+                                                 int(contract_attention["central_size"]))
+                        return inputs, (record.length, tiles)
                     if teacher_owner_thread:
                         return inputs, prepare_teacher_tiles(matrices, self.teacher_contract, quantile_function=quantile_function, half_decoder=half_decoder)
                     return finish_teacher(inputs)
@@ -1550,6 +1572,8 @@ class TaleaPredictor:
                     # The same quadratic bound used for record workers limits retained maps.
                     depth = min(teacher_readback_records, readout_capacity)
                     def launch_teacher(tiles):
+                        if device_tile_plan is not None and isinstance(tiles[1], device_tile_plan):
+                            self.device_teacher_tile_records += 1
                         return teacher_device_probabilities(
                             self.teacher_model, tiles, self.teacher_contract, self.device,
                             teacher_graphs, teacher_diagonal,
