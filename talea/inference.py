@@ -197,6 +197,7 @@ def apc_head_mean(
     sequence_length: int,
     minimum_separation: int,
     storage_dtype: torch.dtype | None = None,
+    residue_slice: slice | None = None,
 ) -> np.ndarray:
     """Symmetrize, APC-correct, head-average, and crop one attention layer.
 
@@ -209,7 +210,12 @@ def apc_head_mean(
     transfer without changing the stored representation.
     """
 
-    attention = layer_attention.index_select(1, indices).index_select(2, indices)
+    if residue_slice is None:
+        attention = layer_attention.index_select(1, indices).index_select(2, indices)
+    else:
+        # Crop both axes in one copy, retaining the contiguous layout used by
+        # the reductions below (including when the batch contains padding).
+        attention = layer_attention[:, residue_slice, residue_slice].contiguous()
     attention = 0.5 * (attention + attention.transpose(-1, -2))
     row = attention.sum(dim=-1, keepdim=True)
     column = attention.sum(dim=-2, keepdim=True)
@@ -242,8 +248,23 @@ def _batch_residue_indices(tokenized, records, device):
     for record, count in zip(records, residue_mask.sum(dim=1).tolist(), strict=True):
         if count != record.length:
             raise ValueError(f"tokenized residue count disagrees for {record.record_id}")
-    positions = tokens[:, 1].contiguous().to(device)
-    return positions.split(lengths)
+    positions = tokens[:, 1].contiguous()
+    slices = []
+    offset = 0
+    for length in lengths:
+        first = int(positions[offset])
+        offset += length
+        stop = int(positions[offset - 1]) + 1
+        slices.append(slice(first, stop) if stop - first == length else None)
+    return list(zip(positions.to(device).split(lengths), slices, strict=True))
+
+
+def _record_hidden_states(state, batch_position, indices, residue_slice):
+    row = state[batch_position]
+    if residue_slice is None:
+        return row.index_select(0, indices).float()
+    # The original gather creates an aligned, contiguous tensor even for fp32.
+    return row[residue_slice].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
 
 
 def make_batches(
@@ -546,13 +567,13 @@ class TaleaPredictor:
         weights = torch.as_tensor(self._openness_weights, device=pooled.device)
         return float(pooled @ weights + self._openness_bias)
 
-    def _hidden_readouts(self, hidden_states, indices, batch_position):
+    def _hidden_readouts(self, hidden_states, indices, batch_position, residue_slice=None):
         """Run fixed-shape per-record reductions, then copy all small outputs together."""
         features = {}
         structure = None
         region = None
         for layer in self.expected_layers:
-            residues = hidden_states[layer][batch_position].index_select(0, indices).float()
+            residues = _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice)
             features[f"layer_{layer}_mean"] = residues.mean(dim=0)
             features[f"layer_{layer}_std"] = residues.std(dim=0, unbiased=False)
             if layer == self.probe_layer:
@@ -561,7 +582,7 @@ class TaleaPredictor:
                 region = torch.sigmoid(residues @ self._region_probe_weights + self._region_probe_bias)
 
         gate_means = [
-            hidden_states[layer][batch_position].index_select(0, indices).float().mean(dim=0)
+            _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice).mean(dim=0)
             for layer in self.openness_layers
         ]
         gate = torch.cat(gate_means) @ self._openness_weights + self._openness_bias
@@ -869,7 +890,7 @@ class TaleaPredictor:
                 compact = []
                 pooled_rows = []
                 for batch_position, record in enumerate(batch):
-                    indices = residue_indices[batch_position]
+                    indices, residue_slice = residue_indices[batch_position]
                     matrices = {
                         layer: apc_head_mean(
                             attentions[layer][batch_position],
@@ -877,11 +898,12 @@ class TaleaPredictor:
                             record.length,
                             minimum_separation,
                             storage_dtype=device_storage_dtype,
+                            residue_slice=residue_slice,
                         )
                         for layer in self.expected_layers
                     }
                     pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
-                        hidden_states, indices, batch_position
+                        hidden_states, indices, batch_position, residue_slice
                     )
                     pooled_rows.append(pooled)
                     # The residue-state track goes to the worker too: further

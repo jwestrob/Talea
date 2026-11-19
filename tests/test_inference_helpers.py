@@ -153,8 +153,12 @@ def test_packed_readouts_equal_individual_heads(dtype, extent, phase):
         layer: torch.randn(2, 58, 48, generator=generator, dtype=dtype)
         for layer in (*predictor.expected_layers, *predictor.openness_layers)
     }
-    for indices in (torch.tensor([7]), torch.arange(1, 54, 2)):
-        means, structure, region, gate = predictor._hidden_readouts(hidden, indices, 1)
+    for indices, span in (
+        (torch.tensor([7]), slice(7, 8)),
+        (torch.arange(1, 54, 2), None),
+        (torch.arange(3, 55), slice(3, 55)),
+    ):
+        means, structure, region, gate = predictor._hidden_readouts(hidden, indices, 1, span)
         reference = pooled_hidden_features_for_layers(hidden, indices, 1, predictor.expected_layers)
         for name in reference:
             np.testing.assert_array_equal(means[name], reference[name])
@@ -175,6 +179,19 @@ def test_batch_token_positions_with_internal_specials_and_padding():
     }
     records = [SimpleNamespace(length=2, record_id="A"), SimpleNamespace(length=1, record_id="B")]
     result = _batch_residue_indices(tokenized, records, "cpu")
-    assert [positions.tolist() for positions in result] == [[1, 3], [2]]
+    assert [positions.tolist() for positions, span in result] == [[1, 3], [2]]
+    assert [span for positions, span in result] == [None, slice(2, 3)]
     with pytest.raises(ValueError, match="tokenized"):
         _batch_residue_indices(tokenized, records[::-1], "cpu")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_contiguous_attention_crop_matches_gathers_bitwise(dtype):
+    generator = torch.Generator().manual_seed(2711)
+    for offset, length, padded in ((1, 1, 6), (2, 30, 36), (3, 63, 76)):
+        attention = torch.rand(5, padded, padded, generator=generator, dtype=dtype)
+        indices = torch.arange(offset, offset + length)
+        reference = apc_head_mean(attention, indices, length, 3, torch.float16)
+        result = apc_head_mean(attention, indices, length, 3, torch.float16,
+                               residue_slice=slice(offset, offset + length))
+        assert result.tobytes() == reference.tobytes()
