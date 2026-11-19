@@ -45,14 +45,18 @@ def _forward(original, apply, counter):
 
 
 @contextmanager
-def swiglu_context(blocks, device):
-    counter = [0]
+def swiglu_context(blocks, device, *, arithmetic=False):
+    counter = [0, None]
     apply = None
     if device.type == "mps" and hasattr(torch.mps, "compile_shader"):
         apply = _metal
     elif device.type == "cuda":
         try:
             from talea._swiglu_cuda import apply
+            if arithmetic:
+                from talea._swiglu_cuda import calibrated_arithmetic
+                with torch.cuda.device(device):
+                    apply, counter[1] = calibrated_arithmetic(_silu_table(device))
         except ImportError:
             pass
     with ExitStack() as restore:

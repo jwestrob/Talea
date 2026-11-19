@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-apc", action="store_true", help="correct captured attention on a CUDA stream during ESM++ encoding")
     parser.add_argument("--unit-residual", action="store_true", help="skip identity divisions in the pinned ESM++ residual blocks")
     parser.add_argument("--skip-all-valid-mask", action="store_true", help="skip the manual ESM++ padding-mask operation for fully valid batches")
+    parser.add_argument("--arithmetic-swiglu", action="store_true", help="calibrate direct CUDA SiLU against every fp16 input")
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
@@ -282,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"early_gate": args.early_gate} if args.early_gate != "off" else {}),
         **({"early_apc": True} if args.early_apc else {}),
         **({"unit_residual": True} if args.unit_residual else {}),
+        **({"arithmetic_swiglu": True} if args.arithmetic_swiglu else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         "group_equal_apc": args.group_equal_apc,
@@ -350,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"early_gate": args.early_gate} if args.early_gate != "off" else {}),
         **({"early_apc": True} if args.early_apc else {}),
         **({"unit_residual": True} if args.unit_residual else {}),
+        **({"arithmetic_swiglu": True} if args.arithmetic_swiglu else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),

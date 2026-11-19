@@ -727,6 +727,7 @@ class TaleaPredictor:
         self.early_gate_layers = 0
         self.early_apc_layers = 0
         self.unit_residual_blocks = 0
+        self.arithmetic_swiglu_repairs = None
         self.fused_swiglu_calls = 0
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
@@ -1082,6 +1083,7 @@ class TaleaPredictor:
         early_apc: bool = False,
         early_gate: str = "off",
         skip_all_valid_mask: bool = False,
+        arithmetic_swiglu: bool = False,
         group_equal_apc: bool = False,
         fused_apc: str = "off",
         batched_apc_reductions: str = "",
@@ -1426,9 +1428,11 @@ class TaleaPredictor:
                 rotary_calls = stack.enter_context(fused_rotary_context(capture.blocks, self.device))
                 stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0]))
             self.fused_swiglu_calls = 0
-            if fused_swiglu:
+            self.arithmetic_swiglu_repairs = None
+            if fused_swiglu or arithmetic_swiglu:
                 from talea.swiglu import swiglu_context
-                swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device))
+                swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device, arithmetic=arithmetic_swiglu))
+                self.arithmetic_swiglu_repairs = swiglu_calls[1]
                 stack.callback(lambda: setattr(self, "fused_swiglu_calls", swiglu_calls[0]))
             self.early_apc_layers = self.early_gate_layers = 0
             if early_readout:
