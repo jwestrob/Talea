@@ -196,11 +196,21 @@ def standardized_probability_z(
     return (probability_logit(float(probability)) - mean) / standard_deviation
 
 
+def _pack_teacher_diagonal(diagonal, teacher_classes):
+    if diagonal.shape[1] != 1 + teacher_classes:
+        raise ValueError("teacher model output channels disagree with its contract")
+    state = torch.sigmoid(diagonal[:, 0])
+    classes = torch.softmax(diagonal[:, 1:], dim=1)
+    return torch.cat((state.unsqueeze(-1), classes.transpose(1, 2)), dim=2).reshape(-1, 1 + teacher_classes)
+
+
 class CudaTeacherGraphs:
     """Replay the frozen U-Net at its original tile-batch sizes on one stream."""
 
     @torch.inference_mode()
-    def __init__(self, model, contract, device):
+    def __init__(self, model, contract, device, pack_tracks=False):
+        self.pack_tracks = pack_tracks
+        self.track_outputs = {}
         self.stream = torch.cuda.current_stream(device)
         self.capture_thread = threading.current_thread()
         self.graphs = {}
@@ -214,6 +224,7 @@ class CudaTeacherGraphs:
             side = torch.cuda.Stream(device=device)
             side.wait_stream(self.stream)
         with torch.cuda.device(device), torch.cuda.stream(side):
+            indices = prepare_teacher_readout(model, contract, device) if pack_tracks else None
             for size in range(1, int(contract["model"]["batch_size"]) + 1):
                 static = torch.zeros((size, channels, tile_size, tile_size),
                                      dtype=torch.float32, device=device)
@@ -223,6 +234,9 @@ class CudaTeacherGraphs:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=side):
                     output = model(static)
+                    if pack_tracks:
+                        diagonal = output[:, :, indices, indices]
+                        self.track_outputs[size] = _pack_teacher_diagonal(diagonal, len(contract["teacher"]["class_names"]))
                 # Independent graph pools allow arbitrary replay order.
                 self.graphs[size] = graph, static, output
                 self._locks[size] = threading.Lock()
@@ -239,6 +253,13 @@ class CudaTeacherGraphs:
         graph.replay()
         return output
 
+
+    def probabilities(self, host_tiles):
+        size = len(host_tiles)
+        with self._locks[size]:
+            self(host_tiles)
+            # The next replay of this shape overwrites the static track storage.
+            return self.track_outputs[size].clone()
 
     def diagonal(self, host_tiles, indices):
         # Record workers issue work to one CUDA stream. Queue the advanced
@@ -331,6 +352,9 @@ def teacher_device_probabilities(model, prepared_tiles, contract, device, cuda_g
     for batch_start in range(0, len(tiles), batch_size):
         tile_batch = tiles[batch_start : batch_start + batch_size]
         host_tiles = torch.from_numpy(tile_batch)
+        if getattr(cuda_graphs, "pack_tracks", False):
+            probability_batches.append(cuda_graphs.probabilities(host_tiles))
+            continue
         if cuda_graphs is None:
             output = model(host_tiles.to(device))
             diagonal = output[:, :, diagonal_indices, diagonal_indices]
@@ -338,14 +362,7 @@ def teacher_device_probabilities(model, prepared_tiles, contract, device, cuda_g
             diagonal = cuda_graphs.diagonal(host_tiles, diagonal_indices)
         if diagonal.shape[0] != len(tile_batch):
             raise ValueError("teacher model returned a different number of tiles")
-        if diagonal.shape[1] != 1 + teacher_classes:
-            raise ValueError("teacher model output channels disagree with its contract")
-        state_probability = torch.sigmoid(diagonal[:, 0])
-        teacher_probability = torch.softmax(diagonal[:, 1:], dim=1)
-        probabilities = torch.cat(
-            (state_probability.unsqueeze(-1), teacher_probability.transpose(1, 2)), dim=2
-        )
-        probability_batches.append(probabilities.reshape(-1, 1 + teacher_classes))
+        probability_batches.append(_pack_teacher_diagonal(diagonal, teacher_classes))
     # Central spans tile the sequence consecutively. Only the last tile is padded.
     packed = probability_batches[0]
     if len(probability_batches) > 1:

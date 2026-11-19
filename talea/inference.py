@@ -655,7 +655,7 @@ class TaleaPredictor:
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
 
-    def _get_teacher_graphs(self, requested, *, replace_stream=False, owner_thread=False):
+    def _get_teacher_graphs(self, requested, *, replace_stream=False, owner_thread=False, pack_tracks=False):
         self.teacher_cuda_graph_active = False
         if (not requested or self.device.type != "cuda"
                 or _device_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
@@ -671,12 +671,12 @@ class TaleaPredictor:
                 # cuDNN convolution plan caches are thread-local. Capture anew
                 # when a caller resumes the predictor from another host thread.
                 new_owner = owner_thread and cached.capture_thread is not threading.current_thread()
-                if cached.stream != stream or new_owner:
+                if cached.stream != stream or new_owner or getattr(cached, "pack_tracks", False) != pack_tracks:
                     cached.stream.synchronize()
                     self._teacher_graphs = None
                     del cached
             if self._teacher_graphs is None:
-                self._teacher_graphs = CudaTeacherGraphs(self.teacher_model, self.teacher_contract, self.device)
+                self._teacher_graphs = CudaTeacherGraphs(self.teacher_model, self.teacher_contract, self.device, pack_tracks)
         self.teacher_cuda_graph_active = True
         return self._teacher_graphs
 
@@ -948,6 +948,7 @@ class TaleaPredictor:
         fused_swiglu: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
+        teacher_graph_tracks: bool = False,
         shared_attention_mib: int = 0,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
@@ -1012,6 +1013,7 @@ class TaleaPredictor:
                 "eligible_squared_lengths": 0, "group_size_counts": {},
                 "element_budget": _APC_GROUP_ELEMENTS,
             }
+        teacher_cuda_graph = teacher_cuda_graph or teacher_graph_tracks
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
@@ -1203,7 +1205,8 @@ class TaleaPredictor:
                     self.teacher_model, self.teacher_contract, self.device
                 )
                 teacher_graphs = self._get_teacher_graphs(
-                    teacher_cuda_graph, replace_stream=graph_prefetch, owner_thread=teacher_owner_thread
+                    teacher_cuda_graph, replace_stream=graph_prefetch, owner_thread=teacher_owner_thread,
+                    pack_tracks=teacher_graph_tracks,
                 )
             record_pool = None
             if record_workers > 1 and not _device_autocast_enabled(self.device.type):
