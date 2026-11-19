@@ -120,6 +120,9 @@ def register_periodic_units(
     if prefix is None:
         prefix = integral_image(values)
     candidates: list[dict] = []
+    # Equal-width edge sets can share a reduction while retaining the order
+    # of values within each candidate phase.
+    groups = {}
     offsets = np.arange(0.0, max(float(period), phase_step), phase_step)
     for offset in offsets:
         units = periodic_tiles(
@@ -139,7 +142,6 @@ def register_periodic_units(
             dtype=np.float64,
         )
         core_edges = edges[core_indices[0] : core_indices[-1]]
-        core_reference = float(np.median(core_edges))
         background = np.asarray(
             [
                 block_mean(prefix, units[index], units[index + 2])
@@ -150,26 +152,41 @@ def register_periodic_units(
             ],
             dtype=np.float64,
         )
-        background_reference = float(np.median(background)) if len(background) else 0.0
-        epsilon = max(abs(core_reference) * 1e-9, 1e-12)
-        adjacent_contrast = float(
-            np.log((core_reference + epsilon) / (background_reference + epsilon))
+        candidate = {
+            "offset": float(offset),
+            "units": units,
+            "core_indices": core_indices,
+            "edge_scores": edges,
+        }
+        candidates.append(candidate)
+        groups.setdefault((len(core_edges), len(background)), []).append(
+            (candidate, core_edges, background)
         )
-        edge_cv = float(np.std(core_edges) / (np.mean(core_edges) + epsilon))
-        objective = adjacent_contrast - edge_cv_penalty * edge_cv
-        candidates.append(
-            {
-                "objective": objective,
-                "offset": float(offset),
-                "units": units,
-                "core_indices": core_indices,
-                "edge_scores": edges,
-                "core_reference": core_reference,
-                "background_reference": background_reference,
-                "adjacent_contrast": adjacent_contrast,
-                "edge_cv": edge_cv,
-            }
+    for (_, background_count), group in groups.items():
+        phases, core_rows, background_rows = zip(*group)
+        core = np.stack(core_rows)
+        references = np.median(core, axis=1)
+        backgrounds = (
+            np.median(np.stack(background_rows), axis=1)
+            if background_count else np.zeros(len(group))
         )
+        means = np.mean(core, axis=1, keepdims=True)
+        deviations = np.std(core, axis=1, mean=means)
+        for index, phase in enumerate(phases):
+            core_reference = float(references[index])
+            background_reference = float(backgrounds[index])
+            epsilon = max(abs(core_reference) * 1e-9, 1e-12)
+            adjacent_contrast = float(
+                np.log((core_reference + epsilon) / (background_reference + epsilon))
+            )
+            edge_cv = float(deviations[index] / (means[index, 0] + epsilon))
+            phase.update(
+                core_reference=core_reference,
+                background_reference=background_reference,
+                adjacent_contrast=adjacent_contrast,
+                edge_cv=edge_cv,
+                objective=adjacent_contrast - edge_cv_penalty * edge_cv,
+            )
     if not candidates:
         raise ValueError("no phase produced three consecutive core units")
     candidates.sort(key=lambda row: (-row["objective"], row["offset"]))

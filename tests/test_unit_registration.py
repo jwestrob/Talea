@@ -84,3 +84,12 @@ def test_boundary_scan_finds_full_length_cycle_seam():
     assert result["noncore_false_scan_candidate_count"] == 2
     assert result["strongest_closure_candidate"]["start"] == 0
     assert result["strongest_closure_candidate"]["end"] == 20
+
+
+def test_registration_preserves_offset_ties_across_different_core_widths():
+    # Fractional tiles give the offsets different counts of core/background
+    # edges. With uniform attention every reduction still ties at zero.
+    result = register_periodic_units(np.ones((53, 53)), 5.5, 8, 37, phase_step=0.5)
+    assert result["phase_offset"] == 0.0
+    assert result["phase_objective"] == result["phase_second_objective"] == 0.0
+    assert result["adjacent_contrast"] == result["core_edge_cv"] == 0.0
