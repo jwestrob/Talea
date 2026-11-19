@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fp16", "fp32", "bf16"),
         default="auto",
     )
+    parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
     parser.add_argument("--maximum-batch", type=int, default=64)
     parser.add_argument("--square-budget", type=int, default=4_000_000)
     parser.add_argument(
@@ -230,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         "progress": not args.quiet,
         "capture_mode": args.capture_mode,
         "cache_clear_interval": args.cache_clear_interval,
+        "record_workers": args.record_workers,
         "postprocess_mode": args.postprocess_mode,
     }
     if args.long_proteins == "window":
@@ -276,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
+        "record_workers": args.record_workers,
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
         "primary_extent": args.primary_extent,

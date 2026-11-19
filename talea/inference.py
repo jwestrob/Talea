@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import sys
 import time
+from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 
 import joblib
@@ -265,6 +266,27 @@ def _record_hidden_states(state, batch_position, indices, residue_slice):
         return row.index_select(0, indices).float()
     # The original gather creates an aligned, contiguous tensor even for fp32.
     return row[residue_slice].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
+
+
+def _ordered_readouts(function, count, executor, width):
+    """Keep at most width records in flight and deliver results in input order."""
+    if executor is None or width == 1:
+        yield from map(function, range(count))
+        return
+    positions = iter(range(count))
+    pending = deque()
+    try:
+        for _ in range(min(width, count)):
+            pending.append(executor.submit(function, next(positions)))
+        while pending:
+            result = pending.popleft().result()
+            following = next(positions, None)
+            if following is not None:
+                pending.append(executor.submit(function, following))
+            yield result
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def make_batches(
@@ -666,6 +688,7 @@ class TaleaPredictor:
         progress: bool = False,
         capture_mode: str = "auto",
         cache_clear_interval: int = 0,
+        record_workers: int = 1,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
@@ -681,6 +704,9 @@ class TaleaPredictor:
         predictor as a context manager) stops it.
         Workers re-import the calling script (Python's spawn/forkserver rule),
         so scripts must call Talea under ``if __name__ == "__main__":``.
+
+        With record_workers > 1, threads prepare independent proteins using
+        their original teacher batch shapes. Results are collected in order.
 
         Batches are pipelined: a batch's rows are yielded after the next batch
         has run on the device and been submitted, so postprocessing overlaps
@@ -706,6 +732,8 @@ class TaleaPredictor:
         batch returns blocks to the driver and forces later reallocation.
         """
 
+        if record_workers < 1:
+            raise ValueError("record_workers must be positive")
         values = list(records)
         if not values:
             return
@@ -852,6 +880,15 @@ class TaleaPredictor:
 
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)
+            record_pool = None
+            if record_workers > 1 and not torch.is_autocast_enabled(self.device.type):
+                # Read from captured tensors on their original CUDA stream.
+                stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+                record_pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(
+                    max_workers=record_workers,
+                    initializer=torch.cuda.set_stream if stream is not None else None,
+                    initargs=(stream,) if stream is not None else (),
+                ))
             stack.callback(cancel_outstanding)
             stack.enter_context(torch.inference_mode())
             capture = stack.enter_context(
@@ -889,7 +926,9 @@ class TaleaPredictor:
                 hidden_states = capture.hidden_states
                 compact = []
                 pooled_rows = []
-                for batch_position, record in enumerate(batch):
+                @torch.inference_mode()
+                def readout(batch_position):
+                    record = batch[batch_position]
                     indices, residue_slice = residue_indices[batch_position]
                     matrices = {
                         layer: apc_head_mean(
@@ -905,7 +944,6 @@ class TaleaPredictor:
                     pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
                         hidden_states, indices, batch_position, residue_slice
                     )
-                    pooled_rows.append(pooled)
                     # The residue-state track goes to the worker too: further
                     # wedge calls are registered into units only where it
                     # supports them.
@@ -915,6 +953,14 @@ class TaleaPredictor:
                         self.teacher_contract,
                         self.device,
                     )
+                    return pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track
+
+                # Bound concurrent quadratic APC scratch as records get longer.
+                width = min(record_workers, max(1, 1024 ** 2 // batch[-1].length ** 2))
+                readouts = _ordered_readouts(readout, len(batch), record_pool, width)
+                for record, outputs in zip(batch, readouts, strict=True):
+                    pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
+                    pooled_rows.append(pooled)
                     if postprocess_mode == "process":
                         future = pool.submit(
                             run_record,
