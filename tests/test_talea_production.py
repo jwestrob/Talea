@@ -191,3 +191,55 @@ def test_concurrent_graph_readouts_own_independent_diagonal_results():
         diagonals = list(workers.map(run, range(16)))
     for protein, values in enumerate(diagonals):
         assert torch.equal(values, torch.full((1, 3, 4), float(protein)))
+
+
+def test_prepared_teacher_readout_preserves_tracks_across_partial_batches():
+    from talea.production import prepare_teacher_readout
+
+    class Teacher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = torch.nn.Dropout()
+            self.outputs = []
+
+        def forward(self, tiles):
+            assert not self.dropout.training
+            size = tiles.shape[-1]
+            # Each tile and each class has its own distinct diagonal.
+            start = sum(len(previous) for previous in self.outputs)
+            count = len(tiles) * 4 * size * size
+            logits = torch.arange(count).reshape(len(tiles), 4, size, size).float()
+            logits = torch.sin(logits + start * 0.75)
+            self.outputs.append(logits)
+            return logits
+
+    model = Teacher()
+    contract = {
+        "attention": {
+            "layers_zero_based": [13, 35], "tile_size": 14, "central_size": 8,
+            "normalization_quantile": 0.95, "normalization_clip": 8.0,
+        },
+        "teacher": {"class_names": ["a", "b", "c"]},
+        "model": {"batch_size": 2},
+    }
+    device = torch.device("cpu")
+    indices = prepare_teacher_readout(model, contract, device)
+    for length in (1, 8, 16, 33, 40):
+        matrix = np.eye(length, dtype=np.float32)
+        model.outputs.clear()
+        states, classes = teacher_tracks_from_attention(
+            model, {13: matrix, 35: matrix}, contract, device, _prepared_diagonal=indices,
+        )
+        expected_states, expected_classes = [], []
+        for output in model.outputs:
+            diagonal = output[:, :, indices, indices]
+            expected_states.extend(torch.sigmoid(diagonal[:, 0]).numpy())
+            expected_classes.extend(torch.softmax(diagonal[:, 1:], dim=1).transpose(1, 2).numpy())
+        assert states.tobytes() == np.concatenate(expected_states)[:length].tobytes()
+        assert classes.tobytes() == np.concatenate(expected_classes)[:length].tobytes()
+        assert states.flags.c_contiguous and classes.flags.c_contiguous
+
+    # The one-off API must reapply eval even when only a child was in training mode.
+    model.dropout.train()
+    teacher_tracks_from_attention(model, {13: matrix, 35: matrix}, contract, device)
+    assert not model.dropout.training

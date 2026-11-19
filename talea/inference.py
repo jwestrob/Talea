@@ -46,6 +46,7 @@ from talea.production import (
     compose_talea_score,
     global_head_probabilities,
     summarize_teacher_prediction,
+    prepare_teacher_readout,
     teacher_tracks_from_attention,
 )
 from talea.topology import process_attention_record
@@ -1145,8 +1146,12 @@ class TaleaPredictor:
                     stack.callback(forward_stream.synchronize)
                 else:
                     stack.callback(torch.mps.synchronize)
-            # Capture and warm every teacher shape before starting the producer.
-            with torch.cuda.stream(readout_stream) if graph_prefetch else contextlib.nullcontext():
+            # Build the shared diagonal on its consuming stream before
+            # starting record workers, and warm any teacher graphs there.
+            with torch.cuda.stream(readout_stream) if readout_stream is not None else contextlib.nullcontext():
+                teacher_diagonal = prepare_teacher_readout(
+                    self.teacher_model, self.teacher_contract, self.device
+                )
                 teacher_graphs = self._get_teacher_graphs(
                     teacher_cuda_graph, replace_stream=graph_prefetch
                 )
@@ -1290,6 +1295,7 @@ class TaleaPredictor:
                         self.teacher_contract,
                         self.device,
                         cuda_graphs=teacher_graphs,
+                        _prepared_diagonal=teacher_diagonal,
                     )
                     return pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track
 

@@ -248,6 +248,17 @@ class CudaTeacherGraphs:
             return output[:, :, indices, indices]
 
 
+def prepare_teacher_readout(
+    model: torch.nn.Module, contract: Mapping, device: torch.device
+) -> torch.Tensor:
+    """Set the frozen teacher to evaluation mode and build its central diagonal."""
+    model.eval()
+    attention = contract["attention"]
+    center = int(attention["central_size"])
+    offset = (int(attention["tile_size"]) - center) // 2
+    return torch.arange(offset, offset + center, device=device, dtype=torch.long)
+
+
 @torch.inference_mode()
 def teacher_tracks_from_attention(
     model: torch.nn.Module,
@@ -256,11 +267,13 @@ def teacher_tracks_from_attention(
     device: torch.device,
     *,
     cuda_graphs: CudaTeacherGraphs | None = None,
+    _prepared_diagonal: torch.Tensor | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode one protein's state and teacher-class tracks from attention.
 
     Tiles are scored only on their central diagonal, so every residue is
     reconstructed exactly once and padding never contributes to a summary.
+    The predictor prepares its fixed diagonal and model mode once per iteration.
     """
 
     attention = contract["attention"]
@@ -287,40 +300,38 @@ def teacher_tracks_from_attention(
         float(attention["normalization_clip"]),
     )
     teacher_classes = len(contract["teacher"]["class_names"])
-    state_track = np.zeros(length, dtype=np.float32)
-    teacher_track = np.zeros((length, teacher_classes), dtype=np.float32)
-    observed = np.zeros(length, dtype=np.int8)
     batch_size = int(contract["model"]["batch_size"])
     if batch_size < 1:
         raise ValueError("teacher tile batch size must be positive")
-    model.eval()
-    offset = (tile_size - central_size) // 2
-    diagonal_indices = torch.arange(
-        offset, offset + central_size, device=device, dtype=torch.long
-    )
+    diagonal_indices = _prepared_diagonal
+    if diagonal_indices is None:
+        diagonal_indices = prepare_teacher_readout(model, contract, device)
+    probability_batches = []
     for batch_start in range(0, len(spans), batch_size):
-        batch_spans = spans[batch_start : batch_start + batch_size]
-        tile_batch = tiles[batch_start : batch_start + len(batch_spans)]
+        tile_batch = tiles[batch_start : batch_start + batch_size]
         host_tiles = torch.from_numpy(tile_batch)
         if cuda_graphs is None:
             output = model(host_tiles.to(device))
             diagonal = output[:, :, diagonal_indices, diagonal_indices]
         else:
             diagonal = cuda_graphs.diagonal(host_tiles, diagonal_indices)
+        if diagonal.shape[0] != len(tile_batch):
+            raise ValueError("teacher model returned a different number of tiles")
         if diagonal.shape[1] != 1 + teacher_classes:
             raise ValueError("teacher model output channels disagree with its contract")
-        state_probability = torch.sigmoid(diagonal[:, 0]).cpu().numpy()
+        state_probability = torch.sigmoid(diagonal[:, 0])
         teacher_probability = torch.softmax(diagonal[:, 1:], dim=1)
-        teacher_probability = teacher_probability.transpose(1, 2).cpu().numpy()
-        for row_index, span in enumerate(batch_spans):
-            start = int(span["central_start"])
-            end = int(span["central_end"])
-            width = end - start
-            state_track[start:end] = state_probability[row_index, :width]
-            teacher_track[start:end] = teacher_probability[row_index, :width]
-            observed[start:end] += 1
-    if not np.all(observed == 1):
-        raise RuntimeError("teacher tiles did not cover every residue exactly once")
+        probabilities = torch.cat(
+            (state_probability.unsqueeze(-1), teacher_probability.transpose(1, 2)), dim=2
+        )
+        probability_batches.append(probabilities.reshape(-1, 1 + teacher_classes))
+    # Central spans tile the sequence consecutively. Only the last tile is padded.
+    packed = probability_batches[0]
+    if len(probability_batches) > 1:
+        packed = torch.cat(probability_batches)
+    host = packed[:length].cpu().numpy()
+    state_track = np.ascontiguousarray(host[:, 0], dtype=np.float32)
+    teacher_track = np.ascontiguousarray(host[:, 1:], dtype=np.float32)
     if not np.isfinite(state_track).all() or not np.isfinite(teacher_track).all():
         raise ValueError("teacher model emitted nonfinite values")
     if not np.allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5):
