@@ -105,26 +105,28 @@ def phase_votes(
 
 
 def lag_evidence(
-    fused_tracks: Sequence[np.ndarray], length: int, maximum_lag: int
+    fused_tracks: Sequence[np.ndarray],
+    length: int,
+    maximum_lag: int,
+    *,
+    minimum_lag: int = 1,
 ) -> np.ndarray:
     """``V[l, i]``: mean fused diagonal z of residue ``i`` with ``i +/- l``.
 
     ``fused_tracks`` is the wedge call's layer-fused robust diagonal tracks
     (``fused_tracks[l]`` has length ``length - l``). Rows beyond the available
-    separations stay zero.
+    separations or below the requested minimum stay zero.
     """
 
     evidence = np.zeros((maximum_lag + 1, length), dtype=np.float64)
     top = min(maximum_lag, len(fused_tracks) - 1)
-    for lag in range(1, top + 1):
+    for lag in range(max(1, minimum_lag), top + 1):
         track = np.asarray(fused_tracks[lag], dtype=np.float64)
-        total = np.zeros(length)
-        count = np.zeros(length)
-        total[: length - lag] += track
-        count[: length - lag] += 1
-        total[lag:] += track
-        count[lag:] += 1
-        evidence[lag] = np.where(count > 0, total / np.maximum(count, 1), 0.0)
+        row = evidence[lag]
+        row[: length - lag] += track
+        row[lag:] += track
+        # Both diagonals contribute only where these two slices overlap.
+        row[lag : length - lag] *= 0.5
     return evidence
 
 
@@ -217,6 +219,8 @@ def viterbi_units(
 
     n = full.shape[0] - 1
     count = full.shape[1]
+    if count == 0:
+        return [], []
     lengths = minimum_length + np.arange(count)
     scores = np.full((n + 1, count), -np.inf)
     back = np.full((n + 1, count), -1, dtype=np.int64)
@@ -230,23 +234,22 @@ def viterbi_units(
         length_change_penalty * step,
         np.inf,
     )
-    columns = np.arange(count)
-    for position in range(1, n + 1):
-        current = scores[position]
-        if not np.isfinite(current).any():
-            continue
-        candidates = current[:, None] - penalty
-        previous = np.argmax(candidates, axis=0)
-        best = candidates[previous, columns]
-        following = position + lengths
-        valid = np.nonzero((following <= n) & np.isfinite(best))[0]
-        if not len(valid):
-            continue
-        proposal = best[valid] + full[position, valid]
-        targets = following[valid]
-        better = proposal > scores[targets, valid]
-        scores[targets[better], valid[better]] = proposal[better]
-        back[targets[better], valid[better]] = previous[valid[better]]
+    # A transition advances by at least minimum_length, so all source rows
+    # in a block this size are final. Aim for at most 2 MiB of transitions.
+    block_size = max(1, min(minimum_length, 262_144 // (count * count)))
+    for start in range(1, n - minimum_length + 1, block_size):
+        stop = min(start + block_size, n - minimum_length + 1)
+        current = scores[start:stop]
+        candidates = current[:, None, :] - penalty
+        previous = np.argmax(candidates, axis=2)
+        best = np.take_along_axis(candidates, previous[..., None], axis=2)[..., 0]
+        targets = np.arange(start, stop)[:, None] + lengths
+        rows, columns = np.nonzero((targets <= n) & np.isfinite(best))
+        destination = targets[rows, columns]
+        proposal = best[rows, columns] + full[start + rows, columns]
+        better = proposal > scores[destination, columns]
+        scores[destination[better], columns[better]] = proposal[better]
+        back[destination[better], columns[better]] = previous[rows, columns][better]
     remainder = n - np.arange(n + 1)[:, None]
     final = np.where(
         (remainder < lengths[None, :]) & np.isfinite(scores), scores + tail, -np.inf
@@ -295,11 +298,16 @@ def decode_units(
         int(decoder["minimum_step"]),
         int(round(float(decoder["maximum_step_fraction"]) * period)),
     )
-    evidence = lag_evidence(fused_tracks, length, int(decoder["attention_lag_maximum"]))
-    emissions = length_emissions(evidence, minimum_length, maximum_length)
+    evidence = lag_evidence(
+        fused_tracks,
+        length,
+        min(maximum_length, int(decoder["attention_lag_maximum"])),
+        minimum_lag=minimum_length,
+    )
+    emissions = length_emissions(evidence[:, start:end], minimum_length, maximum_length)
     tables = unit_tables(
         votes[start:end],
-        emissions[:, start:end],
+        emissions,
         minimum_length,
         float(decoder["phase_weight"]),
     )

@@ -164,3 +164,17 @@ def test_phase_asset_matches_the_runtime_contract():
     assert decoder["phase_weight"] == 256.0
     assert decoder["length_change_penalty"] == 8.0
     assert math.isclose(decoder["terminal_fraction"], 0.45)
+
+
+def test_viterbi_retains_the_shortest_predecessor_across_blocks():
+    from talea.phase_ssm import viterbi_units
+
+    full = np.zeros((29, 3))
+    lead = np.full_like(full, -np.inf)
+    lead[0] = 0
+    tail = np.full_like(full, -np.inf)
+    tail[-1, 1] = 0
+    # Only full paths from 0 to 28 ending at length 5 can win. All such
+    # paths tie. Backtracking chooses the shortest predecessor at each step.
+    boundaries, lengths = viterbi_units(full, lead, tail, 4, 0.0, 2)
+    assert (boundaries, lengths) == ([0, 6, 11, 15, 19, 23, 28], [6, 5, 4, 4, 4, 5])
