@@ -9,6 +9,8 @@ import torch
 from talea.cli import build_parser
 from talea.inference import (
     TaleaPredictor,
+    _ordered_readouts,
+    near_diagonal_mask,
     apc_head_mean,
     available_cpus,
     make_batches,
@@ -27,6 +29,28 @@ def record(record_id: str, length: int) -> SequenceRecord:
         sequence=sequence,
         sequence_sha256=hashlib.sha256(sequence.encode()).hexdigest(),
     )
+
+
+def test_ordered_readouts_prefetches_only_a_bounded_window():
+    submitted = []
+    class RecordingExecutor:
+        def submit(self, fn, value):
+            future = concurrent.futures.Future()
+            future.set_result(fn(value))
+            submitted.append(value)
+            return future
+
+    rows = _ordered_readouts(lambda i: i * 2, 10, RecordingExecutor(), width=3)
+    assert next(rows) == 0
+    assert submitted == [0, 1, 2, 3]
+    assert list(rows) == list(range(2, 20, 2))
+
+
+def test_adjacent_sequence_lengths_share_mask_storage():
+    small = near_diagonal_mask(257, 6, torch.device("cpu"))
+    large = near_diagonal_mask(500, 6, torch.device("cpu"))
+    assert small.data_ptr() == large.data_ptr()
+    assert torch.equal(small, large[:257, :257])
 
 
 def test_batching_obeys_square_budget_and_maximum_batch() -> None:
