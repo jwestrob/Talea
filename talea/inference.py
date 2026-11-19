@@ -211,6 +211,20 @@ def near_diagonal_mask(
     return _separation_mask_block(capacity, minimum_separation, device)[:sequence_length, :sequence_length]
 
 
+def _apc_fusion(device, dtype, mode):
+    if mode not in ("off", "sym", "full"):
+        raise ValueError(f"unknown APC fusion mode {mode}")
+    if mode == "off" or device.type != "cuda" or dtype != torch.float16:
+        return None
+    if "A5000" not in torch.cuda.get_device_name(device):
+        return None
+    try:
+        from talea._apc_cuda import FusedAPC
+    except ImportError:
+        return None
+    return FusedAPC(mode)
+
+
 def _apc_head_mean_tensor(
     layer_attention: torch.Tensor,
     indices: torch.Tensor,
@@ -218,6 +232,7 @@ def _apc_head_mean_tensor(
     minimum_separation: int,
     storage_dtype: torch.dtype | None = None,
     residue_slice: slice | None = None,
+    fusion=None,
 ) -> torch.Tensor:
     """Symmetrize, APC-correct, head-average, and crop one attention layer.
 
@@ -230,17 +245,24 @@ def _apc_head_mean_tensor(
     transfer without changing the stored representation.
     """
 
-    if residue_slice is None:
-        attention = layer_attention.index_select(1, indices).index_select(2, indices)
+    fused = fusion is not None and residue_slice is not None and layer_attention.dtype == torch.float16
+    if fused:
+        attention = fusion.symmetrize(layer_attention, residue_slice.start, sequence_length)
     else:
-        # Crop both axes in one copy, retaining the contiguous layout used by
-        # the reductions below (including when the batch contains padding).
-        attention = layer_attention[:, residue_slice, residue_slice].contiguous()
-    attention = 0.5 * (attention + attention.transpose(-1, -2))
+        if residue_slice is None:
+            attention = layer_attention.index_select(1, indices).index_select(2, indices)
+        else:
+            # Crop both axes in one copy, retaining the contiguous layout used by
+            # the reductions below (including when the batch contains padding).
+            attention = layer_attention[:, residue_slice, residue_slice].contiguous()
+        attention = 0.5 * (attention + attention.transpose(-1, -2))
     row = attention.sum(dim=-1, keepdim=True)
     column = attention.sum(dim=-2, keepdim=True)
     total = attention.sum(dim=(-1, -2), keepdim=True) + 1e-12
-    attention = torch.relu(attention - (row * column) / total).mean(dim=0)
+    if fused and fusion.full:
+        attention = fusion.correct(attention, row, column, total).mean(dim=0)
+    else:
+        attention = torch.relu(attention - (row * column) / total).mean(dim=0)
     if minimum_separation > 0:
         attention = attention.masked_fill(
             near_diagonal_mask(sequence_length, minimum_separation, attention.device),
@@ -260,10 +282,14 @@ def _aligned_record(tensor):
     return tensor
 
 
-def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span):
+def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None):
     """Batch pointwise operations; retain each original reduction's shape and strides."""
-    cropped = attention[:, :, span, span].contiguous()
-    symmetric = 0.5 * (cropped + cropped.transpose(-1, -2))
+    fused = fusion is not None and attention.dtype == torch.float16
+    if fused:
+        symmetric = fusion.symmetrize(attention, span.start, length)
+    else:
+        cropped = attention[:, :, span, span].contiguous()
+        symmetric = 0.5 * (cropped + cropped.transpose(-1, -2))
     rows, columns, totals = [], [], []
     for record in symmetric.unbind():
         record = _aligned_record(record)
@@ -271,7 +297,11 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
         columns.append(record.sum(dim=-2, keepdim=True))
         totals.append(record.sum(dim=(-1, -2), keepdim=True))
     total = torch.stack(totals) + 1e-12
-    corrected = torch.relu(symmetric - (torch.stack(rows) * torch.stack(columns)) / total)
+    rows, columns = torch.stack(rows), torch.stack(columns)
+    if fused and fusion.full:
+        corrected = fusion.correct(symmetric, rows, columns, total)
+    else:
+        corrected = torch.relu(symmetric - (rows * columns) / total)
     result = torch.stack([_aligned_record(record).mean(dim=0) for record in corrected.unbind()])
     if minimum_separation > 0:
         result = result.masked_fill(near_diagonal_mask(length, minimum_separation, result.device), 0)
@@ -298,7 +328,7 @@ def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMEN
         start = stop
 
 
-def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, handoff=False):
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, fusion=None, handoff=False):
     """Yield one device map per layer and protein, or the scalar singleton path."""
     heads = attentions[layers[0]].shape[1]
     for start, stop in (_equal_apc_groups(indices_by_record, heads) if groups is None else groups):
@@ -310,7 +340,7 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
         # after the wait_event() for this capture.
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
             maps = {
-                layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span)
+                layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span, fusion)
                 for layer in layers
             }
         if stats is not None:
@@ -331,7 +361,7 @@ class _PendingCapture(NamedTuple):
         return self.itemsize
 
 
-def _layer_apc(weights, indices_by_record, separation, dtype, grouped):
+def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=None):
     """Run the existing scalar and equal-length kernels, in record order."""
     maps = []
     groups = (_equal_apc_groups(indices_by_record, weights.shape[1]) if grouped
@@ -340,9 +370,9 @@ def _layer_apc(weights, indices_by_record, separation, dtype, grouped):
         indices, span = indices_by_record[start]
         length = len(indices)
         if stop == start + 1:
-            maps.append(_apc_head_mean_tensor(weights[start], indices, length, separation, dtype, span))
+            maps.append(_apc_head_mean_tensor(weights[start], indices, length, separation, dtype, span, fusion))
         else:
-            maps.extend(_equal_length_apc(weights[start:stop], length, separation, dtype, span).unbind())
+            maps.extend(_equal_length_apc(weights[start:stop], length, separation, dtype, span, fusion).unbind())
     return maps
 
 
@@ -673,6 +703,7 @@ class TaleaPredictor:
         self.primary_extent = primary_extent
         self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self._postprocess_pool_workers = 0
+        self.apc_fusion_active = False
         self.apc_group_stats = None
         self._attention_arena = None
         self._teacher_graphs = None
@@ -1039,6 +1070,7 @@ class TaleaPredictor:
         early_gate: str = "off",
         skip_all_valid_mask: bool = False,
         group_equal_apc: bool = False,
+        fused_apc: str = "off",
         teacher_cuda_graph: bool = False,
         teacher_graph_tracks: bool = False,
         shared_attention_mib: int = 0,
@@ -1099,6 +1131,8 @@ class TaleaPredictor:
         batch returns blocks to the driver and forces later reallocation.
         """
 
+        apc_fusion = _apc_fusion(self.device, self.dtype, fused_apc)
+        self.apc_fusion_active = apc_fusion is not None
         self.apc_group_stats = None
         if group_equal_apc:
             self.apc_group_stats = {
@@ -1426,7 +1460,7 @@ class TaleaPredictor:
                         indices.record_stream(capture_stream)
                 if early_apc:
                     correct = partial(_layer_apc, indices_by_record=residue_indices, separation=minimum_separation,
-                                      dtype=device_storage_dtype, grouped=group_equal_apc)
+                                      dtype=device_storage_dtype, grouped=group_equal_apc, fusion=apc_fusion)
                     capture.transform_attention = partial(
                         _queue_capture, function=correct, executor=capture_executor, stream=capture_stream,
                     )
@@ -1546,7 +1580,7 @@ class TaleaPredictor:
                         elif grouped is None:
                             tensor = _apc_head_mean_tensor(
                                 attentions[layer][batch_position], indices, record.length,
-                                minimum_separation, device_storage_dtype, residue_slice,
+                                minimum_separation, device_storage_dtype, residue_slice, apc_fusion,
                             )
                         else:
                             tensor = grouped[layer]
@@ -1616,7 +1650,7 @@ class TaleaPredictor:
                 if group_equal_apc and self.device.type == "cuda" and not early_apc:
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
-                        device_storage_dtype, readout_stream, groups, stats, handoff=bool(private_streams),
+                        device_storage_dtype, readout_stream, groups, stats, apc_fusion, handoff=bool(private_streams),
                     )
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:
