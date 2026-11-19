@@ -741,6 +741,7 @@ class TaleaPredictor:
         self._graph_readout_stream = None
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
+        self.cached_sdpa_bias_calls = 0
         self.fused_rotary_calls = 0
         self.early_gate_layers = 0
         self.early_apc_layers = 0
@@ -1104,6 +1105,7 @@ class TaleaPredictor:
         early_gate: str = "off",
         skip_all_valid_mask: bool = False,
         arithmetic_swiglu: bool = False,
+        cache_sdpa_bias: bool = False,
         group_equal_apc: bool = False,
         fused_apc: str = "off",
         batched_apc_reductions: str = "",
@@ -1431,6 +1433,11 @@ class TaleaPredictor:
             if unit_residual:
                 from talea.capture import unit_residual_context
                 self.unit_residual_blocks = stack.enter_context(unit_residual_context(capture.blocks))
+            self.cached_sdpa_bias_calls = 0
+            if cache_sdpa_bias and self.device.type == "cuda" and capture_mode == "sdpa":
+                from talea.sdpa_bias import cached_padding_bias
+                bias_cache = stack.enter_context(cached_padding_bias(capture.blocks))
+                stack.callback(lambda: setattr(self, "cached_sdpa_bias_calls", bias_cache.calls))
             self.fused_rotary_calls = 0
             if fused_rotary:
                 from talea.rotary import fused_rotary_context
