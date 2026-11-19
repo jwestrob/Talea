@@ -897,10 +897,14 @@ class TaleaPredictor:
             for batch_index, batch in enumerate(batches, start=1):
                 tokenized = self.tokenizer(
                     [record.sequence for record in batch],
-                    return_tensors="pt",
+                    return_tensors=None,
                     padding=True,
                     return_special_tokens_mask=True,
                 )
+                # The fast tokenizer already pads rectangular lists. Construct
+                # tensors directly to avoid Transformers flattening every list
+                # in Python before handing it to torch.
+                tokenized = {k: torch.from_numpy(np.asarray(v)) for k, v in tokenized.items()}
                 residue_indices = _batch_residue_indices(tokenized, batch, self.device)
                 model_inputs = {
                     key: value.to(self.device)
