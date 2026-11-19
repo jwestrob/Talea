@@ -10,6 +10,7 @@ from talea.cli import build_parser
 from talea.inference import (
     TaleaPredictor,
     _ordered_readouts,
+    _readout_window,
     near_diagonal_mask,
     apc_head_mean,
     available_cpus,
@@ -44,6 +45,17 @@ def test_ordered_readouts_prefetches_only_a_bounded_window():
     assert next(rows) == 0
     assert submitted == [0, 1, 2, 3]
     assert list(rows) == list(range(2, 20, 2))
+
+
+def test_lookahead_respects_worker_and_memory_limits():
+    assert _readout_window(4, 12, False) == 4
+    assert _readout_window(4, 12, True) == 8
+    assert _readout_window(4, 5, True) == 5
+    assert _readout_window(4, 1, True) == 1
+    assert _readout_window(1, 12, True) == 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+        window = _readout_window(4, 12, True)
+        assert list(_ordered_readouts(int, 19, workers, window)) == list(range(19))
 
 
 def test_adjacent_sequence_lengths_share_mask_storage():

@@ -616,6 +616,11 @@ def _pool_gate_layer(state, indices_by_record, group_equal):
     return torch.stack(means)
 
 
+def _readout_window(workers, capacity, lookahead):
+    # Reserve a second wave of futures only where the batch memory budget permits it.
+    return min(capacity, workers * (2 if lookahead and workers > 1 else 1))
+
+
 def _ordered_readouts(function, count, executor, width, items=None):
     """Keep at most width records in flight and deliver results in input order."""
     positions = iter(range(count) if items is None else items)
@@ -1224,6 +1229,7 @@ class TaleaPredictor:
         teacher_readback_records: int = 1,
         async_teacher_readback: bool = False,
         readout_square_budget: int = 1024 ** 2,
+        readout_lookahead: bool = False,
         teacher_quantile_histogram: bool = False,
         native_half_readout: bool = False,
         device_teacher_tiles: bool = False,
@@ -1271,6 +1277,7 @@ class TaleaPredictor:
 
         readout_square_budget bounds the concurrent per-record square matrices by
         limiting readout workers and grouped probability transfers for long inputs.
+        readout_lookahead lets each worker queue one additional record within this limit.
 
         With prefetch_forward enabled, one ESM forward can run ahead of the
         current batch's readouts when accelerator memory permits. On CUDA these
@@ -1349,6 +1356,7 @@ class TaleaPredictor:
         if async_teacher_readback and self.device.type != "cuda":
             raise ValueError("asynchronous teacher readback requires CUDA")
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1 or async_teacher_readback or teacher_graph_pool
+        self.readout_lookahead_batches = 0
         self.async_teacher_readback_batches = 0
         if shared_attention_mib < 0:
             raise ValueError("shared_attention_mib must be nonnegative")
@@ -1587,6 +1595,7 @@ class TaleaPredictor:
                     initializer=bind_private_stream if private_streams else (torch.cuda.set_stream if stream is not None else None),
                     initargs=(stream,) if stream is not None and not private_streams else (),
                 ))
+            queue_ahead = readout_lookahead and record_pool is not None
             stack.callback(cancel_outstanding)
             stack.enter_context(torch.inference_mode())
             capture = stack.enter_context(
@@ -1699,7 +1708,8 @@ class TaleaPredictor:
 
             def can_overlap(current, following, captured):
                 _, attention, hidden, _ = captured
-                width = min(len(current), record_workers, max(1, readout_square_budget // current[-1].length ** 2))
+                capacity = max(1, readout_square_budget // current[-1].length ** 2)
+                width = min(len(current), _readout_window(record_workers, capacity, queue_ahead))
                 required = _prefetch_memory_required(
                     current, following, next(iter(attention.values())), next(iter(hidden.values())), width,
                 )
@@ -1838,7 +1848,8 @@ class TaleaPredictor:
 
                 # Bound concurrent quadratic APC scratch as records get longer.
                 readout_capacity = max(1, readout_square_budget // batch[-1].length ** 2)
-                width = min(record_workers, readout_capacity)
+                width = _readout_window(record_workers, readout_capacity, queue_ahead)
+                self.readout_lookahead_batches += int(min(width, len(batch)) > record_workers)
 
                 def stream_readout(position, grouped=None, group_ready=None):
                     stream = getattr(worker_local, "stream", readout_stream) if private_streams else readout_stream
