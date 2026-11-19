@@ -199,6 +199,25 @@ def test_packed_readouts_equal_individual_heads(dtype, extent, phase):
             assert predictor._hidden_readouts(compact, indices, 1, span)[3] == gate
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA reduction kernels")
+@pytest.mark.parametrize("length", [1019, 1020, 1021, 1024, 2000])
+def test_grouped_gate_matches_individual_reduction_across_split_threshold(length):
+    from talea.inference import _pool_gate_layer
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(211)
+    # Vary the magnitude to make float32 addition order observable even with
+    # fp16 encoder outputs.
+    state = torch.randn(5, length + 2, 1152, generator=generator, device=device)
+    state[:, ::3].mul_(4096)
+    state = state.half()
+    indices = torch.arange(1, length + 1, device=device)
+    spans = [(indices, slice(1, length + 1))] * len(state)
+    reference = torch.stack([row.index_select(0, indices).float().mean(0) for row in state])
+    result = _pool_gate_layer(state, spans, True)
+    assert torch.equal(reference.view(torch.int32), result.view(torch.int32))
+
+
 def test_batch_token_positions_with_internal_specials_and_padding():
     from types import SimpleNamespace
     from talea.inference import _batch_residue_indices
