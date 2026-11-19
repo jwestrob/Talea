@@ -110,6 +110,50 @@ def _write_half_tiles(words, tiles, table, starts):
                 tiles[i, y-start, x-start] = table[words[y, x]]
 
 
+@njit(cache=True, nogil=True)
+def _last_half_bin(counts):
+    for index in range(counts.size - 1, 0, -1):
+        if counts[index]:
+            return index
+    return 0
+
+
+def _half_normalization_table(matrix, quantile, denominator, compact=False):
+    words = matrix.view(np.uint16)
+    counts, count = _half_histogram(words)
+    if not count:
+        return None
+    levels = _half_levels()
+    lower, upper, fraction = _quantile_bins(counts, count, quantile)
+    scale = float(levels[lower]) if lower == upper else float(np.quantile(levels[[lower, upper]], fraction))
+    if compact:
+        # Include every observed positive word and keep a distinct signed-zero slot.
+        last = _last_half_bin(counts)
+        compact_levels = np.empty(last + 2, dtype=np.float32)
+        compact_levels[:-1] = levels[:last + 1]
+        compact_levels[-1] = levels[0x8000]
+        levels = compact_levels
+    table = levels / scale
+    np.log1p(table, out=table)
+    np.divide(np.clip(table, 0., denominator), denominator, out=table)
+    return table
+
+
+def native_half_tables(matrices, quantile, clip):
+    """Pack the exact NumPy normalization tables used by the two APC channels."""
+    if not 0.5 <= quantile < 1.0 or clip <= 0:
+        raise ValueError("invalid attention normalization quantile or clip")
+    denominator = np.log1p(clip)
+    channels = [_half_normalization_table(matrix, quantile, denominator, compact=True) for matrix in matrices]
+    width = max((len(table) for table in channels if table is not None), default=2)
+    tables = np.zeros((len(channels), width), dtype=np.float32)
+    for dest, table in zip(tables, channels, strict=True):
+        if table is not None:
+            dest[:len(table) - 1] = table[:-1]
+            dest[-1] = table[-1]
+    return tables
+
+
 def native_half_tiles(matrices, spans, tile_size, quantile, clip):
     """Normalize the exact original half words directly into the teacher tiles."""
     if not 0.5 <= quantile < 1.0 or clip <= 0:
@@ -121,16 +165,8 @@ def native_half_tiles(matrices, spans, tile_size, quantile, clip):
         valid = slice(max(0, -start), min(tile_size, length-start))
         tiles[i, -1, valid, valid] = 1
     denominator = np.log1p(clip)
-    levels = _half_levels()
     for channel, matrix in enumerate(matrices):
-        words = matrix.view(np.uint16)
-        counts, count = _half_histogram(words)
-        if count == 0:
-            continue
-        lower, upper, fraction = _quantile_bins(counts, count, quantile)
-        scale = float(levels[lower]) if lower == upper else float(np.quantile(levels[[lower,upper]], fraction))
-        table = levels / scale
-        np.log1p(table, out=table)
-        np.divide(np.clip(table, 0., denominator), denominator, out=table)
-        _write_half_tiles(words, tiles[:, channel], table, starts)
+        table = _half_normalization_table(matrix, quantile, denominator)
+        if table is not None:
+            _write_half_tiles(matrix.view(np.uint16), tiles[:, channel], table, starts)
     return tiles
