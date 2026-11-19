@@ -80,3 +80,45 @@ def test_odd_half_span_preserves_bits_and_adjacent_float_span():
         recovered = task[1].matrices(ring.buffer)[13]
         assert recovered.dtype == m.dtype
         assert recovered.tobytes() == m.tobytes()
+
+
+def test_direct_half_out_of_order_lifetimes_and_retry():
+    from concurrent.futures import ThreadPoolExecutor
+    import pytest
+
+    ring = SharedAttentionArena(32)
+    pool = DeferredPool()
+    layers = (13, 35)
+    with ThreadPoolExecutor(2) as executor:
+        first, second = list(executor.map(lambda _: ring.reserve_half(2, layers), range(2)))
+    assert first.span.offset != second.span.offset
+    for lease, value in ((first, 3), (second, 7)):
+        for layer in lease:
+            lease[layer].fill(value)
+    assert ring.reserve_half(2, layers) is None
+    payload_for = lambda m: ({"length": 2}, m, (), None, None)
+    class Broken:
+        def submit(self, fn, payload):
+            raise RuntimeError("pool unavailable")
+    with pytest.raises(RuntimeError):
+        ring.submit(Broken(), None, payload_for(second))
+    second_future = ring.submit(pool, None, payload_for(second))
+    with pytest.raises(ValueError):
+        ring.submit(pool, None, payload_for(second))
+    first_future = ring.submit(pool, None, payload_for(first))
+    del first, second
+    assert ring.reserve_half(2, layers) is None
+    for i, value in enumerate((7, 3)):
+        received = pool.tasks[i][0][1].matrices(ring.buffer)
+        assert all(a.dtype == np.float16 and np.all(a == value) for a in received.values())
+    second_future.cancel()
+    first_future.set_result(None)
+    assert ring.reserve_half(2, layers) is not None
+
+
+def test_abandoned_unsubmitted_ticket_releases_ring():
+    ring = SharedAttentionArena(16)
+    reserved = ring.reserve_half(2, (13, 35))
+    assert reserved is not None and ring.reserve_half(2, (13, 35)) is None
+    del reserved
+    assert ring.reserve_half(2, (13, 35)) is not None

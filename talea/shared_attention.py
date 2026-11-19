@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from multiprocessing import RawArray
 from threading import Lock
 from typing import NamedTuple
@@ -26,6 +27,23 @@ class AttentionSpan(NamedTuple):
         return dict(zip(self.layers, stack, strict=True))
 
 
+class _ReservedMatrices(dict):
+    """A writer owns these half maps until submission transfers the lease to a future."""
+
+    def __init__(self, arena, span, values):
+        super().__init__(zip(span.layers, values, strict=True))
+        self.arena = arena
+        self.span = span
+        self.submitted = False
+        self._finished = False
+
+    def done(self):
+        return self._finished
+
+    def release(self, future):
+        self._finished = True
+
+
 class SharedAttentionArena:
     """A producer and its workers inherit the same buffer at process startup.
 
@@ -43,9 +61,81 @@ class SharedAttentionArena:
         self._live = deque()
         self._lock = Lock()
         self.shared_records = self.pickled_records = 0
+        self.direct_records = 0
+
+    def _placement(self, count):
+        capacity = self._flat.size
+        if not 0 < count <= capacity:
+            return None
+        while self._live:
+            oldest = self._live[0][1]()
+            if oldest is not None and not oldest.done():
+                break
+            self._live.popleft()
+        start = self._head if self._live else 0
+        offset = start % capacity
+        if offset + count > capacity:
+            start += capacity - offset
+            offset = 0
+        if self._live and start + count - self._live[0][0] > capacity:
+            return None
+        return start, offset
+
+    def reserve_half(self, length, layers):
+        layers = tuple(layers)
+        elements = len(layers) * length**2
+        count = (elements + 1) // 2
+        with self._lock:
+            where = self._placement(count)
+            if where is None:
+                return None
+            start, offset = where
+            span = AttentionSpan(offset, length, layers, half=True)
+            values = self._flat[offset:offset+count].view(np.float16)[:elements].reshape(len(layers), length, length)
+            maps = _ReservedMatrices(self, span, values)
+            self._head = start + count
+            self._live.append((start, ref(maps)))
+            return maps
+
+    @contextmanager
+    def page_locked(self):
+        """Register existing inherited storage for direct D2H as long as its readers run."""
+        import torch
+        runtime = torch.cuda.cudart()
+        address = self._flat.ctypes.data
+        status = runtime.cudaHostRegister(address, self.capacity_bytes, 0)
+        # A host memory limit or unsupported registration uses the normal pinned
+        # tensor staging buffer. Unexpected CUDA errors need their original report.
+        if int(status) in (1, 2, 712, 801):
+            yield False
+            return
+        torch.cuda.check_error(status)
+        try:
+            yield True
+        finally:
+            torch.cuda.check_error(runtime.cudaHostUnregister(address))
+
 
     def submit(self, pool, function, payload):
         metadata, matrices, *rest = payload
+        if isinstance(matrices, _ReservedMatrices):
+            with self._lock:
+                if matrices.arena is not self or matrices.submitted or metadata["length"] != matrices.span.length:
+                    raise ValueError("invalid or previously submitted shared attention reservation")
+                matrices.submitted = True
+            try:
+                future = pool.submit(function, (metadata, matrices.span, *rest))
+            except BaseException:
+                with self._lock:
+                    matrices.submitted = False
+                raise
+            # The callback holds the maps through asynchronous work. A completed
+            # or cancelled future releases this span for the next producer.
+            future.add_done_callback(matrices.release)
+            with self._lock:
+                self.shared_records += 1
+                self.direct_records += 1
+            return future
         length = metadata["length"]
         layers = tuple(matrices)
         elements = len(layers) * length**2
@@ -58,19 +148,11 @@ class SharedAttentionArena:
             matrix.dtype == dtype and matrix.shape == (length, length)
             for matrix in matrices.values())
         with self._lock:
-            while self._live:
-                oldest = self._live[0][1]()
-                if oldest is not None and not oldest.done():
-                    break
-                self._live.popleft()
-            start = self._head if self._live else 0
-            offset = start % capacity
-            if offset + count > capacity:
-                start += capacity - offset
-                offset = 0
-            if not suitable or (self._live and start + count - self._live[0][0] > capacity):
+            where = self._placement(count) if suitable else None
+            if where is None:
                 self.pickled_records += 1
                 return pool.submit(function, payload)
+            start, offset = where
             dest = self._flat[offset:offset + count].view(dtype)[:elements].reshape(len(layers), length, length)
             for dest_layer, layer in zip(dest, layers, strict=True):
                 np.copyto(dest_layer, matrices[layer])

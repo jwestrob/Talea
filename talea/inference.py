@@ -446,8 +446,8 @@ class _AttentionStaging(threading.local):
             self._buffers[layer] = buffer
         buffer[:count].view_as(matrix).copy_(matrix, non_blocking=True)
 
-    def unpack_after_readouts(self, length, native_half=False):
-        matrices = {}
+    def unpack_after_readouts(self, length, native_half=False, destination=None):
+        matrices = {} if destination is None else destination
         for layer, buffer in self._buffers.items():
             host = buffer[:length * length].reshape(length, length)
             # Workers (and possibly their IPC feeder) retain these arrays after
@@ -455,7 +455,10 @@ class _AttentionStaging(threading.local):
             if native_half and host.dtype == torch.float16:
                 # The teacher histogram validates every half word before this
                 # record is submitted to a topology worker.
-                matrices[layer] = host.numpy().copy()
+                if destination is None:
+                    matrices[layer] = host.numpy().copy()
+                else:
+                    np.copyto(matrices[layer], host.numpy())
                 continue
             matrix = host.to(dtype=torch.float32, copy=True).numpy()
             matrices[layer] = _checked_attention_matrix(matrix, length)
@@ -1098,6 +1101,7 @@ class TaleaPredictor:
         native_half_readout: bool = False,
         device_teacher_tiles: bool = False,
         worker_finalization: bool = False,
+        direct_shared_half: str = "off",
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -1193,6 +1197,8 @@ class TaleaPredictor:
         early_readout = early_apc or early_gate != "off"
         if early_readout and (self.device.type != "cuda" or _device_autocast_enabled("cuda")):
             raise ValueError("early layer readouts require CUDA and an explicit model dtype")
+        if direct_shared_half not in ("off", "host", "cuda"):
+            raise ValueError(f"unknown direct_shared_half setting {direct_shared_half}")
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
         if readout_square_budget < 1:
@@ -1369,6 +1375,15 @@ class TaleaPredictor:
             submit_record = pool.submit
             if postprocess_mode == "process" and shared_attention_mib:
                 submit_record = partial(self._attention_arena.submit, pool)
+            direct_arena = None
+            direct_cuda = False
+            self.direct_shared_half_active = "off"
+            if (direct_shared_half != "off" and half_decoder is not None and
+                    postprocess_mode == "process" and shared_attention_mib):
+                direct_arena = self._attention_arena
+                if direct_shared_half == "cuda":
+                    direct_cuda = stack.enter_context(direct_arena.page_locked())
+                self.direct_shared_half_active = "cuda" if direct_cuda else "host"
             overlap_enabled = prefetch_forward and len(batches) > 1
             forward_stream = readout_stream = None
             graph_prefetch = (
@@ -1613,32 +1628,43 @@ class TaleaPredictor:
                 def readout(batch_position, grouped=None):
                     record = batch[batch_position]
                     indices, residue_slice = residue_indices[batch_position]
-                    matrices = {}
+                    reserved = (direct_arena.reserve_half(record.length, self.expected_layers)
+                                if direct_arena is not None else None)
+                    direct = direct_cuda and reserved is not None
+                    matrices = {} if reserved is None else reserved
                     device_maps = [] if device_tile_plan is not None else None
-                    for layer in self.expected_layers:
-                        if early_apc:
-                            tensor = layer_maps[layer][batch_position]
-                        elif grouped is None:
-                            tensor = _apc_head_mean_tensor(
-                                attentions[layer][batch_position], indices, record.length,
-                                minimum_separation, device_storage_dtype, residue_slice, apc_fusion,
-                            )
-                        else:
-                            tensor = grouped[layer]
-                        if device_maps is not None:
-                            device_maps.append(tensor)
-                        if attention_staging is None:
-                            host = tensor.to("cpu", dtype=torch.float32).numpy()
-                            matrices[layer] = _checked_attention_matrix(host, record.length)
-                        else:
-                            attention_staging.enqueue(layer, tensor)
-                    pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
-                        hidden_states, indices, batch_position, residue_slice
-                    )
-                    if attention_staging is not None:
-                        # _hidden_readouts' blocking D2H copy is on the same CUDA
-                        # stream as both enqueued attention copies.
-                        matrices = attention_staging.unpack_after_readouts(record.length, native_half=half_decoder is not None)
+                    try:
+                        for layer in self.expected_layers:
+                            if early_apc:
+                                tensor = layer_maps[layer][batch_position]
+                            elif grouped is None:
+                                tensor = _apc_head_mean_tensor(
+                                    attentions[layer][batch_position], indices, record.length,
+                                    minimum_separation, device_storage_dtype, residue_slice, apc_fusion,
+                                )
+                            else:
+                                tensor = grouped[layer]
+                            if device_maps is not None:
+                                device_maps.append(tensor)
+                            if direct:
+                                torch.from_numpy(reserved[layer]).copy_(tensor, non_blocking=True)
+                            elif attention_staging is None:
+                                host = tensor.to("cpu", dtype=torch.float32).numpy()
+                                matrices[layer] = _checked_attention_matrix(host, record.length)
+                            else:
+                                attention_staging.enqueue(layer, tensor)
+                        pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
+                            hidden_states, indices, batch_position, residue_slice
+                        )
+                    except BaseException:
+                        if direct:
+                            # Release reserved storage only after queued DMA writes finish.
+                            torch.cuda.current_stream(self.device).synchronize()
+                        raise
+                    if attention_staging is not None and not direct:
+                        matrices = attention_staging.unpack_after_readouts(
+                            record.length, native_half=half_decoder is not None, destination=reserved
+                        )
                     inputs = pooled, matrices, probabilities, region_track, gate_logit
                     if device_maps is not None and all(t.dtype == torch.float16 and t.is_contiguous() for t in device_maps):
                         tables = native_half_tables(

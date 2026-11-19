@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="group ordered teacher probability transfers for up to this many proteins")
     parser.add_argument("--device-teacher-tiles", action="store_true",
                         help="fill teacher tiles on CUDA from fp16 attention and exact normalization tables")
+    parser.add_argument("--direct-shared-half", choices=("off", "host", "cuda"), default="off",
+                        help="write native fp16 readouts into reserved process-shared storage")
     parser.add_argument("--native-half-readout", action="store_true",
                         help="retain fp16 attention through teacher normalization and topology transport on CUDA")
     parser.add_argument("--worker-finalization", action="store_true",
@@ -281,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         "record_workers": args.record_workers,
         **({"readout_streams": args.readout_streams} if args.readout_streams else {}),
         **({"device_teacher_tiles": True} if args.device_teacher_tiles else {}),
+        **({"direct_shared_half": args.direct_shared_half} if args.direct_shared_half != "off" else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
@@ -354,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         "record_workers": args.record_workers,
         **({"readout_streams": args.readout_streams} if args.readout_streams else {}),
         **({"device_teacher_tiles": True} if args.device_teacher_tiles else {}),
+        **({"direct_shared_half": args.direct_shared_half} if args.direct_shared_half != "off" else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
