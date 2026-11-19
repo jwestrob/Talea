@@ -12,6 +12,7 @@ from talea.production import (
     global_head_probabilities,
     pooled_hidden_features_for_record,
     roundtrip_attention_storage,
+    prepare_teacher_tiles,
     standardized_probability_z,
     summarize_teacher_prediction,
     teacher_tracks_from_attention,
@@ -136,6 +137,10 @@ def test_bundled_teacher_loads_and_emits_valid_tracks() -> None:
 
 def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
     import json
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from talea.inference import _ordered_readouts
+
     assets = verified_runtime_assets()
     contract = json.loads(assets.teacher_contract.read_text())
     contract["model"]["batch_size"] = 3
@@ -147,20 +152,32 @@ def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
     model.load_state_dict(torch.load(assets.teacher_model, map_location="cpu", weights_only=True))
     rng = np.random.default_rng(7783)
     observed_sizes = []
+    owner = threading.current_thread()
 
     class ReplayOnCPU:
         def diagonal(self, host, indices):
+            assert threading.current_thread() is owner
             observed_sizes.append(len(host))
             return model(host)[:, :, indices, indices]
 
     replay_on_cpu = ReplayOnCPU()
+    inputs = [
+        {layer: rng.random((length, length), dtype=np.float32) for layer in (13, 35)}
+        for length in (1, 63, 64, 129, 257)
+    ]
+    eager = [teacher_tracks_from_attention(model, maps, contract, torch.device("cpu")) for maps in inputs]
 
-    for length in (1, 63, 64, 129, 257):
-        matrices = {layer: rng.random((length, length), dtype=np.float32) for layer in (13, 35)}
-        eager = teacher_tracks_from_attention(model, matrices, contract, torch.device("cpu"))
-        replay = teacher_tracks_from_attention(model, matrices, contract, torch.device("cpu"),
-                                              cuda_graphs=replay_on_cpu)
-        assert all(a.tobytes() == b.tobytes() for a, b in zip(eager, replay, strict=True))
+    def prepare(index):
+        assert threading.current_thread() is not owner
+        return prepare_teacher_tiles(inputs[index], contract)
+
+    with ThreadPoolExecutor(max_workers=3) as workers:
+        replay_inputs = _ordered_readouts(prepare, len(inputs), workers, 3)
+        for maps, tracks, tiles in zip(inputs, eager, replay_inputs, strict=True):
+            observed = teacher_tracks_from_attention(
+                model, maps, contract, torch.device("cpu"), cuda_graphs=replay_on_cpu, _prepared_tiles=tiles,
+            )
+            assert all(a.tobytes() == b.tobytes() for a, b in zip(tracks, observed, strict=True))
     assert observed_sizes == [1, 1, 1, 3, 3, 2]
 
 

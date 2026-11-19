@@ -47,6 +47,7 @@ from talea.production import (
     global_head_probabilities,
     summarize_teacher_prediction,
     prepare_teacher_readout,
+    prepare_teacher_tiles,
     teacher_tracks_from_attention,
 )
 from talea.topology import process_attention_record
@@ -622,7 +623,7 @@ class TaleaPredictor:
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
 
-    def _get_teacher_graphs(self, requested, *, replace_stream=False):
+    def _get_teacher_graphs(self, requested, *, replace_stream=False, owner_thread=False):
         self.teacher_cuda_graph_active = False
         if (not requested or self.device.type != "cuda"
                 or _device_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
@@ -631,13 +632,17 @@ class TaleaPredictor:
             if torch.cuda.is_current_stream_capturing():
                 return None
             stream = torch.cuda.current_stream(self.device)
-            if self._teacher_graphs is not None and self._teacher_graphs.stream != stream:
-                if not replace_stream:
+            cached = self._teacher_graphs
+            if cached is not None:
+                if cached.stream != stream and not replace_stream:
                     return None
-                # A preceding graph-only warm-up used another stream. Finish
-                # its replays before releasing the old graph pools.
-                self._teacher_graphs.stream.synchronize()
-                self._teacher_graphs = None
+                # cuDNN convolution plan caches are thread-local. Capture anew
+                # when a caller resumes the predictor from another host thread.
+                new_owner = owner_thread and cached.capture_thread is not threading.current_thread()
+                if cached.stream != stream or new_owner:
+                    cached.stream.synchronize()
+                    self._teacher_graphs = None
+                    del cached
             if self._teacher_graphs is None:
                 self._teacher_graphs = CudaTeacherGraphs(self.teacher_model, self.teacher_contract, self.device)
         self.teacher_cuda_graph_active = True
@@ -903,6 +908,7 @@ class TaleaPredictor:
         capture_mode: str = "auto",
         cache_clear_interval: int = 0,
         record_workers: int = 1,
+        teacher_owner_thread: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -927,6 +933,9 @@ class TaleaPredictor:
 
         With record_workers > 1, threads prepare independent proteins using
         their original teacher batch shapes. Results are collected in order.
+
+        With teacher_owner_thread enabled, record workers normalize tiles ahead
+        of the ordered teacher calls on the thread that warmed the network.
 
         With prefetch_forward enabled, one ESM forward can run ahead of the
         current batch's readouts when accelerator memory permits. On CUDA these
@@ -1155,7 +1164,7 @@ class TaleaPredictor:
                     self.teacher_model, self.teacher_contract, self.device
                 )
                 teacher_graphs = self._get_teacher_graphs(
-                    teacher_cuda_graph, replace_stream=graph_prefetch
+                    teacher_cuda_graph, replace_stream=graph_prefetch, owner_thread=teacher_owner_thread
                 )
             record_pool = None
             if record_workers > 1 and not _device_autocast_enabled(self.device.type):
@@ -1268,6 +1277,16 @@ class TaleaPredictor:
                     _handoff_capture(readout_stream, ready, attentions, hidden_states, residue_indices)
                 compact = []
                 pooled_rows = []
+
+                def finish_teacher(inputs, prepared_tiles=None):
+                    _, matrices, _, _, _ = inputs
+                    tracks = teacher_tracks_from_attention(
+                        self.teacher_model, matrices, self.teacher_contract, self.device,
+                        cuda_graphs=teacher_graphs, _prepared_diagonal=teacher_diagonal,
+                        _prepared_tiles=prepared_tiles,
+                    )
+                    return (*inputs, *tracks)
+
                 @torch.inference_mode()
                 def readout(batch_position, grouped=None):
                     record = batch[batch_position]
@@ -1293,18 +1312,10 @@ class TaleaPredictor:
                         # _hidden_readouts' blocking D2H copy is on the same CUDA
                         # stream as both enqueued attention copies.
                         matrices = attention_staging.unpack_after_readouts(record.length)
-                    # The residue-state track goes to the worker too: further
-                    # wedge calls are registered into units only where it
-                    # supports them.
-                    state_track, teacher_track = teacher_tracks_from_attention(
-                        self.teacher_model,
-                        matrices,
-                        self.teacher_contract,
-                        self.device,
-                        cuda_graphs=teacher_graphs,
-                        _prepared_diagonal=teacher_diagonal,
-                    )
-                    return pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track
+                    inputs = pooled, matrices, probabilities, region_track, gate_logit
+                    if teacher_owner_thread:
+                        return inputs, prepare_teacher_tiles(matrices, self.teacher_contract)
+                    return finish_teacher(inputs)
 
                 # Bound concurrent quadratic APC scratch as records get longer.
                 width = min(record_workers, max(1, 1024 ** 2 // batch[-1].length ** 2))
@@ -1339,6 +1350,11 @@ class TaleaPredictor:
                 else:
                     readouts = _ordered_readouts(read, len(batch), record_pool, width)
                 for record, outputs in zip(batch, readouts, strict=True):
+                    if teacher_owner_thread:
+                        # Consume in input order on the graph-capture thread and
+                        # stream while workers prepare the next bounded window.
+                        with torch.cuda.stream(readout_stream) if readout_stream is not None else contextlib.nullcontext():
+                            outputs = finish_teacher(*outputs)
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
                     if postprocess_mode == "process":

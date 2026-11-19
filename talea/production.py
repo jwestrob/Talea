@@ -202,6 +202,7 @@ class CudaTeacherGraphs:
     @torch.inference_mode()
     def __init__(self, model, contract, device):
         self.stream = torch.cuda.current_stream(device)
+        self.capture_thread = threading.current_thread()
         self.graphs = {}
         self._locks = {}
         tile_size = int(contract["attention"]["tile_size"])
@@ -259,23 +260,10 @@ def prepare_teacher_readout(
     return torch.arange(offset, offset + center, device=device, dtype=torch.long)
 
 
-@torch.inference_mode()
-def teacher_tracks_from_attention(
-    model: torch.nn.Module,
-    matrices: Mapping[int, np.ndarray],
-    contract: Mapping,
-    device: torch.device,
-    *,
-    cuda_graphs: CudaTeacherGraphs | None = None,
-    _prepared_diagonal: torch.Tensor | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Decode one protein's state and teacher-class tracks from attention.
-
-    Tiles are scored only on their central diagonal, so every residue is
-    reconstructed exactly once and padding never contributes to a summary.
-    The predictor prepares its fixed diagonal and model mode once per iteration.
-    """
-
+def prepare_teacher_tiles(
+    matrices: Mapping[int, np.ndarray], contract: Mapping,
+) -> tuple[int, np.ndarray]:
+    """Normalize one record's tiles on the host, in the model's original order."""
     attention = contract["attention"]
     layers = tuple(int(value) for value in attention["layers_zero_based"])
     missing = [layer for layer in layers if layer not in matrices]
@@ -299,6 +287,30 @@ def teacher_tracks_from_attention(
         float(attention["normalization_quantile"]),
         float(attention["normalization_clip"]),
     )
+    return length, tiles
+
+
+@torch.inference_mode()
+def teacher_tracks_from_attention(
+    model: torch.nn.Module,
+    matrices: Mapping[int, np.ndarray],
+    contract: Mapping,
+    device: torch.device,
+    *,
+    cuda_graphs: CudaTeacherGraphs | None = None,
+    _prepared_diagonal: torch.Tensor | None = None,
+    _prepared_tiles: tuple[int, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode one protein's state and teacher-class tracks from attention.
+
+    Tiles are scored only on their central diagonal, so every residue is
+    reconstructed exactly once and padding never contributes to a summary.
+    The predictor prepares its fixed diagonal and model mode once per iteration.
+    """
+
+    if _prepared_tiles is None:
+        _prepared_tiles = prepare_teacher_tiles(matrices, contract)
+    length, tiles = _prepared_tiles
     teacher_classes = len(contract["teacher"]["class_names"])
     batch_size = int(contract["model"]["batch_size"])
     if batch_size < 1:
@@ -307,7 +319,7 @@ def teacher_tracks_from_attention(
     if diagonal_indices is None:
         diagonal_indices = prepare_teacher_readout(model, contract, device)
     probability_batches = []
-    for batch_start in range(0, len(spans), batch_size):
+    for batch_start in range(0, len(tiles), batch_size):
         tile_batch = tiles[batch_start : batch_start + batch_size]
         host_tiles = torch.from_numpy(tile_batch)
         if cuda_graphs is None:

@@ -266,6 +266,7 @@ def test_record_worker_threads_own_independent_attention_staging():
 
 def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     import contextlib
+    import threading
     from types import SimpleNamespace
     import talea.inference as inference
     predictor = object.__new__(TaleaPredictor)
@@ -280,10 +281,18 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     monkeypatch.setattr(torch.cuda, "device", lambda d: contextlib.nullcontext())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda d: current[0])
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(inference, "CudaTeacherGraphs", lambda *args: SimpleNamespace(stream=current[0]))
+    monkeypatch.setattr(inference, "CudaTeacherGraphs", lambda *args: SimpleNamespace(
+        stream=current[0], capture_thread=threading.current_thread(),
+    ))
     cached = predictor._get_teacher_graphs(True)
     assert cached is not None and predictor.teacher_cuda_graph_active
     assert predictor._get_teacher_graphs(True) is cached
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        assert pool.submit(predictor._get_teacher_graphs, True, owner_thread=True).result() is not cached
+    assert synchronized == ["warm-up"]
+    assert predictor._get_teacher_graphs(True, owner_thread=True).capture_thread is threading.current_thread()
+    assert synchronized == ["warm-up", "warm-up"]
+    synchronized.clear()
     current[0] = object()
     assert predictor._get_teacher_graphs(True) is None
     assert not predictor.teacher_cuda_graph_active

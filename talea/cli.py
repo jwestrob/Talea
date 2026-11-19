@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
+    parser.add_argument("--teacher-owner-thread", action="store_true",
+                        help="prepare tiles in record workers and run the teacher in order on the predictor thread")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--group-equal-apc", action="store_true",
@@ -247,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
+        **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         "group_equal_apc": args.group_equal_apc,
@@ -300,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
+        **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
