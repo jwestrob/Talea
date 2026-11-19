@@ -216,3 +216,36 @@ def test_mad_from_sorted_halves_matches_full_sort():
         expected.append(np.median(np.abs(raw - center)))
     actual = median_absolute_deviations(sorted_rows, np.array(centers), lengths)
     assert actual.tobytes() == np.asarray(expected).tobytes()
+
+
+def test_compiled_ragged_prefixes_match_numpy_including_signed_zero():
+    import pytest
+    pytest.importorskip("numba")
+    from talea._wedge_numba import track_prefixes
+
+    tracks = [
+        np.array([]),
+        np.array([-0.0, -0.0, 1.0, 2.0**-52, -1.0]),
+        np.array([0.75, 1.25, 1.0]),
+        np.array([]),
+        np.array([np.nextafter(0.0, 1.0), -0.0]),
+    ]
+    offsets = np.cumsum([0, *(len(track) for track in tracks)])
+    used = np.array([1, 3, 4])
+    expected = np.zeros((5, 7))
+    for d in used:
+        expected[d, 1 : len(tracks[d]) + 1] = np.cumsum(tracks[d])
+    observed = track_prefixes(np.concatenate(tracks), offsets, used, 6)
+    assert observed.tobytes() == expected.tobytes()
+
+
+def test_native_precision_diagonal_sort_preserves_float64_interpolation():
+    rng = np.random.default_rng(8002)
+    for dtype in (np.float16, np.float32):
+        matrix = rng.random((59, 59)).astype(dtype)
+        matrix[::3] = np.nextafter(dtype(0), dtype(1))
+        for sentinel in (0.0, -0.0, -1.0):
+            matrix[1::4, ::5] = sentinel
+            result = robust_diagonal_tracks(matrix, 45, baseline_quantile=0.31791)
+            reference = robust_diagonal_tracks(matrix.astype(np.float64), 45, baseline_quantile=0.31791)
+            assert all(a.tobytes() == b.tobytes() for a, b in zip(result, reference))

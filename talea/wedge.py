@@ -18,20 +18,24 @@ import numpy as np
 
 _compiled_wedge_scores = None
 _compiled_mad = None
+_compiled_track_prefixes = None
 
 
 def enable_compiled_wedge_scores() -> None:
     """Compile on first use in long-lived process workers when Numba is installed."""
-    global _compiled_wedge_scores, _compiled_mad
+    global _compiled_wedge_scores, _compiled_mad, _compiled_track_prefixes
     try:
         from numba import config
         if config.DISABLE_JIT:
             return
-        from talea._wedge_numba import accumulate_scores, median_absolute_deviations
+        from talea._wedge_numba import (
+            accumulate_scores, median_absolute_deviations, track_prefixes,
+        )
     except ImportError:
         return
     _compiled_wedge_scores = accumulate_scores
     _compiled_mad = median_absolute_deviations
+    _compiled_track_prefixes = track_prefixes
 
 
 def candidate_periods_from_windows(
@@ -92,7 +96,9 @@ def _sorted_row_quantile(rows: np.ndarray, counts: np.ndarray, q: float) -> np.n
     following = np.minimum(previous + 1, counts - 1)
     gamma = virtual - previous
     index = np.arange(len(rows))
-    return _row_lerp(rows[index, previous], rows[index, following], gamma)
+    lower = rows[index, previous].astype(np.float64, copy=False)
+    upper = rows[index, following].astype(np.float64, copy=False)
+    return _row_lerp(lower, upper, gamma)
 
 
 def _sorted_row_median(rows: np.ndarray, counts: np.ndarray) -> np.ndarray:
@@ -134,9 +140,14 @@ def robust_diagonal_tracks(
     separations = np.arange(1, maximum + 1)
     counts = length - separations
     # Row d - 1 holds diagonal d, left-aligned and padded with +inf so padding sorts last.
-    padded = np.full((maximum, length - 1), np.inf)
+    storage = np.float32 if values.dtype in (np.float32, np.float16) else np.float64
+    padded = np.full((maximum, length - 1), np.inf, dtype=storage)
     for row, separation in enumerate(separations):
         padded[row, : counts[row]] = np.diagonal(values, offset=separation)
+    # Nonnegative attention retains its exact order statistics in its native
+    # precision. Keep the float64 ordering for NaNs and signed-zero ties.
+    if padded.dtype == np.float32 and (np.signbit(padded).any() or np.isnan(padded).any()):
+        padded = padded.astype(np.float64)
     ordered = np.sort(padded, axis=1)
     baseline = _sorted_row_quantile(ordered, counts, baseline_quantile)
     centered_sorted = ordered - baseline[:, None]
@@ -569,11 +580,14 @@ class WedgePlan:
                 "index": index,
                 "weight": weight,
                 "counts": counts,
-                "rows": tuple(int(np.sum(counts > slot)) for slot in range(slots)),
+                # Templates are sorted by decreasing member count. Each slot
+                # contributes only to the leading rows with count > slot.
+                "rows": np.searchsorted(-counts, -np.arange(slots)),
                 "denominator": np.array([members[period][2] for period in valid], dtype=np.float64),
             }
             separations.update(int(value) for value in used)
         self.separations = np.array(sorted(separations), dtype=np.int64)
+        self.track_offsets = np.concatenate(([0], np.cumsum(self.track_lengths, dtype=np.int64)))
 
     def matches(self, tracks: Sequence[np.ndarray], protein_length: int, periods, widths, settings) -> bool:
         return (
@@ -596,12 +610,22 @@ class WedgePlan:
         """Yield a matrix of start scores for the templates at each width."""
         if tuple(len(track) for track in tracks) != self.track_lengths:
             raise ValueError("tracks differ in shape from the plan")
+        if not len(self.separations):
+            return
         length = self.protein_length
         # Row d holds the reference's prefix sum of diagonal d, [0, cumsum(track)].
-        prefix = np.zeros((len(tracks), length + 1), dtype=np.float64)
-        for separation in self.separations:
-            track = np.asarray(tracks[separation], dtype=np.float64)
-            prefix[separation, 1 : len(track) + 1] = np.cumsum(track)
+        if _compiled_track_prefixes is not None and all(
+            isinstance(track, np.ndarray) and track.ndim == 1
+            and track.dtype == np.float64 and len(track) <= length for track in tracks
+        ):
+            prefix = _compiled_track_prefixes(
+                np.concatenate(tracks), self.track_offsets, self.separations, length
+            )
+        else:
+            prefix = np.zeros((len(tracks), length + 1), dtype=np.float64)
+            for separation in self.separations:
+                track = np.asarray(tracks[separation], dtype=np.float64)
+                prefix[separation, 1 : len(track) + 1] = np.cumsum(track)
         flat = prefix.reshape(-1)
         for width, layout in self.layouts.items():
             if layout is None:

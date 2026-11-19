@@ -52,3 +52,19 @@ def median_absolute_deviations(centered_sorted, centers, counts):
                 output[row] = middle
                 break
     return output
+
+
+@njit(cache=True, fastmath=False)
+def track_prefixes(values, offsets, used, length):
+    """Accumulate each requested diagonal in spatial order, starting at its first value."""
+    prefix = np.zeros((len(offsets) - 1, length + 1), dtype=np.float64)
+    for row in used:
+        first = offsets[row]
+        size = offsets[row + 1] - first
+        if size:
+            total = values[first]
+            prefix[row, 1] = total
+            for i in range(1, size):
+                total += values[first + i]
+                prefix[row, i + 1] = total
+    return prefix
