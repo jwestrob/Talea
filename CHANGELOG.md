@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.5.1
+
+- Accelerated inference with concurrent CUDA readouts, fused fp16 kernels, grouped attention correction, ordered teacher transfers and compiled CPU postprocessing. The README gives the measured RTX A5000 configurations for one or two processes.
+- On 4,311 proteins, warmed single-process scoring improved from 100.01 s in v0.3.5 to 35.31 s. Two processes sharing one A5000 improved from 77.05 s to 31.88 s. Both configurations matched the 1,536-protein frozen-teacher replay and retained the same ranked hits at scores ≥2 and ≥3 in both confirmation runs.
+
 ## 0.3.5
 
 - **Open-versus-closed gate on the discovery score.** A linear probe on

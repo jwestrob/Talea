@@ -190,6 +190,44 @@ talea \
   --trust-remote-code
 ```
 
+### RTX A5000 throughput
+
+On Linux, install the optional compiled kernels with `python -m pip install -e '.[a5000]'` in an environment with CUDA-enabled PyTorch. The benchmark used one RTX A5000 and 14 logical CPUs. The following Bash array supplies the common scoring options for both layouts:
+
+```bash
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 NUMBA_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false
+common=(
+  --device cuda --dtype fp16 --trust-remote-code --capture-mode sdpa
+  --maximum-batch 96 --square-budget 24000000 --postprocess-mode process
+  --long-proteins window --record-workers 4 --readout-streams 2
+  --prefetch-forward --teacher-cuda-graph --fused-rotary --fused-swiglu
+  --group-equal-apc --shared-attention-mib 64 --teacher-owner-thread
+  --teacher-readback-records 8 --teacher-quantile-histogram --unit-residual
+  --early-apc --native-half-readout --early-gate record
+)
+```
+
+For a single instance, give the process all 14 allocated CPUs:
+
+```bash
+talea "${common[@]}" --postprocess-workers 10 -i proteins.faa -o predictions.jsonl
+```
+
+For two independent inputs sharing the card, assign each process seven distinct CPU IDs from your allocation. Replace the example ranges below with those IDs. Both processes use the same visible GPU.
+
+```bash
+paired=("${common[@]}" --postprocess-workers 3 --fused-apc full --skip-all-valid-mask)
+taskset -c 0-6 talea "${paired[@]}" -i cohort-a.faa -o a.jsonl & pid_a=$!
+taskset -c 7-13 talea "${paired[@]}" -i cohort-b.faa -o b.jsonl & pid_b=$!
+status=0
+wait "$pid_a" || status=$?
+wait "$pid_b" || status=$?
+test "$status" -eq 0
+```
+
+On a 4,311-protein panel of intact batches, warmed scoring took 35.31 s with one instance and 31.88 s with two. Stock v0.3.5 took 100.01 s and 77.05 s, respectively, on the same panel. The two-instance times are the elapsed time to score both cohorts together. CLI startup and checkpoint loading add time to a fresh invocation.
+
 ### Automatic device selection
 
 ```bash
@@ -378,7 +416,7 @@ length-sorts inputs and constrains batches by
   elsewhere.
 - Attention matrices, residue embeddings, and residue-state tracks are reduced
   in memory and are not retained on disk.
-- For reproducibility and memory efficiency, run one Talea process per GPU.
+- One process per GPU minimizes model memory. The RTX A5000 throughput example above also covers two resident processes sharing a card.
 
 The 2,046-aa ceiling is part of the frozen deployment contract, not a
 fundamental limit of the method. Longer proteins are scored only on request,
