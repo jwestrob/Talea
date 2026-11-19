@@ -600,6 +600,7 @@ class TaleaPredictor:
         self._graph_readout_stream = None
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
+        self.fused_qk_calls = 0
         self.fused_rotary_calls = 0
         self.fused_swiglu_calls = 0
         self.unit_placement = unit_placement
@@ -945,6 +946,7 @@ class TaleaPredictor:
         teacher_quantile_histogram: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
+        fused_qk: bool = False,
         fused_swiglu: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
@@ -1225,11 +1227,17 @@ class TaleaPredictor:
                     mode=capture_mode,
                 )
             )
+            self.fused_qk_calls = 0
+            qk_calls = [0]
+            if fused_qk:
+                from talea.qk import fused_qk_context
+                qk_calls = stack.enter_context(fused_qk_context(capture.blocks, self.device))
+                stack.callback(lambda: setattr(self, "fused_qk_calls", qk_calls[0]))
             self.fused_rotary_calls = 0
             if fused_rotary:
                 from talea.rotary import fused_rotary_context
                 rotary_calls = stack.enter_context(fused_rotary_context(capture.blocks, self.device))
-                stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0]))
+                stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0] + qk_calls[0]))
             self.fused_swiglu_calls = 0
             if fused_swiglu:
                 from talea.swiglu import swiglu_context
