@@ -134,12 +134,14 @@ def _half_histogram(words):
 
 @njit(cache=True, nogil=True)
 def _write_half_tiles(words, tiles, table, starts):
+    # The validated negative-zero word maps to the final lookup entry.
+    last = len(table) - 1
     for i, start in enumerate(starts):
         first = max(start, 0)
         stop = min(start + tiles.shape[-1], words.shape[0])
         for y in range(first, stop):
             for x in range(first, stop):
-                tiles[i, y-start, x-start] = table[words[y, x]]
+                tiles[i, y-start, x-start] = table[min(words[y, x], last)]
 
 
 @njit(cache=True, nogil=True)
@@ -150,7 +152,7 @@ def _last_half_bin(counts):
     return 0
 
 
-def _half_normalization_table(matrix, quantile, denominator, compact=False):
+def _half_normalization_table(matrix, quantile, denominator):
     words = matrix.view(np.uint16)
     counts, count = _half_histogram(words)
     if not count:
@@ -158,14 +160,11 @@ def _half_normalization_table(matrix, quantile, denominator, compact=False):
     levels = _half_levels()
     lower, upper, fraction = _quantile_bins(counts, count, quantile)
     scale = float(levels[lower]) if lower == upper else float(np.quantile(levels[[lower, upper]], fraction))
-    if compact:
-        # Include every observed positive word and keep a distinct signed-zero slot.
-        last = _last_half_bin(counts)
-        compact_levels = np.empty(last + 2, dtype=np.float32)
-        compact_levels[:-1] = levels[:last + 1]
-        compact_levels[-1] = levels[0x8000]
-        levels = compact_levels
-    table = levels / scale
+    # Include every observed positive word and keep a distinct signed-zero slot.
+    last = _last_half_bin(counts)
+    table = np.empty(last + 2, dtype=np.float32)
+    np.divide(levels[:last + 1], scale, out=table[:-1])
+    table[-1] = levels[0x8000]
     np.log1p(table, out=table)
     np.divide(np.clip(table, 0., denominator), denominator, out=table)
     return table
@@ -176,7 +175,7 @@ def native_half_tables(matrices, quantile, clip):
     if not 0.5 <= quantile < 1.0 or clip <= 0:
         raise ValueError("invalid attention normalization quantile or clip")
     denominator = np.log1p(clip)
-    channels = [_half_normalization_table(matrix, quantile, denominator, compact=True) for matrix in matrices]
+    channels = [_half_normalization_table(matrix, quantile, denominator) for matrix in matrices]
     width = max((len(table) for table in channels if table is not None), default=2)
     tables = np.zeros((len(channels), width), dtype=np.float32)
     for dest, table in zip(tables, channels, strict=True):
