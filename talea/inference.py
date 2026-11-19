@@ -1230,6 +1230,7 @@ class TaleaPredictor:
         async_teacher_readback: bool = False,
         readout_square_budget: int = 1024 ** 2,
         readout_lookahead: bool = False,
+        canonical_token_inputs: bool = False,
         teacher_quantile_histogram: bool = False,
         native_half_readout: bool = False,
         device_teacher_tiles: bool = False,
@@ -1376,6 +1377,12 @@ class TaleaPredictor:
         if not values:
             return
         self._validate_records(values)
+        token_table = None
+        if canonical_token_inputs:
+            from talea._canonical_inputs import canonical_batch, canonical_token_table
+
+            token_table = canonical_token_table(self.tokenizer)
+        self.canonical_token_inputs_active = token_table is not None
         if capture_mode == "auto":
             # sdpa is faster and fine on CUDA; on Apple MPS its kernels grow the
             # driver's allocation over many long, variable-length batches until
@@ -1643,17 +1650,20 @@ class TaleaPredictor:
 
             @torch.inference_mode()
             def forward(batch):
-                tokenized = self.tokenizer(
-                    [record.sequence for record in batch],
-                    return_tensors=None,
-                    padding=True,
-                    return_special_tokens_mask=True,
-                )
-                # The fast tokenizer already pads rectangular lists. Construct
-                # tensors directly to avoid Transformers flattening every list
-                # in Python before handing it to torch.
-                tokenized = {k: torch.from_numpy(np.asarray(v)) for k, v in tokenized.items()}
-                residue_indices = _batch_residue_indices(tokenized, batch, self.device)
+                if token_table is not None:
+                    tokenized, residue_indices = canonical_batch(batch, token_table, self.device)
+                else:
+                    tokenized = self.tokenizer(
+                        [record.sequence for record in batch],
+                        return_tensors=None,
+                        padding=True,
+                        return_special_tokens_mask=True,
+                    )
+                    # The fast tokenizer already pads rectangular lists. Construct
+                    # tensors directly to avoid Transformers flattening every list
+                    # in Python before handing it to torch.
+                    tokenized = {k: torch.from_numpy(np.asarray(v)) for k, v in tokenized.items()}
+                    residue_indices = _batch_residue_indices(tokenized, batch, self.device)
                 model_inputs = {
                     key: value.to(self.device)
                     for key, value in tokenized.items()

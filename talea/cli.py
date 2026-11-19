@@ -92,6 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="clear excluded APC entries in one pass, using a mask or sparse indices")
     parser.add_argument("--group-equal-apc", action="store_true",
                         help="group CUDA attention correction for records with identical residue spans")
+    parser.add_argument("--canonical-token-inputs", action="store_true",
+                        help="prepare input tensors directly for the verified ESM++ character tokenizer")
     parser.add_argument("--readout-lookahead", action="store_true",
                         help="queue a second wave of record readouts within the square budget")
     parser.add_argument("--readout-square-budget", type=int, default=1024 ** 2,
@@ -295,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"readout_lookahead": True} if args.readout_lookahead else {}),
+        **({"canonical_token_inputs": True} if args.canonical_token_inputs else {}),
         **({"hidden_graph_min_uses": args.hidden_graph_min_uses} if args.hidden_graph_min_uses else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
@@ -373,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"readout_lookahead": True} if args.readout_lookahead else {}),
+        **({"canonical_token_inputs_active": predictor.canonical_token_inputs_active} if args.canonical_token_inputs else {}),
         **({"hidden_graph_min_uses": args.hidden_graph_min_uses} if args.hidden_graph_min_uses else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
