@@ -119,3 +119,16 @@ def test_screened_harmonic_bins_keep_original_blas_scores_and_ties(monkeypatch):
             expected = attention._compact_harmonic_calls(spectrum, n)
             monkeypatch.setattr(attention, "_compiled_harmonic_screen", screen_harmonic_bins)
             assert attention._compact_harmonic_calls(spectrum, n) == expected
+
+
+def test_zero_padded_fft_preserves_the_individual_transform_powers(monkeypatch):
+    rng = np.random.default_rng(1389)
+    verified_build = attention._PADDED_SCALAR_FFT
+    for length in (3, 31, 64, 96, 129, 256, 511):
+        for rows in (rng.uniform(-1.0, 1.0, (9, length)), rng.choice([-0., 0., 1., -1.], (9, length))):
+            for ending in (np.zeros(9), rng.choice([-0., 0.], 9), rng.normal(size=9)):
+                rows[:, -1] = ending
+                expected = np.abs(np.stack([np.fft.rfft(row) for row in rows]))
+                for enabled in (False, verified_build):
+                    monkeypatch.setattr(attention, "_PADDED_SCALAR_FFT", enabled)
+                    assert np.abs(attention._window_fft(rows)).tobytes() == expected.tobytes()
