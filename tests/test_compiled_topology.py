@@ -105,3 +105,17 @@ def test_compiled_wedge_peak_and_row_normalization_match_reference(monkeypatch):
             m.setattr(wedge, "_compiled_wedge_winner", None)
             ref_call = wedge.best_wedge_interval(tracks, n, periods, widths)
         assert wedge.best_wedge_interval(tracks, n, periods, widths) == ref_call
+
+
+def test_screened_harmonic_bins_keep_original_blas_scores_and_ties(monkeypatch):
+    from talea._attention_numba import screen_harmonic_bins
+
+    rng = np.random.default_rng(138)
+    for n in (32, 65, 256, 512):
+        shape = (4, n // 2 + 1)
+        for spectrum in (rng.normal(1, 5, shape), rng.integers(0, 4, shape).astype(float),
+                         np.nextafter(np.ones(shape), 2.0), np.full(shape, 8.0), np.zeros(shape)):
+            monkeypatch.setattr(attention, "_compiled_harmonic_screen", None)
+            expected = attention._compact_harmonic_calls(spectrum, n)
+            monkeypatch.setattr(attention, "_compiled_harmonic_screen", screen_harmonic_bins)
+            assert attention._compact_harmonic_calls(spectrum, n) == expected
