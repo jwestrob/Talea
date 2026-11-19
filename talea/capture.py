@@ -96,6 +96,7 @@ class SelectiveCapture:
             raise ValueError(f"unsupported capture mode: {mode}")
         self.model = model
         self.mode = mode
+        self.all_tokens_valid = False
         self.attention_layers = tuple(int(value) for value in attention_layers)
         self.blocks = _blocks(model)
         self.n_blocks = len(self.blocks)
@@ -135,7 +136,7 @@ class SelectiveCapture:
                 query_BHLD,
                 key_BHLD,
                 value_BHLD,
-                attention_mask_4d,
+                None if self.all_tokens_valid else attention_mask_4d,
                 output_s_max,
             )
             if capture:
@@ -167,7 +168,7 @@ class SelectiveCapture:
                 query_BHLD,
                 key_BHLD,
                 value_BHLD,
-                attention_mask_4d,
+                None if self.all_tokens_valid else attention_mask_4d,
                 output_s_max,
             )
             sink[block_index] = weights.detach()

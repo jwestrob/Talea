@@ -946,6 +946,7 @@ class TaleaPredictor:
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
+        skip_all_valid_mask: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         shared_attention_mib: int = 0,
@@ -1262,6 +1263,15 @@ class TaleaPredictor:
                     for key, value in tokenized.items()
                     if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
+                if skip_all_valid_mask:
+                    # Evaluate the tokenizer mask on CPU, before the ESM forward.
+                    # Only a padding-only mask can be simplified this way.
+                    padding_mask = tokenized.get("attention_mask")
+                    capture.all_tokens_valid = (
+                        "sequence_id" not in model_inputs
+                        and padding_mask is not None
+                        and bool(padding_mask.all())
+                    )
                 capture.reset()
                 try:
                     model_output = self.esm_model(

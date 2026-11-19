@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fp16", "fp32", "bf16"),
         default="auto",
     )
+    parser.add_argument("--skip-all-valid-mask", action="store_true", help="skip the manual ESM++ padding-mask operation for fully valid batches")
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
@@ -258,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
+        **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         "group_equal_apc": args.group_equal_apc,
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph,
@@ -315,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
            if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
+        **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
