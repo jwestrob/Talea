@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import median_filter
 
-from talea.physical import score_signals, window_plan
+from talea.physical import best_harmonic_comb, score_signals, window_plan
 
 
 # Above this side length the vectorized path's (L, L+1) working grid stops
@@ -106,6 +106,96 @@ def score_attention_window(
         float(np.median(np.abs(profile - center))) if len(profile) else 0.0
     )
     return call
+
+
+def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
+    """Score rows of equal-length diagonal profiles with independent transforms.
+
+    Reductions are along each contiguous row. Run each FFT independently to keep
+    the same single-transform kernel as the scalar implementation on every CPU.
+    """
+    n = profiles.shape[1]
+    width = min(31, n if n % 2 else n - 1)
+    residual = profiles - median_filter(profiles, size=(1, width), mode="nearest")
+    time = np.arange(n, dtype=np.float64) - (n - 1) / 2
+    centered = residual - residual.mean(axis=1, keepdims=True)
+    slopes = np.sum(centered * time, axis=1, keepdims=True) / np.dot(time, time)
+    centered -= time * slopes
+    deviations = centered.std(axis=1, keepdims=True)
+    normalized = np.divide(centered, deviations, out=np.zeros_like(centered), where=deviations > 1e-12)
+    window = np.hanning(n)
+    transformed = np.stack([np.fft.rfft(row) for row in normalized * window])
+    log_power = np.log1p(np.abs(transformed) ** 2 / np.sum(window**2))
+    width = min(15, max(5, (log_power.shape[1] // 8) | 1))
+    residual = log_power - median_filter(log_power, size=(1, width), mode="nearest")
+    usable = residual[:, 2:]
+    center = np.median(usable, axis=1, keepdims=True)
+    scale = 1.4826 * np.median(np.abs(usable - center), axis=1, keepdims=True)
+    small = scale[:, 0] < 1e-8
+    scale[small, 0] = usable[small].std(axis=1)
+    spectral_z = np.divide(residual - center, scale, out=np.zeros_like(residual), where=scale >= 1e-8)
+    calls = []
+    for spectrum in spectral_z:
+        call = best_harmonic_comb(spectrum, n, max_period=min(250.0, n / 3))
+        calls.append({"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics})
+    return calls
+
+
+def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
+    """Shared window sums for the binary16 storage grid.
+
+    Every binary16 value is an integer multiple of 2**-24. For up to 8192
+    entries of magnitude <= 65504, each possible partial sum is an exact
+    float64. Subtracting two prefixes therefore gives the same bits as summing
+    the subwindow directly. Arbitrary floating-point input uses the scalar
+    summation order unless it meets the same exactness conditions.
+    """
+    length = len(matrix)
+    if matrix.dtype not in (np.float16, np.float32) or length > 8192:
+        return None
+    if not np.max(np.abs(matrix)) <= 65504:
+        return None
+    if matrix.dtype == np.float32:
+        scaled = np.ldexp(matrix, 24)
+        if not np.array_equal(scaled, np.rint(scaled)):
+            return None
+    # Flat index i*(length+1)+d is the element (i, i+d). Right padding
+    # keeps the final row's unused columns inside the underlying allocation.
+    flat = np.pad(matrix.ravel(), (0, width - 1))
+    diagonals = np.lib.stride_tricks.sliding_window_view(flat, width)[::length + 1].T
+    prefix = np.empty((width, length + 1), dtype=np.float64)
+    prefix[:, 0] = 0.0
+    np.cumsum(diagonals, axis=1, dtype=np.float64, out=prefix[:, 1:])
+    return prefix
+
+
+
+def compact_window_calls(matrix: np.ndarray, spans: list[tuple[int, int]], whole: dict | None) -> dict:
+    """Score the fields consumed by the topology calibration, batched by window length."""
+    by_size: dict[int, list[tuple[int, int]]] = {}
+    result = {}
+    for start, end in spans:
+        if whole is not None and start == 0 and end == len(matrix):
+            result[(start, end)] = whole
+        else:
+            by_size.setdefault(end - start, []).append((start, end))
+    prefix = None
+    if by_size and len(spans) >= 8:
+        prefix = _exact_diagonal_prefix(matrix, max(by_size))
+    for width, group in by_size.items():
+        if len(group) < 2 or width < 8:
+            for start, end in group:
+                result[(start, end)] = score_attention_window(matrix[start:end, start:end], include_diagnostics=False)
+            continue
+        if prefix is None:
+            profiles = np.stack([diagonal_mean_profile(matrix[start:end, start:end]) for start, end in group])
+        else:
+            starts = np.array([start for start, end in group])[:, None]
+            offsets = np.arange(1, width)
+            counts = width - offsets
+            profiles = (prefix[offsets, starts + counts] - prefix[offsets, starts]) / counts
+        result.update(zip(group, _batched_window_calls(profiles), strict=True))
+    return result
 
 
 def scan_attention_matrix(

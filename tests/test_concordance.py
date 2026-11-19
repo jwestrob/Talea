@@ -503,3 +503,32 @@ def test_worker_entry_point_reproduces_direct_call():
     finally:
         pool_module._CONFIGS = saved
     assert direct == viaworker
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_batched_window_spectra_match_individual_windows(dtype):
+    from talea.attention import compact_window_calls, score_attention_window
+    from talea.physical import window_plan
+
+    rng = np.random.default_rng(194)
+    matrix = (rng.uniform(size=(321, 321)) - 0.5).astype(dtype)
+    # Exercise both the exact prefix sums and the high-precision fallback.
+    if dtype == np.float16:
+        matrix = matrix.astype(np.float32)
+    spans = window_plan(len(matrix), window_sizes=(7, 32, 64, 95, 128, 256, 384))
+    expected = {
+        span: score_attention_window(matrix[span[0]:span[1], span[0]:span[1]], include_diagnostics=False)
+        for span in spans
+    }
+    assert compact_window_calls(matrix, spans, expected[(0, len(matrix))]) == expected
+
+
+def test_batched_window_calls_match_flat_profiles():
+    from talea.attention import _batched_window_calls, local_distance_residual
+    from talea.physical import score_signals
+
+    profiles = np.stack((np.zeros(63), np.full(63, 7.0), np.arange(63.0)))
+    observed = _batched_window_calls(profiles)
+    for row, item in zip(profiles, observed, strict=True):
+        call = score_signals(local_distance_residual(row)[:, None], max_period=len(row) / 3)
+        assert item == {"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics}

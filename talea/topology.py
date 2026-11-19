@@ -7,7 +7,7 @@ import math
 import numpy as np
 
 from talea.application import frozen_operational_scores, frozen_spectrum_score
-from talea.attention import score_attention_window
+from talea.attention import compact_window_calls, score_attention_window
 from talea.physical import window_plan
 from talea.phase_ssm import apply_placement, place_units
 from talea.regions import SECONDARY_MINIMUM_STATE, secondary_wedge_calls
@@ -62,16 +62,18 @@ def fused_local_windows(
         int(key): value for key, value in calibration["parameters"].items()
     }
     whole_scores = {} if whole_scores is None else whole_scores
+    spans = sorted(window_plan(protein_length, window_sizes=window_sizes))
+    scores = {
+        layer: compact_window_calls(matrices[layer], spans, whole_scores.get(layer))
+        for layer in layers
+    }
     fused = []
-    for start, end in sorted(window_plan(protein_length, window_sizes=window_sizes)):
+    for start, end in spans:
         window_size = end - start
-        by_layer = {}
-        for layer in layers:
-            if start == 0 and end == protein_length and layer in whole_scores:
-                score = whole_scores[layer]
-            else:
-                score = score_attention_window(matrices[layer][start:end, start:end], include_diagnostics=False)
-            by_layer[layer] = {"window_size": window_size, "attention": score}
+        by_layer = {
+            layer: {"window_size": window_size, "attention": scores[layer][(start, end)]}
+            for layer in layers
+        }
         zscores = {
             layer: window_zscore(by_layer[layer], protein_length, parameters[layer])
             for layer in layers
