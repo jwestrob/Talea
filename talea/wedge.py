@@ -20,21 +20,26 @@ _compiled_wedge_scores = None
 _compiled_mad = None
 _compiled_track_prefixes = None
 _compiled_padded_diagonals = None
+_compiled_wedge_winner = None
+_compiled_normalize = None
 
 
 def enable_compiled_wedge_scores() -> None:
     """Compile on first use in long-lived process workers when Numba is installed."""
     global _compiled_wedge_scores, _compiled_mad, _compiled_track_prefixes, _compiled_padded_diagonals
+    global _compiled_wedge_winner, _compiled_normalize
     try:
         from numba import config
         if config.DISABLE_JIT:
             return
         from talea._wedge_numba import (
-            scores_from_prefixes, median_absolute_deviations, track_prefixes, padded_diagonals_f32,
+            scores_from_prefixes, median_absolute_deviations, track_prefixes, padded_diagonals_f32, best_from_prefixes, normalize_sorted_f32,
         )
     except ImportError:
         return
     _compiled_wedge_scores = scores_from_prefixes
+    _compiled_wedge_winner = best_from_prefixes
+    _compiled_normalize = normalize_sorted_f32
     _compiled_mad = median_absolute_deviations
     _compiled_track_prefixes = track_prefixes
     _compiled_padded_diagonals = padded_diagonals_f32
@@ -182,6 +187,16 @@ def _normalized_diagonals(matrix, max_separation, baseline_quantile, clip):
         padded = padded.astype(np.float64)
     ordered = np.sort(padded, axis=1)
     baseline = _sorted_row_quantile(ordered, counts, baseline_quantile)
+    if (padded.dtype == np.float32 and _compiled_normalize is not None and np.isfinite(clip)
+            and np.isfinite(ordered[np.arange(maximum), counts - 1]).all()):
+        normalized, needs_std = _compiled_normalize(padded, ordered, baseline, counts, clip)
+        for row in np.flatnonzero(needs_std):
+            size = counts[row]
+            centered = padded[row, :size].astype(np.float64) - baseline[row]
+            scale = float(np.std(centered))
+            if scale >= 1e-12:
+                normalized[row, :size] = np.clip(centered / scale, -clip, clip)
+        return normalized
     centered_sorted = ordered - baseline[:, None]
     median = _sorted_row_median(centered_sorted, counts)
     centered = padded - baseline[:, None]
@@ -591,7 +606,7 @@ class WedgePlan:
             d for d in range(1, len(self.track_lengths))
             if self.track_lengths[d] != self.protein_length - d
         )
-        separations = set()
+        separation_mask = np.zeros(len(self.track_lengths), dtype=bool)
         for width in sorted({min(value, self.protein_length) for value in self.requested_widths}):
             maximum = min(len(self.track_lengths) - 1, width - 1)
             members = {
@@ -605,18 +620,25 @@ class WedgePlan:
             if not valid:
                 self.layouts[width] = None
                 continue
-            used = np.array(sorted({value for period in valid for value in members[period][0]}), dtype=np.int64)
-            position = {int(value): index for index, value in enumerate(used)}
             slots = len(members[valid[0]][0])
-            index = np.zeros((len(valid), slots), dtype=np.int64)
+            # Fill unused slots with a real separation so they do not enlarge
+            # the gather. Per-template counts determine which slots contribute.
+            first_separation = members[valid[0]][0][0]
+            index = np.full((len(valid), slots), first_separation, dtype=np.int64)
             weight = np.zeros((len(valid), slots), dtype=np.float64)
             for row, period in enumerate(valid):
                 offsets, weights, _ = members[period]
-                index[row, : len(offsets)] = [position[value] for value in offsets]
+                index[row, : len(offsets)] = offsets
                 weight[row, : len(weights)] = weights
+            used_mask = np.zeros(maximum + 1, dtype=bool)
+            used_mask[index] = True
+            used = np.flatnonzero(used_mask)
+            positions = np.cumsum(used_mask) - 1
+            index = positions[index]
             counts = np.array([len(members[period][0]) for period in valid])
             self.layouts[width] = {
                 "periods": tuple(valid),
+                "period_values": np.asarray(valid),
                 "used": used,
                 "index": index,
                 "weight": weight,
@@ -626,8 +648,8 @@ class WedgePlan:
                 "rows": np.searchsorted(-counts, -np.arange(slots)),
                 "denominator": np.array([members[period][2] for period in valid], dtype=np.float64),
             }
-            separations.update(int(value) for value in used)
-        self.separations = np.array(sorted(separations), dtype=np.int64)
+            separation_mask[used] = True
+        self.separations = np.flatnonzero(separation_mask)
         self.track_offsets = np.concatenate(([0], np.cumsum(self.track_lengths, dtype=np.int64)))
 
     def matches(self, tracks: Sequence[np.ndarray], protein_length: int, periods, widths, settings) -> bool:
@@ -647,8 +669,8 @@ class WedgePlan:
             for row, period in enumerate(periods)
         }
 
-    def _width_scores(self, tracks: Sequence[np.ndarray]):
-        """Yield a matrix of start scores for the templates at each width."""
+    def _prefix(self, tracks: Sequence[np.ndarray]):
+        """Build spatial prefix sums for the separations used by the plan."""
         if tuple(len(track) for track in tracks) != self.track_lengths:
             raise ValueError("tracks differ in shape from the plan")
         if not len(self.separations):
@@ -671,6 +693,14 @@ class WedgePlan:
             for separation in self.separations:
                 track = np.asarray(tracks[separation], dtype=np.float64)
                 prefix[separation, 1 : len(track) + 1] = np.cumsum(track)
+        return prefix
+
+    def _width_scores(self, tracks: Sequence[np.ndarray]):
+        """Yield a matrix of start scores for the templates at each width."""
+        prefix = self._prefix(tracks)
+        if prefix is None:
+            return
+        length = self.protein_length
         flat = prefix.reshape(-1)
         for width, layout in self.layouts.items():
             if layout is None:
@@ -697,6 +727,45 @@ class WedgePlan:
                     scores[:rows] += weight[:rows, slot, None] * sums[index[:rows, slot]]
                 scores /= layout["denominator"][:, None]
             yield width, layout["periods"], scores
+
+
+    def _width_peaks(self, tracks):
+        if _compiled_wedge_scores is not None and _compiled_wedge_winner is not None:
+            prefix = self._prefix(tracks)
+            if prefix is None:
+                return
+            for width, layout in self.layouts.items():
+                if layout is None:
+                    continue
+                row, start, score = _compiled_wedge_winner(
+                    prefix, width, layout["used"], layout["index"], layout["weight"],
+                    layout["counts"], layout["denominator"], layout["period_values"],
+                )
+                if row >= 0:
+                    yield width, layout["periods"][row], start, score
+            return
+        for width, row_periods, scores in self._width_scores(tracks):
+            # Collect the winning start for all periods of this width together.
+            # The reference visits ascending period, then width, then start.
+            valid = np.isfinite(scores)
+            if valid.all():
+                starts = np.argmax(scores, axis=1)
+                valid_rows = None
+            else:
+                valid_rows = valid.any(axis=1)
+                if not valid_rows.any():
+                    continue
+                starts = np.argmax(np.where(np.isnan(scores), -np.inf, scores), axis=1)
+            row_scores = scores[np.arange(len(starts)), starts]
+            if valid_rows is not None:
+                row_scores = np.where(valid_rows, row_scores, -np.inf)
+            maximum = np.max(row_scores)
+            tied_rows = np.flatnonzero(row_scores == maximum)
+            row = min(tied_rows, key=lambda index: row_periods[index])
+            period = row_periods[row]
+            start = int(starts[row])
+            score = float(scores[row, start])
+            yield width, period, start, score
 
 
 def best_wedge_interval(
@@ -733,27 +802,7 @@ def best_wedge_interval(
             )
         elif not plan.matches(tracks, protein_length, periods, widths, settings):
             raise ValueError("plan was built for a different search")
-        for width, row_periods, scores in plan._width_scores(tracks):
-            # Collect the winning start for all periods of this width together.
-            # The reference visits ascending period, then width, then start.
-            valid = np.isfinite(scores)
-            if valid.all():
-                starts = np.argmax(scores, axis=1)
-                valid_rows = None
-            else:
-                valid_rows = valid.any(axis=1)
-                if not valid_rows.any():
-                    continue
-                starts = np.argmax(np.where(np.isnan(scores), -np.inf, scores), axis=1)
-            row_scores = scores[np.arange(len(starts)), starts]
-            if valid_rows is not None:
-                row_scores = np.where(valid_rows, row_scores, -np.inf)
-            maximum = np.max(row_scores)
-            tied_rows = np.flatnonzero(row_scores == maximum)
-            row = min(tied_rows, key=lambda index: row_periods[index])
-            period = row_periods[row]
-            start = int(starts[row])
-            score = float(scores[row, start])
+        for width, period, start, score in plan._width_peaks(tracks):
             if best is None or (score, -period, -width) > (best["score"], -best["period"], -best["window_size"]):
                 best = {
                     "start": start,

@@ -86,3 +86,22 @@ def test_packed_median_suppression_matches_per_diagonal_partition():
             suppress_interval(tracks, start, end)
             suppress_packed(packed, offsets, separations, start, end)
             assert packed.tobytes() == np.concatenate(tracks).tobytes()
+
+
+def test_compiled_wedge_peak_and_row_normalization_match_reference(monkeypatch):
+    from talea import wedge
+    rng = np.random.default_rng(92)
+    wedge.enable_compiled_wedge_scores()
+    for n, quantile in [(64, 0.25), (109, 0.3), (206, 0.0), (301, 0.413)]:
+        matrix = rng.integers(0, 79, size=(n, n)).astype(np.float32)
+        matrix[: n // 3] = 0
+        with monkeypatch.context() as m:
+            m.setattr(wedge, "_compiled_normalize", None)
+            ref = wedge.robust_diagonal_tracks(matrix, 60, quantile)
+        tracks = wedge.robust_diagonal_tracks(matrix, 60, quantile)
+        assert all(a.tobytes() == b.tobytes() for a, b in zip(ref, tracks))
+        periods, widths = (7, 8.5, 19, 31), (16, 32, 72, 160)
+        with monkeypatch.context() as m:
+            m.setattr(wedge, "_compiled_wedge_winner", None)
+            ref_call = wedge.best_wedge_interval(tracks, n, periods, widths)
+        assert wedge.best_wedge_interval(tracks, n, periods, widths) == ref_call

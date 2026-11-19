@@ -160,6 +160,41 @@ def _phase_rotations(size: int, unit_length: int) -> tuple[np.ndarray, np.ndarra
 _cached_phase_rotations = lru_cache(maxsize=128)(_phase_rotations)
 
 
+@lru_cache(maxsize=6)
+def _phase_grid(capacity):
+    """Rotations for all decoder lengths up to 128 at one extent capacity."""
+    lengths = np.arange(1, 129)[:, None]
+    positions = np.arange(capacity)
+    return (np.exp(-2j * np.pi * positions / lengths),
+            np.exp(2j * np.pi * positions / lengths))
+
+
+def _grid_unit_tables(votes, emissions, minimum, weight, capacity):
+    n = len(votes)
+    count = len(emissions)
+    rotation, realign = _phase_grid(capacity)
+    phase_rows = slice(minimum - 1, minimum - 1 + count)
+    realign = realign[phase_rows, :n + 1]
+    phase = np.empty((count, n + 1), dtype=np.complex128)
+    phase[:, 0] = 0
+    np.cumsum(votes * rotation[phase_rows, :n], axis=1, out=phase[:, 1:])
+    emission = np.empty((count, n + 1), dtype=np.float64)
+    emission[:, 0] = 0
+    np.cumsum(emissions, axis=1, out=emission[:, 1:])
+    starts = np.arange(n + 1)
+    lengths = np.arange(minimum, minimum + count)[:, None]
+    ends = starts + lengths
+    stop = np.minimum(ends, n)
+    delta = np.take_along_axis(phase, stop, axis=1) - phase
+    emission_delta = np.take_along_axis(emission, stop, axis=1) - emission
+    full = np.where(ends <= n, weight * np.real(realign * delta) + emission_delta, -np.inf)
+    lead = np.where(starts < lengths, weight * np.real(realign * phase) + emission, -np.inf)
+    tail = np.where(ends > n,
+                    weight * np.real(realign * (phase[:, -1:] - phase)) + (emission[:, -1:] - emission),
+                    -np.inf)
+    return full.T, lead.T, tail.T
+
+
 def unit_tables(
     votes: np.ndarray,
     emissions: np.ndarray,
@@ -184,10 +219,13 @@ def unit_tables(
 
     n = len(votes)
     lengths = minimum_length + np.arange(emissions.shape[0])
+    capacity = 1 << n.bit_length()
+    if (1 <= minimum_length and len(lengths) and lengths[-1] <= 128 and capacity <= 2048
+            and isinstance(votes, np.ndarray) and votes.dtype == np.complex128 and emissions.dtype == np.float64):
+        return _grid_unit_tables(votes, emissions, minimum_length, phase_weight, capacity)
     full = np.full((n + 1, len(lengths)), -np.inf)
     lead = np.full((n + 1, len(lengths)), -np.inf)
     tail = np.full((n + 1, len(lengths)), -np.inf)
-    capacity = 1 << n.bit_length()
     for r, unit_length in enumerate(lengths):
         if capacity <= 4096:
             rotation, realign = _cached_phase_rotations(capacity, int(unit_length))
