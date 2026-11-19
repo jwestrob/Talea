@@ -380,6 +380,20 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype, ban
             if grouped is not None:
                 assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
 
+@pytest.mark.parametrize("length", [127, 128, 129, 151, 152])
+def test_protected_apc_row_layout_keeps_reference_values(length):
+    from talea.inference import _equal_length_apc
+
+    generator = torch.Generator().manual_seed(108)
+    x = torch.rand((3, 18, length + 2, length + 2), generator=generator).half()
+    span = slice(1, length + 1)
+    reference = _equal_length_apc(x, length, 6, torch.float16, span)
+    for mode in ("guarded_row", "aligned_row"):
+        result = _equal_length_apc(x, length, 6, torch.float16, span,
+                                   batched={mode, "column", "total", "head"})
+        assert torch.equal(reference.view(torch.int16), result.view(torch.int16))
+
+
 def test_record_workers_use_prefetch_or_ordinary_graph_stream(monkeypatch):
     from talea.inference import _record_worker_stream
     ordinary, readout = object(), object()

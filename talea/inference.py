@@ -313,7 +313,24 @@ def _aligned_record(tensor):
 def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None, batched=(), band_mode="off"):
     """Batch pointwise operations; retain each original reduction's shape and strides."""
     fused = fusion is not None and attention.dtype == torch.float16
-    if fused:
+    protected_rows = "guarded_row" in batched or "aligned_row" in batched
+    supported = protected_rows and attention.dtype == torch.float16 and attention.shape[1] == 18
+    # ATen's CUDA FP16 row sum uses four-element vector loads above L=128.
+    # An odd length shifts alternate 18-head records by two half elements.
+    pad_records = supported and "aligned_row" in batched and length > 128 and length % 2 == 1
+    batched_rows = "row" in batched or (supported and (length <= 128 or length % 2 == 0 or pad_records))
+    if pad_records:
+        batch, heads = attention.shape[:2]
+        area = length * length
+        symmetric = torch.empty_strided((batch, heads, length, length),
+                                        (heads * area + 2, area, length, 1),
+                                        device=attention.device, dtype=attention.dtype)
+        if fused:
+            fusion.symmetrize(attention, span.start, length, destination=symmetric)
+        else:
+            cropped = attention[:, :, span, span].contiguous()
+            torch.mul(cropped + cropped.transpose(-1, -2), 0.5, out=symmetric)
+    elif fused:
         symmetric = fusion.symmetrize(attention, span.start, length)
     else:
         cropped = attention[:, :, span, span].contiguous()
@@ -321,8 +338,8 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
     if batched:
         # Each reference reduction starts from an independently aligned allocation.
         records = (tuple(_aligned_record(record) for record in symmetric.unbind())
-                   if not all(which in batched for which in ("row", "column", "total")) else ())
-        rows = (symmetric.sum(dim=-1, keepdim=True) if "row" in batched else
+                   if not (batched_rows and "column" in batched and "total" in batched) else ())
+        rows = (symmetric.sum(dim=-1, keepdim=True) if batched_rows else
                 torch.stack([record.sum(dim=-1, keepdim=True) for record in records]))
         columns = (symmetric.sum(dim=-2, keepdim=True) if "column" in batched else
                    torch.stack([record.sum(dim=-2, keepdim=True) for record in records]))
@@ -1318,8 +1335,14 @@ class TaleaPredictor:
         """
 
         batched = frozenset(batched_apc_reductions.split(",")) if batched_apc_reductions else frozenset()
-        if not batched <= {"row", "column", "total", "head"}:
-            raise ValueError("batched_apc_reductions accepts row,column,total,head")
+        row_modes = batched & {"row", "guarded_row", "aligned_row"}
+        if len(row_modes) > 1 or not batched <= {"row", "guarded_row", "aligned_row", "column", "total", "head"}:
+            raise ValueError("batched_apc_reductions accepts one row mode (row,guarded_row,aligned_row) and column,total,head")
+        if row_modes & {"guarded_row", "aligned_row"} and not (
+            self.device.type == "cuda" and self.dtype == torch.float16 and torch.version.hip is None
+            and torch.__version__.partition("+")[0] == "2.7.1" and torch.cuda.get_device_capability(self.device) == (8, 6)
+        ):
+            batched = batched - row_modes
         if apc_band_mode not in ("off", "dense", "sparse"):
             raise ValueError("apc_band_mode must be off, dense or sparse")
         if grouped_apc_graph_min_uses < 0:

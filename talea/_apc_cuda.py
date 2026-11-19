@@ -5,7 +5,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _sym(source, symmetric, length, offset, heads, bs, hs, rs, cs, TILE: tl.constexpr):
+def _sym(source, symmetric, length, offset, heads, bs, hs, rs, cs, PAD: tl.constexpr, TILE: tl.constexpr):
     row = tl.program_id(0) * TILE + tl.arange(0, TILE)
     col = tl.program_id(1) * TILE + tl.arange(0, TILE)
     flat_head = tl.program_id(2)
@@ -19,16 +19,21 @@ def _sym(source, symmetric, length, offset, heads, bs, hs, rs, cs, TILE: tl.cons
     b = tl.trans(tl.load(base + peer, tl.trans(valid), 0)).to(tl.float32)
     summed = (a + b).to(tl.float16).to(tl.float32)
     out = (summed * 0.5).to(tl.float16)
-    tl.store(symmetric + (flat_head * length + row[:, None]) * length + col[None, :], out, valid)
+    dest = symmetric + (flat_head * length + row[:, None]) * length + col[None, :]
+    if PAD:
+        dest += (flat_head // heads) * PAD
+    tl.store(dest, out, valid)
 
 
 @triton.jit
-def _correct(symmetric, rows, cols, totals, length, TILE: tl.constexpr):
+def _correct(symmetric, rows, cols, totals, length, heads, PAD: tl.constexpr, TILE: tl.constexpr):
     row = tl.program_id(0) * TILE + tl.arange(0, TILE)
     col = tl.program_id(1) * TILE + tl.arange(0, TILE)
     head = tl.program_id(2)
     valid = (row[:, None] < length) & (col[None, :] < length)
     addr = symmetric + (head * length + row[:, None]) * length + col[None, :]
+    if PAD:
+        addr += (head // heads) * PAD
     x = tl.load(addr, valid, 0).to(tl.float32)
     r = tl.load(rows + head * length + row, row < length, 0).to(tl.float32)
     c = tl.load(cols + head * length + col, col < length, 0).to(tl.float32)
@@ -45,20 +50,25 @@ class FusedAPC:
     def __init__(self, mode):
         self.full = mode == "full"
 
-    def symmetrize(self, attention, start, length):
+    def symmetrize(self, attention, start, length, destination=None):
         x = attention.unsqueeze(0) if attention.ndim == 3 else attention
         batch, heads = x.shape[:2]
-        symmetric = torch.empty((batch, heads, length, length), dtype=x.dtype, device=x.device)
+        symmetric = destination
+        if symmetric is None:
+            symmetric = torch.empty((batch, heads, length, length), dtype=x.dtype, device=x.device)
+        pad = symmetric.stride(0) - heads * length * length
         grid = (triton.cdiv(length, 32), triton.cdiv(length, 32), batch * heads)
         with torch.cuda.device(x.device):
             _sym[grid](x, symmetric, length, start, heads, *x.stride(),
-                       TILE=32, enable_fp_fusion=False)
+                       PAD=pad, TILE=32, enable_fp_fusion=False)
         return symmetric[0] if attention.ndim == 3 else symmetric
 
     def correct(self, symmetric, rows, cols, totals):
         length = symmetric.shape[-1]
+        heads = symmetric.shape[-3]
+        pad = symmetric.stride(0) - heads * length * length if symmetric.ndim == 4 else 0
         n_heads = symmetric.numel() // (length * length)
         grid = (triton.cdiv(length, 32), triton.cdiv(length, 32), n_heads)
         with torch.cuda.device(symmetric.device):
-            _correct[grid](symmetric, rows, cols, totals, length, TILE=32, enable_fp_fusion=False)
+            _correct[grid](symmetric, rows, cols, totals, length, heads, PAD=pad, TILE=32, enable_fp_fusion=False)
         return symmetric

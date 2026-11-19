@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grouped-apc-graph-min-uses", type=int, default=0,
                         help="capture repeated full-sized APC groups on a CUDA readout stream (zero disables)")
     parser.add_argument("--batched-apc-reductions", default="",
-                        help="named reductions to apply across equal-length APC records (row,column,total,head)")
+                        help="equal-length APC reductions (one of row,guarded_row,aligned_row plus column,total,head)")
     parser.add_argument("--fused-apc", choices=("off", "sym", "full"), default="off",
                         help="fuse fp16 APC pointwise operations on an RTX A5000")
     parser.add_argument("--apc-band-mode", choices=("off", "dense", "sparse"), default="off",
