@@ -247,8 +247,7 @@ def _clear_apc_diagonals(matrix, separation, sparse=False):
 
 def _mask_apc_map(matrix, separation, mode):
     if mode != "off":
-        _clear_apc_diagonals(matrix, separation, sparse=mode == "sparse")
-        return matrix
+        return _clear_apc_diagonals(matrix, separation, sparse=mode == "sparse")
     if separation > 0:
         matrix = matrix.masked_fill(near_diagonal_mask(matrix.shape[-1], separation, matrix.device), 0)
     matrix.diagonal(dim1=-2, dim2=-1).fill_(0)
@@ -368,8 +367,9 @@ def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMEN
 class _GroupedAPCGraphs:
     """Replay a repeated equal-length APC group, keeping a single shape's graph."""
 
-    def __init__(self, minimum_uses):
+    def __init__(self, minimum_uses, capture_lock=None):
         self.minimum_uses = minimum_uses
+        self.capture_lock = capture_lock if capture_lock is not None else contextlib.nullcontext()
         self.key = None
         self.uses = 0
         self.graph = None
@@ -398,14 +398,14 @@ class _GroupedAPCGraphs:
             if self.capture_stream is None:
                 self.capture_stream = torch.cuda.Stream(device=attention.device)
             self.capture_stream.wait_stream(stream)
-            with torch.cuda.stream(self.capture_stream):
+            with self.capture_lock, torch.cuda.stream(self.capture_stream):
                 self.input = torch.empty_like(source, memory_format=torch.contiguous_format)
                 self.input.copy_(source)
                 cropped = slice(0, length)
                 # Keep the external cached distance mask alive for the graph.
                 self.mask = near_diagonal_mask(length, separation, source.device) if separation else None
                 self.band_indices = (_flat_band_indices(length, separation, source.device)
-                                     if band_mode == "sparse" and 1 < separation < length / 2 else None)
+                                     if band_mode == "sparse" and 1 < separation and 2 * separation < length else None)
                 _equal_length_apc(self.input, length, separation, dtype, cropped, fusion, batched, band_mode)
                 graph = torch.cuda.CUDAGraph()
                 graph.capture_begin(capture_error_mode="thread_local")
@@ -1287,10 +1287,13 @@ class TaleaPredictor:
             raise ValueError("apc_band_mode must be off, dense or sparse")
         if grouped_apc_graph_min_uses < 0:
             raise ValueError("grouped_apc_graph_min_uses must be nonnegative")
+        # Prefetch can start early APC for the next batch while the owner captures
+        # this batch's hidden graph. Only capture setup takes this shared lock.
+        graph_capture_lock = threading.Lock() if grouped_apc_graph_min_uses and hidden_graph_min_uses else None
         grouped_graphs = None
         self.grouped_apc_graph_stats = None
         if grouped_apc_graph_min_uses and group_equal_apc and self.device.type == "cuda":
-            grouped_graphs = _GroupedAPCGraphs(grouped_apc_graph_min_uses)
+            grouped_graphs = _GroupedAPCGraphs(grouped_apc_graph_min_uses, graph_capture_lock)
             self.grouped_apc_graph_stats = grouped_graphs.stats
         apc_fusion = _apc_fusion(self.device, self.dtype, fused_apc)
         self.apc_fusion_active = apc_fusion is not None
@@ -1490,7 +1493,7 @@ class TaleaPredictor:
         self.hidden_graph_stats = None
         if hidden_graph_min_uses and self.device.type == "cuda":
             from talea.hidden_graph import HiddenReadoutGraphs
-            hidden_graphs = HiddenReadoutGraphs(self, values, hidden_graph_min_uses)
+            hidden_graphs = HiddenReadoutGraphs(self, values, hidden_graph_min_uses, graph_capture_lock)
             self.hidden_graph_stats = hidden_graphs.stats
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)

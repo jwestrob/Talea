@@ -342,7 +342,8 @@ def test_device_autocast_matches_cpu_context():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
+@pytest.mark.parametrize("band_mode", ["off", "dense", "sparse"])
+def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype, band_mode):
     from talea.inference import _apc_head_mean_tensor, _equal_apc_groups, _grouped_apc_jobs, _layer_apc
     lengths = [63] * 11 + [64] * 5 + [65]
     positions = [(torch.arange(1, n + 1), slice(1, n + 1)) for n in lengths]
@@ -353,12 +354,12 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
     maps = {k: torch.rand(len(lengths), 18, 68, 68, generator=generator, dtype=dtype) / 68 for k in (13, 35)}
     stats = {"executed_groups": 0, "executed_records": 0}
     jobs = _grouped_apc_jobs(maps, (13, 35), positions, 4, torch.float16,
-                             groups=groups, stats=stats)
+                             groups=groups, stats=stats, band_mode=band_mode)
     with concurrent.futures.ThreadPoolExecutor(3) as pool:
         delivered = list(_ordered_readouts(lambda item: item, len(lengths), pool, width=3, items=jobs))
     assert [n for n, _ in delivered] == list(range(len(lengths)))
     assert stats == {"executed_groups": 2, "executed_records": 13}
-    early = {k: _layer_apc(value, positions, 4, torch.float16, grouped=True) for k, value in maps.items()}
+    early = {k: _layer_apc(value, positions, 4, torch.float16, grouped=True, band_mode=band_mode) for k, value in maps.items()}
     for n, grouped in delivered:
         ix, span = positions[n]
         for k in maps:

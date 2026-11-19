@@ -1,6 +1,7 @@
 """CUDA replay of the original per-record hidden readout operations for repeated lengths."""
 
 from collections import Counter
+from contextlib import nullcontext
 
 import torch
 
@@ -8,8 +9,9 @@ import torch
 class HiddenReadoutGraphs:
     """Own one repeatedly used sequence length in a sorted batch stream."""
 
-    def __init__(self, predictor, records, minimum_uses):
+    def __init__(self, predictor, records, minimum_uses, capture_lock=None):
         self.predictor = predictor
+        self.capture_lock = capture_lock if capture_lock is not None else nullcontext()
         counts = Counter(record.length for record in records)
         self.eligible = {length for length, count in counts.items() if count >= minimum_uses}
         self.layers = tuple(sorted(set(predictor.expected_layers) | set(predictor.openness_layers)))
@@ -57,7 +59,8 @@ class HiddenReadoutGraphs:
                 if self.length != length:
                     # Each capture has an independent pool. The previous length's
                     # graph, inputs and output can be released after enqueued use.
-                    self._capture(sources)
+                    with self.capture_lock:
+                        self._capture(sources)
                     self.length = length
                 torch._foreach_copy_(self.destinations, sources)
                 self.graph.replay()
