@@ -1037,6 +1037,7 @@ class TaleaPredictor:
         unit_residual: bool = False,
         early_apc: bool = False,
         early_gate: str = "off",
+        skip_all_valid_mask: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         teacher_graph_tracks: bool = False,
@@ -1410,6 +1411,15 @@ class TaleaPredictor:
                     for key, value in tokenized.items()
                     if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
+                if skip_all_valid_mask:
+                    # Evaluate the tokenizer mask on CPU, before the ESM forward.
+                    # Only a padding-only mask can be simplified this way.
+                    padding_mask = tokenized.get("attention_mask")
+                    capture.all_tokens_valid = (
+                        "sequence_id" not in model_inputs
+                        and padding_mask is not None
+                        and bool(padding_mask.all())
+                    )
                 capture.reset()
                 if early_readout:
                     for indices, _ in residue_indices:
