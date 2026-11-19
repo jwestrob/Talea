@@ -169,9 +169,14 @@ def secondary_wedge_calls(
             work[separation] = np.array(tracks[separation], dtype=np.float64, copy=True)
         use_kernel = False
 
+    median_state = None
+    if use_kernel:
+        size = len(plan.separations)
+        median_state = np.empty(size, dtype=np.float64), np.zeros(size, dtype=np.uint8)
+
     def suppress(start, end):
         if use_kernel:
-            _compiled_suppress(work.values, plan.track_offsets, plan.separations, start, end)
+            _compiled_suppress(work.values, plan.track_offsets, plan.separations, start, end, median_state)
         else:
             suppress_interval(work, start, end, separations=plan.separations)
 
