@@ -240,7 +240,8 @@ class CudaTeacherGraphs:
             side = torch.cuda.Stream(device=device)
             side.wait_stream(self.stream)
         with torch.cuda.device(device), torch.cuda.stream(side):
-            indices = prepare_teacher_readout(model, contract, device) if pack_tracks else None
+            # Captured indexing kernels retain this device address across replays.
+            self._track_indices = prepare_teacher_readout(model, contract, device) if pack_tracks else None
             workspace = torch.cuda.graph_pool_handle() if shared_pool else None
             for size in range(1, int(contract["model"]["batch_size"]) + 1):
                 static = torch.zeros((size, channels, tile_size, tile_size),
@@ -252,6 +253,7 @@ class CudaTeacherGraphs:
                 with torch.cuda.graph(graph, stream=side, pool=workspace):
                     output = model(static)
                     if pack_tracks:
+                        indices = self._track_indices
                         diagonal = output[:, :, indices, indices]
                         self.track_outputs[size] = _pack_teacher_diagonal(diagonal, len(contract["teacher"]["class_names"]))
                 # Static inputs live outside capture. Only this graph reads them.
