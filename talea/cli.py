@@ -69,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--group-equal-apc", action="store_true",
                         help="group CUDA attention correction for records with identical residue spans")
+    parser.add_argument("--readout-square-budget", type=int, default=1024 ** 2,
+                        help="square residue elements available for concurrent per-record readouts")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
     parser.add_argument(
         "--prefetch-forward", action="store_true",
@@ -261,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
         **({"native_half_readout": True} if args.native_half_readout else {}),
+        **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
@@ -322,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
         **({"native_half_readout": True} if args.native_half_readout else {}),
+        **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}
