@@ -275,3 +275,31 @@ def test_prepared_teacher_readout_preserves_tracks_across_partial_batches():
     model.dropout.train()
     teacher_tracks_from_attention(model, {13: matrix, 35: matrix}, contract, device)
     assert not model.dropout.training
+
+
+def test_shared_teacher_pool_owns_all_outputs_across_replays():
+    from talea.production import CudaTeacherGraphs
+    from types import SimpleNamespace
+    from threading import RLock
+
+    teacher = CudaTeacherGraphs.__new__(CudaTeacherGraphs)
+    teacher.shared_pool = True
+    teacher._check_workspace_owner = lambda: None
+    storage = torch.empty((2, 3, 4, 4))
+    tracks = torch.empty((2, 4, 3))
+    teacher._locks, teacher.graphs, teacher.track_outputs = {}, {}, {}
+    for n in (1, 2):
+        static = torch.zeros_like(storage[:n])
+        def replay(static=static, n=n):
+            storage[:n].copy_(static)
+            tracks[:n].copy_(static.diagonal(dim1=2, dim2=3).transpose(1, 2))
+        teacher.graphs[n] = SimpleNamespace(replay=replay), static, storage[:n]
+        teacher.track_outputs[n] = tracks[:n]
+        teacher._locks[n] = RLock()
+    held = []
+    for value, n in enumerate((2, 1, 2, 1), start=1):
+        features = torch.full_like(storage[:n], value)
+        held.extend((value, result) for result in (
+            teacher(features), teacher.diagonal(features, torch.arange(4)), teacher.probabilities(features),
+        ))
+    assert all(torch.all(result == value) for value, result in held)

@@ -220,8 +220,11 @@ def _pack_teacher_diagonal(diagonal, teacher_classes):
 class CudaTeacherGraphs:
     """Replay the frozen U-Net at its original tile-batch sizes on one stream."""
 
+    shared_pool = False
+
     @torch.inference_mode()
-    def __init__(self, model, contract, device, pack_tracks=False):
+    def __init__(self, model, contract, device, pack_tracks=False, shared_pool=False):
+        self.shared_pool = shared_pool
         self.pack_tracks = pack_tracks
         self.track_outputs = {}
         self.stream = torch.cuda.current_stream(device)
@@ -238,6 +241,7 @@ class CudaTeacherGraphs:
             side.wait_stream(self.stream)
         with torch.cuda.device(device), torch.cuda.stream(side):
             indices = prepare_teacher_readout(model, contract, device) if pack_tracks else None
+            workspace = torch.cuda.graph_pool_handle() if shared_pool else None
             for size in range(1, int(contract["model"]["batch_size"]) + 1):
                 static = torch.zeros((size, channels, tile_size, tile_size),
                                      dtype=torch.float32, device=device)
@@ -245,26 +249,39 @@ class CudaTeacherGraphs:
                 for _ in range(3):
                     model(static)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=side):
+                with torch.cuda.graph(graph, stream=side, pool=workspace):
                     output = model(static)
                     if pack_tracks:
                         diagonal = output[:, :, indices, indices]
                         self.track_outputs[size] = _pack_teacher_diagonal(diagonal, len(contract["teacher"]["class_names"]))
-                # Independent graph pools allow arbitrary replay order.
+                # Static inputs live outside capture. Only this graph reads them.
                 self.graphs[size] = graph, static, output
                 self._locks[size] = threading.RLock()
         if side != self.stream:
             self.stream.wait_stream(side)
 
+    def _check_workspace_owner(self):
+        if (threading.current_thread() is not self.capture_thread
+                or torch.cuda.current_stream(self.stream.device) != self.stream):
+            raise RuntimeError("shared teacher graphs must replay on their owning thread and stream")
+
     @contextmanager
     def input_buffer(self, size):
         """Reserve this graph's input through a direct write and the ensuing replay."""
+        if self.shared_pool:
+            self._check_workspace_owner()
         with self._locks[size]:
             yield self.graphs[size][1]
 
     def __call__(self, host_tiles):
-        # The static output is borrowed until the calling thread releases the
-        # shape lock in diagonal().
+        output = self._replay(host_tiles)
+        return output.clone() if self.shared_pool else output
+
+    def _replay(self, host_tiles):
+        # The shared pool's intermediate and output addresses can be reused by
+        # another shape. All reads of borrowed storage precede the next replay.
+        if self.shared_pool:
+            self._check_workspace_owner()
         graph, static, output = self.graphs[len(host_tiles)]
         # The per-protein tile tensor stays alive through the synchronous
         # state/class host reads; replay is ordered behind the H2D on this stream.
@@ -277,7 +294,10 @@ class CudaTeacherGraphs:
     def probabilities(self, host_tiles):
         size = len(host_tiles)
         with self._locks[size]:
-            self(host_tiles)
+            if self.shared_pool:
+                self._replay(host_tiles)
+            else:
+                self(host_tiles)
             # The next replay of this shape overwrites the static track storage.
             return self.track_outputs[size].clone()
 
@@ -286,7 +306,7 @@ class CudaTeacherGraphs:
         # indexing copy before another thread can overwrite the static output.
         # Each caller owns its diagonal until its host transfers are complete.
         with self._locks[len(host_tiles)]:
-            output = self(host_tiles)
+            output = self._replay(host_tiles) if self.shared_pool else self(host_tiles)
             return output[:, :, indices, indices]
 
 

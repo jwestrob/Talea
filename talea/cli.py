@@ -74,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="prepare tiles in record workers and run the teacher in order on the predictor thread")
     parser.add_argument("--teacher-graph-tracks", action="store_true",
                         help="include the per-protein probability readout in the teacher CUDA graph")
+    parser.add_argument("--teacher-graph-pool", action="store_true",
+                        help="share GPU scratch memory across ordered teacher tile-batch graphs")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--batched-apc-reductions", default="",
@@ -297,7 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         "fused_apc": args.fused_apc,
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
         "prefetch_forward": args.prefetch_forward,
-        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
+        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks or args.teacher_graph_pool,
+        **({"teacher_graph_pool": True} if args.teacher_graph_pool else {}),
         **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "postprocess_mode": args.postprocess_mode,
         **({"worker_finalization": True} if args.worker_finalization else {}),
@@ -373,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
-        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
+        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks or args.teacher_graph_pool,
+        **({"teacher_graph_pool": True} if args.teacher_graph_pool else {}),
         **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,
         **({"fused_rotary_calls": predictor.fused_rotary_calls} if args.fused_rotary else {}),
