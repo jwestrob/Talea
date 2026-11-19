@@ -282,7 +282,7 @@ def prepare_teacher_readout(
 
 
 def prepare_teacher_tiles(
-    matrices: Mapping[int, np.ndarray], contract: Mapping, *, quantile_function=None,
+    matrices: Mapping[int, np.ndarray], contract: Mapping, *, quantile_function=None, half_decoder=None,
 ) -> tuple[int, np.ndarray]:
     """Normalize one record's tiles on the host, in the model's original order."""
     attention = contract["attention"]
@@ -290,7 +290,7 @@ def prepare_teacher_tiles(
     missing = [layer for layer in layers if layer not in matrices]
     if missing:
         raise KeyError(f"missing teacher attention layers: {missing}")
-    selected = [np.asarray(matrices[layer], dtype=np.float32) for layer in layers]
+    selected = [np.asarray(matrices[layer]) for layer in layers]
     shapes = {values.shape for values in selected}
     if len(shapes) != 1:
         raise ValueError("teacher attention matrices have inconsistent shapes")
@@ -301,8 +301,11 @@ def prepare_teacher_tiles(
     tile_size = int(attention["tile_size"])
     central_size = int(attention["central_size"])
     spans = central_tile_spans(length, tile_size, central_size)
+    if half_decoder is not None and all(m.dtype == np.float16 and m.flags.c_contiguous for m in selected):
+        return length, half_decoder(selected, spans, tile_size, float(attention["normalization_quantile"]),
+                                    float(attention["normalization_clip"]))
     tiles = normalized_attention_tiles(
-        selected,
+        [np.asarray(m, dtype=np.float32) for m in selected],
         spans,
         tile_size,
         float(attention["normalization_quantile"]),

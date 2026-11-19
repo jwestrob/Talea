@@ -107,6 +107,8 @@ def process_attention_record(task: dict) -> dict:
 
     metadata = task["metadata"]
     matrices = task["matrices"]
+    if any(m.dtype == np.float16 for m in matrices.values()):
+        matrices = {layer: m.astype(np.float32, copy=False) for layer, m in matrices.items()}
     length = int(metadata["length"])
     protein_calibration = task["protein_calibration"]
     local_calibration = task["local_calibration"]
