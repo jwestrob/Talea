@@ -319,7 +319,7 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
             yield start + offset, {layer: maps[layer][offset] for layer in layers}
 
 
-class _PendingAPC(NamedTuple):
+class _PendingCapture(NamedTuple):
     shape: torch.Size
     itemsize: int
     future: concurrent.futures.Future
@@ -343,30 +343,30 @@ def _layer_apc(weights, indices_by_record, separation, dtype, grouped):
     return maps
 
 
-def _queue_layer_apc(weights, *, executor, stream, indices, separation, dtype, grouped):
-    """Launch correction from the capture hook, while the producer continues to encode."""
-    ready = torch.cuda.current_stream(weights.device).record_event()
+def _queue_capture(tensor, function, executor, stream):
+    """Launch readout from a layer hook while the producer continues to encode."""
+    ready = torch.cuda.current_stream(tensor.device).record_event()
 
     @torch.inference_mode()
     def work():
         with torch.cuda.stream(stream):
             stream.wait_event(ready)
-            weights.record_stream(stream)
-            maps = _layer_apc(weights, indices, separation, dtype, grouped)
-            return maps, stream.record_event()
+            tensor.record_stream(stream)
+            output = function(tensor)
+            return output, stream.record_event()
 
-    return _PendingAPC(weights.shape, weights.element_size(), executor.submit(work))
+    return _PendingCapture(tensor.shape, tensor.element_size(), executor.submit(work))
 
 
-def _collect_layer_apc(pending, consumer):
-    result = {}
-    for layer, value in pending.items():
-        maps, ready = value.future.result()
-        consumer.wait_event(ready)
-        for matrix in maps:
-            matrix.record_stream(consumer)
-        result[layer] = maps
-    return result
+def _collect_capture(value, consumer):
+    output, ready = value.future.result()
+    consumer.wait_event(ready)
+    if isinstance(output, torch.Tensor):
+        output.record_stream(consumer)
+    else:
+        for tensor in output:
+            tensor.record_stream(consumer)
+    return output
 
 
 def _checked_attention_matrix(result, sequence_length):
@@ -450,6 +450,26 @@ def _record_hidden_states(state, batch_position, indices, residue_slice):
         return row.index_select(0, indices).float()
     # The original gather creates an aligned, contiguous tensor even for fp32.
     return row[residue_slice].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
+
+
+def _pool_gate_layer(state, indices_by_record, group_equal):
+    """Reduce only valid residues, using their original order and fp32 accumulation."""
+    means = []
+    start = 0
+    while start < len(indices_by_record):
+        indices, span = indices_by_record[start]
+        stop = start + 1
+        if group_equal and span is not None:
+            while stop < len(indices_by_record) and indices_by_record[stop][1] == span:
+                stop += 1
+        if stop == start + 1:
+            residues = _record_hidden_states(state, start, indices, span)
+            means.append(residues.mean(dim=0))
+        else:
+            residues = state[start:stop, span].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
+            means.extend(residues.mean(dim=1).unbind())
+        start = stop
+    return torch.stack(means)
 
 
 def _ordered_readouts(function, count, executor, width, items=None):
@@ -657,6 +677,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.fused_rotary_calls = 0
+        self.early_gate_layers = 0
         self.early_apc_layers = 0
         self.unit_residual_blocks = 0
         self.fused_swiglu_calls = 0
@@ -913,7 +934,9 @@ class TaleaPredictor:
                 region = torch.sigmoid(residues @ self._region_probe_weights + self._region_probe_bias)
 
         gate_means = [
-            _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice).mean(dim=0)
+            hidden_states[layer][batch_position]
+            if hidden_states[layer].ndim == 2
+            else _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice).mean(dim=0)
             for layer in self.openness_layers
         ]
         gate = torch.cat(gate_means) @ self._openness_weights + self._openness_bias
@@ -1007,6 +1030,7 @@ class TaleaPredictor:
         fused_swiglu: bool = False,
         unit_residual: bool = False,
         early_apc: bool = False,
+        early_gate: str = "off",
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         teacher_graph_tracks: bool = False,
@@ -1075,8 +1099,11 @@ class TaleaPredictor:
                 "element_budget": _APC_GROUP_ELEMENTS,
             }
         teacher_cuda_graph = teacher_cuda_graph or teacher_graph_tracks
-        if early_apc and (self.device.type != "cuda" or _device_autocast_enabled("cuda")):
-            raise ValueError("early APC requires CUDA and an explicit model dtype")
+        if early_gate not in ("off", "record", "group"):
+            raise ValueError("early_gate must be off, record or group")
+        early_readout = early_apc or early_gate != "off"
+        if early_readout and (self.device.type != "cuda" or _device_autocast_enabled("cuda")):
+            raise ValueError("early layer readouts require CUDA and an explicit model dtype")
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
@@ -1312,11 +1339,11 @@ class TaleaPredictor:
                 from talea.swiglu import swiglu_context
                 swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device))
                 stack.callback(lambda: setattr(self, "fused_swiglu_calls", swiglu_calls[0]))
-            self.early_apc_layers = 0
-            if early_apc:
-                apc_stream = torch.cuda.Stream(device=self.device)
-                stack.callback(apc_stream.synchronize)
-                apc_executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+            self.early_apc_layers = self.early_gate_layers = 0
+            if early_readout:
+                capture_stream = torch.cuda.Stream(device=self.device)
+                stack.callback(capture_stream.synchronize)
+                capture_executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
             producer = None
             if overlap_enabled:
                 # Join the producer before restoring the ESM hooks.
@@ -1345,14 +1372,23 @@ class TaleaPredictor:
                     if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
                 capture.reset()
-                if early_apc:
+                if early_readout:
                     for indices, _ in residue_indices:
-                        indices.record_stream(apc_stream)
+                        indices.record_stream(capture_stream)
+                if early_apc:
+                    correct = partial(_layer_apc, indices_by_record=residue_indices, separation=minimum_separation,
+                                      dtype=device_storage_dtype, grouped=group_equal_apc)
                     capture.transform_attention = partial(
-                        _queue_layer_apc, executor=apc_executor, stream=apc_stream,
-                        indices=residue_indices, separation=minimum_separation, dtype=device_storage_dtype,
-                        grouped=group_equal_apc,
+                        _queue_capture, function=correct, executor=capture_executor, stream=capture_stream,
                     )
+                if early_gate != "off":
+                    reduce_gate = partial(_pool_gate_layer, indices_by_record=residue_indices, group_equal=early_gate == "group")
+
+                    def early_hidden(layer, value):
+                        if layer in self.openness_layers and layer not in self.expected_layers:
+                            return _queue_capture(value, reduce_gate, capture_executor, capture_stream)
+                        return value
+                    capture.transform_hidden = early_hidden
                 try:
                     model_output = self.esm_model(
                         **model_inputs,
@@ -1367,7 +1403,7 @@ class TaleaPredictor:
                     capture.reset()
                     raise
                 finally:
-                    capture.transform_attention = None
+                    capture.transform_attention = capture.transform_hidden = None
                 ready = None
                 if readout_stream is not None:
                     ready = torch.cuda.current_stream(self.device).record_event()
@@ -1409,11 +1445,17 @@ class TaleaPredictor:
                     prefetched += 1
                 residue_indices, attentions, hidden_states, ready = captured
                 del captured
+                if early_readout:
+                    consumer = readout_stream if readout_stream is not None else torch.cuda.current_stream(self.device)
+                if early_gate != "off":
+                    for layer, value in hidden_states.items():
+                        if isinstance(value, _PendingCapture):
+                            hidden_states[layer] = _collect_capture(value, consumer)
+                            self.early_gate_layers += 1
                 if ready is not None:
                     _handoff_capture(readout_stream, ready, {} if early_apc else attentions, hidden_states, residue_indices)
                 if early_apc:
-                    consumer = readout_stream if readout_stream is not None else torch.cuda.current_stream(self.device)
-                    layer_maps = _collect_layer_apc(attentions, consumer)
+                    layer_maps = {layer: _collect_capture(item, consumer) for layer, item in attentions.items()}
                     self.early_apc_layers += len(layer_maps)
                 compact = []
                 pooled_rows = []
