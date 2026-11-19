@@ -341,18 +341,43 @@ def longest_supported_run(track: np.ndarray, threshold: float = 0.5) -> tuple[in
         raise ValueError("track must be one-dimensional")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0, 1]")
-    best_start = best_end = start = 0
-    inside = False
-    for index, supported in enumerate(values >= threshold):
-        if supported and not inside:
-            start = index
-            inside = True
-        if inside and (not supported or index == len(values) - 1):
-            end = index if not supported else index + 1
-            if end - start > best_end - best_start:
-                best_start, best_end = start, end
-            inside = False
-    return best_start, best_end
+    supported = values >= threshold
+    return _longest_supported_interval(supported, np.count_nonzero(supported))
+
+
+def _longest_supported_interval(supported: np.ndarray, count: int) -> tuple[int, int]:
+    if count == 0:
+        return 0, 0
+    if count == len(supported):
+        return 0, len(supported)
+    padded = np.empty(len(supported) + 2, dtype=bool)
+    padded[0] = padded[-1] = False
+    padded[1:-1] = supported
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    # argmax resolves ties to the first run, following sequence order.
+    best = int(np.argmax(edges[1::2] - edges[::2])) * 2
+    return int(edges[best]), int(edges[best + 1])
+
+
+def _state_quantiles(values: np.ndarray) -> tuple[float, float]:
+    n = len(values)
+    middle_left, middle_right = (n - 1) // 2, n // 2
+    rank = (n - 1) * 0.9
+    left = int(rank)
+    right = min(n - 1, left + 1)
+    ordered = np.partition(values, (middle_left, middle_right, left, right))
+    median = float((ordered[middle_left] + ordered[middle_right]) * 0.5)
+    low, high = float(ordered[left]), float(ordered[right])
+    weight = rank - left
+    # NumPy's linear quantile interpolates from the nearer endpoint.
+    if weight >= 0.5:
+        q90 = high - (high - low) * (1.0 - weight)
+    else:
+        q90 = low + (high - low) * weight
+    if (median == 0.0 or q90 == 0.0) and np.signbit(values).any():
+        # Different choices of equal elements in partition can select opposite signed zeros.
+        return float(np.median(values)), float(np.quantile(values, 0.9))
+    return median, q90
 
 
 def summarize_state_track(
@@ -363,14 +388,19 @@ def summarize_state_track(
     values = np.asarray(track, dtype=np.float64)
     if values.ndim != 1 or not len(values):
         raise ValueError("track must be a non-empty one-dimensional array")
-    if not np.isfinite(values).all() or np.any((values < 0) | (values > 1)):
+    if not (0.0 <= values.min() and values.max() <= 1.0):
         raise ValueError("state probabilities must be finite and in [0, 1]")
-    start, end = longest_supported_run(values, threshold=threshold)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    supported = values >= threshold
+    count = np.count_nonzero(supported)
+    start, end = _longest_supported_interval(supported, count)
+    median, q90 = _state_quantiles(values)
     return {
         "mean_probability": float(np.mean(values)),
-        "median_probability": float(np.median(values)),
-        "q90_probability": float(np.quantile(values, 0.9)),
-        "supported_fraction": float(np.mean(values >= threshold)),
+        "median_probability": median,
+        "q90_probability": q90,
+        "supported_fraction": float(count / len(values)),
         "longest_run_start": start,
         "longest_run_end": end,
         "longest_run_length": end - start,

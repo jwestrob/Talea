@@ -105,3 +105,28 @@ def test_matrix_quantile_matches_full_selection_for_unrepresentative_samples():
     matrix.flat[1::3] = 0.25
     for quantile in (0.5, 0.95, 0.9999):
         assert _matrix_quantile(matrix, quantile) == np.quantile(matrix[matrix > 0], quantile)
+
+
+def test_shared_state_quantiles_and_vectorized_runs_are_bit_exact():
+    rng = np.random.default_rng(684)
+    for n in (1, 2, 6, 11, 25, 64, 811, 2046):
+        cases = (
+            rng.random(n),
+            rng.choice([-0.0, 0.0, np.nextafter(0., 1.)], n),
+            rng.choice([np.nextafter(.5, 0.), .5, np.nextafter(.5, 1.)], n),
+        )
+        for values in cases:
+            for threshold in (0.0, 0.5, 1.0):
+                result = summarize_state_track(values, threshold)
+                expected = (np.mean(values), np.median(values), np.quantile(values, 0.9), np.mean(values >= threshold))
+                observed = tuple(result[k] for k in ("mean_probability", "median_probability", "q90_probability", "supported_fraction"))
+                assert np.array(observed).tobytes() == np.array(expected).tobytes()
+                supported = values >= threshold
+                runs = []
+                for i, value in enumerate(supported):
+                    if value and (i == 0 or not supported[i - 1]):
+                        runs.append([i, i + 1])
+                    elif value:
+                        runs[-1][1] = i + 1
+                best = max(runs, key=lambda v: v[1] - v[0], default=[0, 0])
+                assert (result["longest_run_start"], result["longest_run_end"]) == tuple(best)
