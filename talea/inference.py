@@ -489,6 +489,7 @@ class TaleaPredictor:
         self._teacher_graphs = None
         self._graph_readout_stream = None
         self.teacher_cuda_graph_active = False
+        self.fused_rotary_calls = 0
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
         if self.deterministic:
@@ -814,6 +815,7 @@ class TaleaPredictor:
         cache_clear_interval: int = 0,
         record_workers: int = 1,
         prefetch_forward: bool = False,
+        fused_rotary: bool = False,
         teacher_cuda_graph: bool = False,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
@@ -1061,6 +1063,11 @@ class TaleaPredictor:
                     mode=capture_mode,
                 )
             )
+            self.fused_rotary_calls = 0
+            if fused_rotary:
+                from talea.rotary import fused_rotary_context
+                rotary_calls = stack.enter_context(fused_rotary_context(capture.blocks, self.device))
+                stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0]))
             producer = None
             if overlap_enabled:
                 # Join the producer before restoring the ESM hooks.
