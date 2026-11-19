@@ -107,7 +107,8 @@ class SelectiveCapture:
         self.hidden_sources = resolve_hidden_state_sources(
             transformer_layers, self.n_blocks
         )
-        self.attentions: dict[int, torch.Tensor] = {}
+        self.attentions = {}
+        self.transform_attention = None
         self.hidden_states: dict[int, torch.Tensor] = {}
         self._handles: list = []
         self._patched: list[tuple[torch.nn.Module, object]] = []
@@ -117,7 +118,6 @@ class SelectiveCapture:
         attention = block.attn
         original = attention._attn
         capture = block_index in self.attention_layers
-        sink = self.attentions
 
         def patched(
             query_BHLD,
@@ -139,7 +139,7 @@ class SelectiveCapture:
                 output_s_max,
             )
             if capture:
-                sink[block_index] = weights.detach()
+                self._capture_attention(block_index, weights)
             # Returning None drops the reference immediately for uncaptured
             # blocks; the stack only stores weights when it built a tuple, and
             # we always call it with output_attentions=False.
@@ -151,7 +151,6 @@ class SelectiveCapture:
     def _patch_capture_only(self, block_index: int, block: torch.nn.Module) -> None:
         attention = block.attn
         original = attention._attn
-        sink = self.attentions
 
         def patched(
             query_BHLD,
@@ -170,11 +169,15 @@ class SelectiveCapture:
                 attention_mask_4d,
                 output_s_max,
             )
-            sink[block_index] = weights.detach()
+            self._capture_attention(block_index, weights)
             return output, None, s_max
 
         attention._attn = patched
         self._patched.append((attention, original))
+
+    def _capture_attention(self, layer, weights):
+        value = weights.detach()
+        self.attentions[layer] = value if self.transform_attention is None else self.transform_attention(value)
 
     def _hook_hidden(self, block_index: int, layer: int) -> None:
         def hook(module, args, output):
