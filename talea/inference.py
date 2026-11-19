@@ -598,6 +598,17 @@ def _record_hidden_states(state, batch_position, indices, residue_slice):
 
 def _pool_gate_layer(state, indices_by_record, group_equal):
     """Reduce only valid residues, using their original order and fp32 accumulation."""
+    # The CUDA reduction geometry below is specific to the deployment's ATen
+    # implementation and aligned ESM hidden size. Keep the ordinary means on
+    # other builds, devices, and batch shapes.
+    group_equal = (
+        group_equal
+        and state.device.type == "cuda"
+        and torch.version.hip is None
+        and torch.__version__.partition("+")[0] == "2.7.1"
+        and state.shape[-1] == 1152
+        and len(indices_by_record) <= 96
+    )
     means = []
     start = 0
     while start < len(indices_by_record):
@@ -611,7 +622,14 @@ def _pool_gate_layer(state, indices_by_record, group_equal):
             means.append(residues.mean(dim=0))
         else:
             residues = state[start:stop, span].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
-            means.extend(residues.mean(dim=1).unbind())
+            # ATen 2.7.1 Reduce.cuh uses four reduction warps for these
+            # 1152-wide contiguous rows. Once ceil(L / 4) reaches 256 its
+            # cross-block split depends on the number of records in the call.
+            # The cast can still be shared; each row starts 512-byte aligned.
+            if residues.shape[1] <= 1020:
+                means.extend(residues.mean(dim=1).unbind())
+            else:
+                means.extend(row.mean(dim=0) for row in residues.unbind())
         start = stop
     return torch.stack(means)
 
