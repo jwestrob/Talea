@@ -249,3 +249,17 @@ def test_native_precision_diagonal_sort_preserves_float64_interpolation():
             result = robust_diagonal_tracks(matrix, 45, baseline_quantile=0.31791)
             reference = robust_diagonal_tracks(matrix.astype(np.float64), 45, baseline_quantile=0.31791)
             assert all(a.tobytes() == b.tobytes() for a, b in zip(result, reference))
+
+
+def test_padded_diagonals_sort_only_the_occupied_row_blocks():
+    from talea.wedge import _robust_diagonal_tracks_reference
+
+    rng = np.random.default_rng(331)
+    for length, separation in ((65, 64), (133, 68), (256, 255)):
+        values = rng.integers(0, 12, size=(length, length)).astype(np.float32)
+        for quantile in (0.25, 0.319):
+            result = robust_diagonal_tracks(values, separation, baseline_quantile=quantile)
+            reference = robust_diagonal_tracks(values.astype(np.float64), separation, baseline_quantile=quantile)
+            assert all(a.tobytes() == b.tobytes() for a, b in zip(result, reference, strict=True))
+        slow = _robust_diagonal_tracks_reference(values, separation)
+        assert all(a.tobytes() == b.tobytes() for a, b in zip(robust_diagonal_tracks(values, separation), slow, strict=True))

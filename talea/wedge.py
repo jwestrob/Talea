@@ -185,7 +185,14 @@ def _normalized_diagonals(matrix, max_separation, baseline_quantile, clip):
     # precision. Keep the float64 ordering for NaNs and signed-zero ties.
     if padded.dtype == np.float32 and (np.signbit(padded).any() or np.isnan(padded).any()):
         padded = padded.astype(np.float64)
-    ordered = np.sort(padded, axis=1)
+    if padded.dtype == np.float32 and 64 <= padded.shape[1] <= 2 * maximum:
+        # Short diagonals leave a triangular +inf tail. Every row in each block
+        # already has its final sorted values beyond the longest diagonal there.
+        ordered = padded.copy()
+        for start in range(0, maximum, 32):
+            ordered[start:start + 32, : padded.shape[1] - start].sort(axis=1)
+    else:
+        ordered = np.sort(padded, axis=1)
     baseline = _sorted_row_quantile(ordered, counts, baseline_quantile)
     if (padded.dtype == np.float32 and _compiled_normalize is not None and np.isfinite(clip)
             and np.isfinite(ordered[np.arange(maximum), counts - 1]).all()):
