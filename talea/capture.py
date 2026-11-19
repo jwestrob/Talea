@@ -45,7 +45,7 @@ than assumed:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 import torch
 
@@ -245,3 +245,37 @@ def selective_capture(
         yield capture
     finally:
         capture.remove()
+
+
+def _unit_residual_forward(block):
+    def forward(
+        x, attention_mask_2d=None, attention_mask_4d=None, flex_block_mask=None,
+        output_attentions=False, output_s_max=False,
+    ):
+        attn, weights, s_max = block.attn(
+            x, attention_mask_2d=attention_mask_2d, attention_mask_4d=attention_mask_4d,
+            flex_block_mask=flex_block_mask, output_attentions=output_attentions,
+            output_s_max=output_s_max,
+        )
+        x = x + block.dropout(attn)
+        return x + block.dropout(block.ffn(x)), weights, s_max
+    return forward
+
+
+@contextmanager
+def unit_residual_context(blocks):
+    """Elide division by exactly one in the pinned 36-block ESM++ residual path."""
+    with ExitStack() as restore:
+        enabled = 0
+        for block in blocks:
+            if (type(block).__name__ != "UnifiedTransformerBlock" or block.training
+                    or getattr(block, "scaling_factor", None) != 1.0
+                    or "f813401638b3fddab09748aec1ad2bf537aa4208" not in type(block).__module__):
+                continue
+            if "forward" in vars(block):
+                restore.callback(setattr, block, "forward", block.forward)
+            else:
+                restore.callback(delattr, block, "forward")
+            block.forward = _unit_residual_forward(block)
+            enabled += 1
+        yield enabled
