@@ -56,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-all-valid-mask", action="store_true", help="skip the manual ESM++ padding-mask operation for fully valid batches")
     parser.add_argument("--arithmetic-swiglu", action="store_true", help="calibrate direct CUDA SiLU against every fp16 input")
     parser.add_argument("--cache-sdpa-bias", action="store_true", help="reuse the CUDA SDPA padding bias across ESM layers")
+    parser.add_argument("--tuned-gemm", choices=("off","ffn","qkv","both"), default="off", help="shape-check alternate cuBLASLt kernels for ESM linear projections")
+    parser.add_argument("--verify-tuned-gemm", action="store_true", help="compare every tuned projection with the original linear layer")
     parser.add_argument("--fused-qk", action="store_true", help="fuse FP16 Q/K normalization and rotation on SM86 with PyTorch 2.7.1")
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
@@ -310,6 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         **({"cache_sdpa_bias": True} if args.cache_sdpa_bias else {}),
         **({"fused_qk": True} if args.fused_qk else {}),
+        **({"tuned_gemm": args.tuned_gemm} if args.tuned_gemm != "off" else {}),
+        **({"verify_tuned_gemm": True} if args.verify_tuned_gemm else {}),
         "group_equal_apc": args.group_equal_apc,
         "fused_apc": args.fused_apc,
         **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
@@ -396,6 +400,9 @@ def main(argv: list[str] | None = None) -> int:
         **({"cache_sdpa_bias": True} if args.cache_sdpa_bias else {}),
         **({"apc_band_mode": args.apc_band_mode} if args.apc_band_mode != "off" else {}),
         **({"fused_qk": True, "fused_qk_calls": predictor.fused_qk_calls} if args.fused_qk else {}),
+        **({"tuned_gemm": args.tuned_gemm, "tuned_gemm_statistics": predictor.tuned_gemm_statistics}
+           if args.tuned_gemm != "off" else {}),
+        **({"verify_tuned_gemm": True} if args.verify_tuned_gemm else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),

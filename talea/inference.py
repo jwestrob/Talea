@@ -851,6 +851,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.cached_sdpa_bias_calls = 0
+        self.tuned_gemm_statistics = {}
         self.fused_qk_calls = 0
         self.fused_rotary_calls = 0
         self.early_gate_layers = 0
@@ -1239,6 +1240,8 @@ class TaleaPredictor:
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_qk: bool = False,
+        tuned_gemm: str = "off",
+        verify_tuned_gemm: bool = False,
         fused_swiglu: bool = False,
         unit_residual: bool = False,
         early_apc: bool = False,
@@ -1617,6 +1620,14 @@ class TaleaPredictor:
                 from talea.sdpa_bias import cached_padding_bias
                 bias_cache = stack.enter_context(cached_padding_bias(capture.blocks))
                 stack.callback(lambda: setattr(self, "cached_sdpa_bias_calls", bias_cache.calls))
+            self.tuned_gemm_statistics = {}
+            if tuned_gemm != "off":
+                from talea.tuned_gemm import tuned_gemm_context
+                self.tuned_gemm_statistics = stack.enter_context(
+                    tuned_gemm_context(capture.blocks, self.device, tuned_gemm, verify_tuned_gemm)
+                )
+            elif verify_tuned_gemm:
+                raise ValueError("verify_tuned_gemm requires a tuned_gemm projection")
             self.fused_qk_calls = 0
             qk_calls = [0]
             if fused_qk:

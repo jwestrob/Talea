@@ -1,13 +1,8 @@
 """Fuse ESM++'s FP16 Q/K layer normalization and rotation on validated Ampere hardware."""
 import ctypes
-import hashlib
-import os
 from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 from pathlib import Path
-import shutil
-import subprocess
-import tempfile
 
 import torch
 
@@ -17,37 +12,8 @@ _REVISION = "f813401638b3fddab09748aec1ad2bf537aa4208"
 @lru_cache(maxsize=1)
 def _kernel():
     """Build once and atomically share the compiled library between scoring processes."""
-    import fcntl
-
-    source = Path(__file__).with_name("_qk_rope.cu")
-    version = torch.version.cuda
-    candidates = [os.environ.get("CUDACXX")]
-    if os.environ.get("CUDA_HOME"):
-        candidates.append(str(Path(os.environ["CUDA_HOME"]) / "bin" / "nvcc"))
-    candidates.extend([f"/usr/local/cuda-{version}/bin/nvcc", f"/usr/local/cuda-{version.split('.')[0]}/bin/nvcc",
-                       shutil.which("nvcc"), "/usr/local/cuda/bin/nvcc"])
-    compiler = next((p for p in candidates if p and os.access(p, os.X_OK)), None)
-    if compiler is None:
-        raise RuntimeError("--fused-qk requires nvcc on its first use; set CUDACXX to its path")
-    host = os.environ.get("CUDAHOSTCXX") or shutil.which("g++-11")
-    compiler_version = subprocess.check_output([compiler, "--version"])
-    key = hashlib.sha256(source.read_bytes() + compiler_version + repr((compiler, host)).encode()).hexdigest()[:20]
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home()/".cache"))
-    cache = cache_root / "talea" / "qk-sm86" / key
-    cache.mkdir(parents=True, exist_ok=True)
-    library = cache / "qk.so"
-    with (cache / "build.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not library.is_file():
-            with tempfile.TemporaryDirectory(dir=cache) as tmp:
-                output = Path(tmp)/"qk.so"
-                command = [compiler]
-                if host:
-                    command += ["-ccbin",host]
-                command += ["-O3","-arch=sm_86","-shared","-Xcompiler=-fPIC","--cudart=shared",
-                            str(source),"-o",str(output)]
-                subprocess.run(command,check=True)
-                output.replace(library)
+    from talea._cuda_library import build_library
+    library = build_library(Path(__file__).with_name("_qk_rope.cu"), "qk-sm86")
     call = ctypes.CDLL(str(library)).run_qk
     pointer = ctypes.c_void_p
     call.argtypes = [pointer]*7 + [ctypes.c_int,ctypes.c_int,ctypes.c_float,pointer]
