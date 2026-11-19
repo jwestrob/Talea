@@ -565,3 +565,14 @@ def test_compact_harmonic_calls_keep_reference_dot_and_ties(n):
     for spectrum, result in zip(spectra, actual, strict=True):
         expected = best_harmonic_comb(spectrum, n, max_period=min(250.0, n / 3))
         assert result == {key: getattr(expected, key) for key in result}
+
+
+@pytest.mark.parametrize("length,minimum", [(71, 96), (96, 96), (317, 96), (317, 192)])
+def test_local_scan_can_select_only_eligible_intervals(length, minimum):
+    from talea.topology import fused_local_windows
+
+    task = build_task(length)
+    args = (task["matrices"], length, task["local_calibration"], task["window_sizes"])
+    complete = fused_local_windows(*args)
+    eligible = fused_local_windows(*args, minimum_window_size=minimum)
+    assert eligible == [row for row in complete if row["window_size"] >= minimum]

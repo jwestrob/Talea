@@ -56,13 +56,17 @@ def fused_local_windows(
     calibration: dict,
     window_sizes: tuple[int, ...],
     whole_scores: dict[int, dict] | None = None,
+    minimum_window_size: int = 1,
 ) -> list[dict]:
     layers = tuple(int(value) for value in calibration["layers_zero_based"])
     parameters = {
         int(key): value for key, value in calibration["parameters"].items()
     }
     whole_scores = {} if whole_scores is None else whole_scores
-    spans = sorted(window_plan(protein_length, window_sizes=window_sizes))
+    spans = sorted(
+        (start, end) for start, end in window_plan(protein_length, window_sizes=window_sizes)
+        if end - start >= minimum_window_size
+    )
     scores = {
         layer: compact_window_calls(matrices[layer], spans, whole_scores.get(layer))
         for layer in layers
@@ -121,17 +125,17 @@ def process_attention_record(task: dict) -> dict:
     spectrum = frozen_spectrum_score(
         spectrum_input, length, protein_calibration
     )
-    windows = fused_local_windows(
-        matrices,
-        length,
-        local_calibration,
-        tuple(task["window_sizes"]),
-        whole_scores,
-    )
     period_config = wedge_config["period_candidates"]
+    minimum_window_size = int(period_config["minimum_window_size"])
+    # Local scores feed only the candidate-period filter, so score just the
+    # intervals it can select. The independent whole-protein score is retained.
+    windows = fused_local_windows(
+        matrices, length, local_calibration, tuple(task["window_sizes"]),
+        whole_scores, minimum_window_size=minimum_window_size,
+    )
     periods = candidate_periods_from_windows(
         windows,
-        minimum_window_size=int(period_config["minimum_window_size"]),
+        minimum_window_size=minimum_window_size,
         top_n=int(period_config["top_n"]),
         alias_multipliers=tuple(
             float(value) for value in period_config["alias_multipliers"]
