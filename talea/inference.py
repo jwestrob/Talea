@@ -239,6 +239,9 @@ def _clear_apc_diagonals(matrix, separation, sparse=False):
     elif sparse and 2 * separation < length and matrix.is_contiguous():
         # One index vector addresses the same band across a group of maps.
         ix = _flat_band_indices(length, separation, matrix.device)
+        if matrix.is_cuda:
+            # Cache eviction can occur on another readout worker's CUDA stream.
+            ix.record_stream(torch.cuda.current_stream(matrix.device))
         matrix.view(-1, length**2).index_fill_(1, ix, 0)
     else:
         matrix.masked_fill_(near_diagonal_mask(length, separation, matrix.device), 0)
@@ -417,6 +420,12 @@ class _GroupedAPCGraphs:
             stream.wait_stream(self.capture_stream)
             self.input.record_stream(stream)
             self.output.record_stream(stream)
+            # The cache can evict external operands before this shape's final
+            # replay finishes on the consumer stream.
+            if self.mask is not None:
+                self.mask.record_stream(stream)
+            if self.band_indices is not None:
+                self.band_indices.record_stream(stream)
             self.stats["captures"] += 1
         else:
             self.input.copy_(source)
