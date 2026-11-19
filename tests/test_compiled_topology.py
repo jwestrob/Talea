@@ -71,3 +71,18 @@ def test_registration_candidates_offsets_and_medians_match_numpy(monkeypatch):
             monkeypatch.setattr(unit_registration, "_compiled_interval_medians", interval_medians)
             assert unit_registration.register_periodic_units(*args, phase_step=0.5, prefix=prefix) == reg
             assert unit_registration.scan_plausible_boundary_pairs(values, reg, prefix=prefix) == scan
+
+
+def test_packed_median_suppression_matches_per_diagonal_partition():
+    from talea.regions import suppress_interval
+    from talea._wedge_numba import suppress_packed
+    rng = np.random.default_rng(42)
+    for length in (3, 19, 118):
+        tracks = [np.empty(0)] + [rng.integers(-5, 5, size=length - d).astype(float) for d in range(1, length)]
+        offsets = np.cumsum([0] + [len(t) for t in tracks])
+        packed = np.concatenate(tracks)
+        separations = np.arange(1, length)
+        for start, end in [(0, 2), (3, 10), (-5, -1), (length - 10, length + 3)]:
+            suppress_interval(tracks, start, end)
+            suppress_packed(packed, offsets, separations, start, end)
+            assert packed.tobytes() == np.concatenate(tracks).tobytes()
