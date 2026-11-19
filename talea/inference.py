@@ -49,6 +49,8 @@ from talea.production import (
     prepare_teacher_readout,
     prepare_teacher_tiles,
     teacher_tracks_from_attention,
+    teacher_device_probabilities,
+    unpack_teacher_tracks,
 )
 from talea.topology import process_attention_record
 from talea.shared_attention import SharedAttentionArena
@@ -412,6 +414,34 @@ def _ordered_readouts(function, count, executor, width, items=None):
     finally:
         for future in pending:
             future.cancel()
+
+
+def _ordered_teacher_readbacks(readouts, launch, stream, depth):
+    """Queue unchanged per-protein calls, then transfer their probability rows together."""
+    def activate():
+        return torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+    def retrieve(group):
+        with activate():
+            tensors = [tensor for _, tensor in group]
+            packed = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
+            host = packed.cpu().numpy()
+        offset = 0
+        for inputs, tensor in group:
+            end = offset + len(tensor)
+            yield (*inputs, *unpack_teacher_tracks(host[offset:end]))
+            offset = end
+
+    group = []
+    for inputs, tiles in readouts:
+        with activate():
+            tensor = launch(tiles)
+        group.append((inputs, tensor))
+        if len(group) == depth:
+            yield from retrieve(group)
+            group.clear()
+    if group:
+        yield from retrieve(group)
 
 
 def _forward_pair(batch, following, future, forward, producer, can_overlap):
@@ -909,6 +939,7 @@ class TaleaPredictor:
         cache_clear_interval: int = 0,
         record_workers: int = 1,
         teacher_owner_thread: bool = False,
+        teacher_readback_records: int = 1,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -978,6 +1009,9 @@ class TaleaPredictor:
                 "eligible_squared_lengths": 0, "group_size_counts": {},
                 "element_budget": _APC_GROUP_ELEMENTS,
             }
+        if teacher_readback_records < 1:
+            raise ValueError("teacher_readback_records must be positive")
+        teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
         if shared_attention_mib < 0:
             raise ValueError("shared_attention_mib must be nonnegative")
         if record_workers < 1:
@@ -1278,12 +1312,11 @@ class TaleaPredictor:
                 compact = []
                 pooled_rows = []
 
-                def finish_teacher(inputs, prepared_tiles=None):
+                def finish_teacher(inputs):
                     _, matrices, _, _, _ = inputs
                     tracks = teacher_tracks_from_attention(
                         self.teacher_model, matrices, self.teacher_contract, self.device,
                         cuda_graphs=teacher_graphs, _prepared_diagonal=teacher_diagonal,
-                        _prepared_tiles=prepared_tiles,
                     )
                     return (*inputs, *tracks)
 
@@ -1349,12 +1382,17 @@ class TaleaPredictor:
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:
                     readouts = _ordered_readouts(read, len(batch), record_pool, width)
+                if teacher_owner_thread:
+                    # Submit teacher calls in stock order on the graph-capture thread.
+                    # The same quadratic bound used for record workers limits retained maps.
+                    depth = min(teacher_readback_records, max(1, 1024 ** 2 // batch[-1].length ** 2))
+                    def launch_teacher(tiles):
+                        return teacher_device_probabilities(
+                            self.teacher_model, tiles, self.teacher_contract, self.device,
+                            teacher_graphs, teacher_diagonal,
+                        )
+                    readouts = _ordered_teacher_readbacks(readouts, launch_teacher, readout_stream, depth)
                 for record, outputs in zip(batch, readouts, strict=True):
-                    if teacher_owner_thread:
-                        # Consume in input order on the graph-capture thread and
-                        # stream while workers prepare the next bounded window.
-                        with torch.cuda.stream(readout_stream) if readout_stream is not None else contextlib.nullcontext():
-                            outputs = finish_teacher(*outputs)
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
                     if postprocess_mode == "process":

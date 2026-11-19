@@ -376,3 +376,27 @@ def test_record_workers_use_prefetch_or_ordinary_graph_stream(monkeypatch):
     assert not calls
     assert _record_worker_stream(cuda, None) is ordinary
     assert calls == [cuda]
+
+
+def test_grouped_teacher_transfers_preserve_order_and_partial_group():
+    from talea.inference import _ordered_teacher_readbacks
+    from talea.production import unpack_teacher_tracks
+
+    calls = []
+    def launch(n):
+        calls.append(n)
+        rows = torch.zeros(n, 3)
+        rows[:, 0] = torch.arange(n) * 0.125
+        rows[:, 1] = 1.0
+        return rows
+    lengths = [3, 6, 1, 4, 2]
+    result = _ordered_teacher_readbacks((((n,), n) for n in lengths), launch, None, 3)
+    first = next(result)
+    assert calls == lengths[:3]
+    records = [first, *result]
+    assert calls == lengths
+    for (length, state, classes), n in zip(records, lengths, strict=True):
+        assert length == n
+        expected_state, expected_classes = unpack_teacher_tracks(launch(n).numpy())
+        assert state.tobytes() == expected_state.tobytes()
+        assert classes.tobytes() == expected_classes.tobytes()

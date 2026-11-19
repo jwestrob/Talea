@@ -310,12 +310,19 @@ def teacher_tracks_from_attention(
 
     if _prepared_tiles is None:
         _prepared_tiles = prepare_teacher_tiles(matrices, contract)
-    length, tiles = _prepared_tiles
+    packed = teacher_device_probabilities(model, _prepared_tiles, contract, device,
+                                          cuda_graphs, _prepared_diagonal)
+    return unpack_teacher_tracks(packed.cpu().numpy())
+
+
+@torch.inference_mode()
+def teacher_device_probabilities(model, prepared_tiles, contract, device, cuda_graphs, diagonal_indices):
+    """Evaluate one protein in its original tile batches and retain the tracks on device."""
+    length, tiles = prepared_tiles
     teacher_classes = len(contract["teacher"]["class_names"])
     batch_size = int(contract["model"]["batch_size"])
     if batch_size < 1:
         raise ValueError("teacher tile batch size must be positive")
-    diagonal_indices = _prepared_diagonal
     if diagonal_indices is None:
         diagonal_indices = prepare_teacher_readout(model, contract, device)
     probability_batches = []
@@ -341,7 +348,11 @@ def teacher_tracks_from_attention(
     packed = probability_batches[0]
     if len(probability_batches) > 1:
         packed = torch.cat(probability_batches)
-    host = packed[:length].cpu().numpy()
+    return packed[:length]
+
+
+def unpack_teacher_tracks(host):
+    """Recover and validate the state and class tracks from one protein's copied rows."""
     state_track = np.ascontiguousarray(host[:, 0], dtype=np.float32)
     teacher_track = np.ascontiguousarray(host[:, 1:], dtype=np.float32)
     if not np.isfinite(state_track).all() or not np.isfinite(teacher_track).all():
