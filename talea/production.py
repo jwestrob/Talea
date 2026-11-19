@@ -122,16 +122,33 @@ def flatten_global_features(
 ) -> np.ndarray:
     """Flatten a named pooled representation in its frozen feature order."""
 
+    return _global_feature_matrix([features], feature_keys)
+
+
+def _global_feature_matrix(
+    feature_rows: Sequence[Mapping[str, np.ndarray]], feature_keys: Sequence[str]
+) -> np.ndarray:
+    """Place every pooled vector in one C-order float64 prediction matrix."""
     keys = tuple(str(value) for value in feature_keys)
     if not keys or len(set(keys)) != len(keys):
         raise ValueError("global feature keys must be unique and non-empty")
-    missing = [key for key in keys if key not in features]
-    if missing:
-        raise KeyError(f"missing global features: {missing}")
-    arrays = [np.asarray(features[key], dtype=np.float64).reshape(-1) for key in keys]
-    if any(not values.size for values in arrays):
-        raise ValueError("global feature vectors must be non-empty")
-    values = np.concatenate(arrays)[None, :]
+    vectors = []
+    width = None
+    for features in feature_rows:
+        missing = [key for key in keys if key not in features]
+        if missing:
+            raise KeyError(f"missing global features: {missing}")
+        row = [np.asarray(features[key]).reshape(-1) for key in keys]
+        sizes = [vector.size for vector in row]
+        if not all(sizes):
+            raise ValueError("global feature vectors must be non-empty")
+        row_width = sum(sizes)
+        if width is None:
+            width = row_width
+        elif row_width != width:
+            raise ValueError("global feature rows must have the same total width")
+        vectors.extend(row)
+    values = np.concatenate(vectors, dtype=np.float64, casting="unsafe").reshape(len(feature_rows), width)
     if not np.isfinite(values).all():
         raise ValueError("global feature vector contains nonfinite values")
     return values
@@ -161,13 +178,7 @@ def global_head_probabilities(
         raise KeyError(f"global model bundle lacks required fields: {missing}")
     if not feature_rows:
         raise ValueError("at least one global feature row is required")
-    values = np.concatenate(
-        [
-            flatten_global_features(features, model_bundle["feature_keys"])
-            for features in feature_rows
-        ],
-        axis=0,
-    )
+    values = _global_feature_matrix(feature_rows, model_bundle["feature_keys"])
     with warnings.catch_warnings(), np.errstate(
         divide="ignore", over="ignore", invalid="ignore"
     ):

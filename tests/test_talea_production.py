@@ -58,6 +58,21 @@ def test_flatten_global_features_honors_frozen_key_order() -> None:
     np.testing.assert_array_equal(observed, [[1.0, 2.0, 3.0, 4.0]])
 
 
+def test_global_feature_batch_converts_once_with_variable_component_widths():
+    from talea.production import _global_feature_matrix
+
+    rows = [
+        {"a": np.array([[-0.0, 1.5]], dtype=np.float32), "b": np.array([4], dtype=np.uint8)},
+        {"a": np.array([3], dtype=np.int16), "b": np.arange(4, dtype=np.float16)[::2]},
+    ]
+    expected = np.array([[-0.0, 1.5, 4.0], [3.0, 0.0, 2.0]], dtype=np.float64)
+    actual = _global_feature_matrix(rows, ["a", "b"])
+    assert actual.tobytes() == expected.tobytes()
+    assert actual.flags.c_contiguous
+    with pytest.raises(ValueError, match="same total width"):
+        _global_feature_matrix(rows + [{"a": [1], "b": [2]}], ["a", "b"])
+
+
 def test_score_composition_reproduces_frozen_reference_row() -> None:
     contract = load_deployment()["score_contract"]
     observed = compose_talea_score(
