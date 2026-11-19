@@ -181,6 +181,38 @@ def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
     assert observed_sizes == [1, 1, 1, 3, 3, 2]
 
 
+def test_packed_teacher_graph_keeps_captured_index_tensor_alive(monkeypatch):
+    import gc
+    import weakref
+    from contextlib import nullcontext
+    from talea import production
+
+    device = torch.device("cpu")
+    stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(torch.cuda, "default_stream", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
+
+    refs = []
+    def make_indices(model, contract, device):
+        value = torch.tensor([1, 2], device=device)
+        refs.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(production, "prepare_teacher_readout", make_indices)
+    contract = {"attention": {"tile_size": 4}, "input_channels": 3,
+                "model": {"batch_size": 2}, "teacher": {"class_names": ["a", "b"]}}
+    graphs = production.CudaTeacherGraphs(torch.nn.Identity(), contract, device, pack_tracks=True)
+    gc.collect()
+    assert len(refs) == 1 and refs[0]() is not None
+    del graphs
+    gc.collect()
+    assert refs[0]() is None
+
+
 def test_concurrent_graph_readouts_own_independent_diagonal_results():
     from concurrent.futures import ThreadPoolExecutor
     import threading
