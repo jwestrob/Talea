@@ -94,3 +94,41 @@ def padded_diagonals_f32(matrix, maximum):
         for i in range(length - d, length - 1):
             result[d - 1, i] = np.inf
     return result
+
+
+@njit(cache=True, fastmath=False)
+def suppress_packed(values, offsets, separations, start, end):
+    """Set touched residue pairs in the selected diagonals to their current medians."""
+    for separation in separations:
+        first, last = offsets[separation], offsets[separation + 1]
+        row = values[first:last]
+        size = len(row)
+        if size == 0:
+            continue
+        ordered = row.copy()
+        middle = size // 2
+        low, high = 0, size - 1
+        while low < high:
+            # Hoare partition, searching only for the upper middle element.
+            pivot = ordered[(low + high) // 2]
+            i, j = low, high
+            while i <= j:
+                while ordered[i] < pivot:
+                    i += 1
+                while ordered[j] > pivot:
+                    j -= 1
+                if i <= j:
+                    ordered[i], ordered[j] = ordered[j], ordered[i]
+                    i += 1
+                    j -= 1
+            if middle <= j:
+                high = j
+            elif middle >= i:
+                low = i
+            else:
+                break
+        median = ordered[middle]
+        if size % 2 == 0:
+            median = (np.max(ordered[:middle]) + median) / 2.0
+        row[max(0, start):min(size, max(0, end))] = median
+        row[max(0, start - separation):min(size, max(0, end - separation))] = median

@@ -542,6 +542,13 @@ def _wedge_members(period: float, width: int, maximum: int, missing: frozenset[i
     return tuple(offsets_out), tuple(weights_out), np.sqrt(np.maximum(variance, 1e-12))
 
 
+class _PackedTracks(list):
+    """Mutable diagonal views for repeated wedge searches on one owned buffer."""
+    def __init__(self, tracks, offsets):
+        self.values = np.concatenate(tracks, dtype=np.float64)
+        super().__init__(self.values[a:b] for a, b in zip(offsets[:-1], offsets[1:]))
+
+
 class WedgePlan:
     """Every template of a wedge search, laid out for evaluation together.
 
@@ -648,7 +655,11 @@ class WedgePlan:
             return
         length = self.protein_length
         # Row d holds the reference's prefix sum of diagonal d, [0, cumsum(track)].
-        if _compiled_track_prefixes is not None and all(
+        if _compiled_track_prefixes is not None and isinstance(tracks, _PackedTracks):
+            prefix = _compiled_track_prefixes(
+                tracks.values, self.track_offsets, self.separations, length
+            )
+        elif _compiled_track_prefixes is not None and all(
             isinstance(track, np.ndarray) and track.ndim == 1
             and track.dtype == np.float64 and len(track) <= length for track in tracks
         ):

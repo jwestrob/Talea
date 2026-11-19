@@ -76,7 +76,10 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from talea.wedge import WedgePlan, best_wedge_interval
+from talea.wedge import WedgePlan, best_wedge_interval, _PackedTracks
+
+_compiled_suppress = None
+
 
 SECONDARY_MAXIMUM_CALLS = 20
 SECONDARY_MINIMUM_SCORE = 12.0
@@ -153,12 +156,26 @@ def secondary_wedge_calls(
     # Suppression edits values only, so every search shares one template plan.
     if plan is None:
         plan = WedgePlan([len(track) for track in tracks], length, periods, widths, **settings)
-    # Wedge evaluation only uses these separations. Preserve the other
-    # tracks by reference for the plan's shape checks.
-    work = list(tracks)
-    for separation in plan.separations:
-        work[separation] = np.array(tracks[separation], dtype=np.float64, copy=True)
-    suppress_interval(work, int(primary["start"]), int(primary["end"]), separations=plan.separations)
+    if _compiled_suppress is not None:
+        work = _PackedTracks(tracks, plan.track_offsets)
+        # NumPy partition's tie ordering matters for negative zero. Nonfinite
+        # inputs also retain the public median's propagation rules.
+        use_kernel = np.isfinite(work.values).all() and not np.any(
+            (work.values == 0) & np.signbit(work.values)
+        )
+    else:
+        work = list(tracks)
+        for separation in plan.separations:
+            work[separation] = np.array(tracks[separation], dtype=np.float64, copy=True)
+        use_kernel = False
+
+    def suppress(start, end):
+        if use_kernel:
+            _compiled_suppress(work.values, plan.track_offsets, plan.separations, start, end)
+        else:
+            suppress_interval(work, start, end, separations=plan.separations)
+
+    suppress(int(primary["start"]), int(primary["end"]))
     calls = []
     for rank in range(2, 2 + SECONDARY_MAXIMUM_CALLS):
         call = best_wedge_interval(work, length, periods, widths, plan=plan, **settings)
@@ -174,7 +191,7 @@ def secondary_wedge_calls(
                 "score": score,
             }
         )
-        suppress_interval(work, int(call["start"]), int(call["end"]), separations=plan.separations)
+        suppress(int(call["start"]), int(call["end"]))
     return calls
 
 

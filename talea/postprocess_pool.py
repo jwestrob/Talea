@@ -55,9 +55,11 @@ def _enable_compiled_topology_kernels() -> None:
             return
         from talea._attention_numba import diagonal_means_f32, diagonal_prefix_f32, integral_image_f32, interval_medians, registration_geometry
         from talea._phase_numba import transitions
+        from talea._wedge_numba import suppress_packed
     except ImportError:
         return
-    from talea import attention, phase_ssm, unit_registration
+    from talea import attention, phase_ssm, regions, unit_registration
+    regions._compiled_suppress = suppress_packed
     attention._compiled_diagonal_means = diagonal_means_f32
     attention._compiled_diagonal_prefix = diagonal_prefix_f32
     unit_registration._compiled_registration_geometry = registration_geometry
