@@ -600,6 +600,7 @@ class TaleaPredictor:
         self._graph_readout_stream = None
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
+        self.tuned_gemm_statistics = {}
         self.fused_qk_calls = 0
         self.fused_rotary_calls = 0
         self.fused_swiglu_calls = 0
@@ -947,6 +948,8 @@ class TaleaPredictor:
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_qk: bool = False,
+        tuned_gemm: str = "off",
+        verify_tuned_gemm: bool = False,
         fused_swiglu: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
@@ -1227,6 +1230,14 @@ class TaleaPredictor:
                     mode=capture_mode,
                 )
             )
+            self.tuned_gemm_statistics = {}
+            if tuned_gemm != "off":
+                from talea.tuned_gemm import tuned_gemm_context
+                self.tuned_gemm_statistics = stack.enter_context(
+                    tuned_gemm_context(capture.blocks, self.device, tuned_gemm, verify_tuned_gemm)
+                )
+            elif verify_tuned_gemm:
+                raise ValueError("verify_tuned_gemm requires a tuned_gemm projection")
             self.fused_qk_calls = 0
             qk_calls = [0]
             if fused_qk:
