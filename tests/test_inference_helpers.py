@@ -195,3 +195,46 @@ def test_contiguous_attention_crop_matches_gathers_bitwise(dtype):
         result = apc_head_mean(attention, indices, length, 3, torch.float16,
                                residue_slice=slice(offset, offset + length))
         assert result.tobytes() == reference.tobytes()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA unavailable"
+))])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_attention_staging_matches_blocking_copies_and_preserves_worker_arrays(device, dtype):
+    from talea.inference import _AttentionStaging
+    transfer = _AttentionStaging(pin_memory=device == "cuda")
+    stored = []
+    expected = []
+    for length in (11, 13, 9, 37, 12):
+        current = {}
+        for layer in (13, 35):
+            values = torch.arange(length**2, dtype=torch.float32, device=device)
+            matrix = torch.sin(values + layer).reshape(length, length).to(dtype)
+            current[layer] = matrix.cpu().float().numpy()
+            transfer.enqueue(layer, matrix)
+        # The real parent calls _hidden_readouts, whose synchronous copy releases
+        # both enqueued attention maps to consumers on the same stream.
+        torch.ones(1, device=device).cpu()
+        expected.append(current)
+        stored.append(transfer.unpack_after_readouts(length))
+    for before, after in zip(expected, stored, strict=True):
+        for layer in (13, 35):
+            assert before[layer].tobytes() == after[layer].tobytes()
+
+
+def test_record_worker_threads_own_independent_attention_staging():
+    import threading
+    from talea.inference import _AttentionStaging
+    transfer = _AttentionStaging(pin_memory=False)
+    barrier = threading.Barrier(4)
+
+    def simulate_readout(protein):
+        transfer.enqueue(13, torch.full((20, 20), protein, dtype=torch.float16))
+        barrier.wait(timeout=10)
+        return transfer.unpack_after_readouts(20)[13]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as workers:
+        result = list(workers.map(simulate_readout, range(4)))
+    for protein, matrix in enumerate(result):
+        np.testing.assert_array_equal(matrix, np.full((20, 20), protein, dtype=np.float32))

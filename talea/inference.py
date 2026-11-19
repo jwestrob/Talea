@@ -11,6 +11,7 @@ import json
 import multiprocessing
 import os
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
@@ -187,14 +188,14 @@ def near_diagonal_mask(
     return _separation_mask_block(capacity, minimum_separation, device)[:sequence_length, :sequence_length]
 
 
-def apc_head_mean(
+def _apc_head_mean_tensor(
     layer_attention: torch.Tensor,
     indices: torch.Tensor,
     sequence_length: int,
     minimum_separation: int,
     storage_dtype: torch.dtype | None = None,
     residue_slice: slice | None = None,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Symmetrize, APC-correct, head-average, and crop one attention layer.
 
     The crop precedes the symmetrization: both operations are elementwise over
@@ -225,12 +226,55 @@ def apc_head_mean(
     attention.fill_diagonal_(0.0)
     if storage_dtype is not None and attention.dtype != storage_dtype:
         attention = attention.to(storage_dtype)
-    result = attention.to("cpu", dtype=torch.float32).numpy()
+    return attention
+
+
+def _checked_attention_matrix(result, sequence_length):
     if result.shape != (sequence_length, sequence_length) or not result.size:
         raise ValueError("cropped attention matrix does not match sequence length")
     if not np.isfinite(result).all():
         raise ValueError("attention matrix contains nonfinite values")
     return result
+
+
+def apc_head_mean(
+    layer_attention, indices, sequence_length, minimum_separation, storage_dtype=None,
+    residue_slice=None,
+):
+    tensor = _apc_head_mean_tensor(
+        layer_attention, indices, sequence_length, minimum_separation, storage_dtype,
+        residue_slice,
+    )
+    return _checked_attention_matrix(tensor.to("cpu", dtype=torch.float32).numpy(), sequence_length)
+
+
+class _AttentionStaging(threading.local):
+    """Thread-local pinned scratch, reused once a protein's readouts reach the host."""
+
+    def __init__(self, pin_memory=True):
+        self._buffers = {}
+        self._pin_memory = pin_memory
+
+    def enqueue(self, layer, matrix):
+        count = matrix.numel()
+        buffer = self._buffers.get(layer)
+        if buffer is None or buffer.numel() < count or buffer.dtype != matrix.dtype:
+            # Lengths are sorted; grow geometrically instead of pinning new pages
+            # for every additional residue. Total space is bounded by O(max L²).
+            capacity = 1 << (count - 1).bit_length()
+            buffer = torch.empty(capacity, dtype=matrix.dtype, device="cpu", pin_memory=self._pin_memory)
+            self._buffers[layer] = buffer
+        buffer[:count].view_as(matrix).copy_(matrix, non_blocking=True)
+
+    def unpack_after_readouts(self, length):
+        matrices = {}
+        for layer, buffer in self._buffers.items():
+            host = buffer[:length * length].reshape(length, length)
+            # Workers (and possibly their IPC feeder) retain these arrays after
+            # the following protein starts using our pinned storage.
+            matrix = host.to(dtype=torch.float32, copy=True).numpy()
+            matrices[layer] = _checked_attention_matrix(matrix, length)
+        return matrices
 
 
 def _batch_residue_indices(tokenized, records, device):
@@ -873,6 +917,7 @@ class TaleaPredictor:
                 for _, future, *_ in outstanding:
                     future.cancel()
 
+        attention_staging = _AttentionStaging() if self.device.type == "cuda" else None
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)
             record_pool = None
@@ -929,20 +974,24 @@ class TaleaPredictor:
                 def readout(batch_position):
                     record = batch[batch_position]
                     indices, residue_slice = residue_indices[batch_position]
-                    matrices = {
-                        layer: apc_head_mean(
-                            attentions[layer][batch_position],
-                            indices,
-                            record.length,
-                            minimum_separation,
-                            storage_dtype=device_storage_dtype,
-                            residue_slice=residue_slice,
+                    matrices = {}
+                    for layer in self.expected_layers:
+                        tensor = _apc_head_mean_tensor(
+                            attentions[layer][batch_position], indices, record.length,
+                            minimum_separation, device_storage_dtype, residue_slice,
                         )
-                        for layer in self.expected_layers
-                    }
+                        if attention_staging is None:
+                            host = tensor.to("cpu", dtype=torch.float32).numpy()
+                            matrices[layer] = _checked_attention_matrix(host, record.length)
+                        else:
+                            attention_staging.enqueue(layer, tensor)
                     pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
                         hidden_states, indices, batch_position, residue_slice
                     )
+                    if attention_staging is not None:
+                        # _hidden_readouts' blocking D2H copy is on the same CUDA
+                        # stream as both enqueued attention copies.
+                        matrices = attention_staging.unpack_after_readouts(record.length)
                     # The residue-state track goes to the worker too: further
                     # wedge calls are registered into units only where it
                     # supports them.
