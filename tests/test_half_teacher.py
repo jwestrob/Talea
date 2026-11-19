@@ -4,10 +4,10 @@ import pytest
 from talea.repeat_state import central_tile_spans, normalized_attention_tiles
 
 pytest.importorskip("numba")
-from talea._teacher_histogram import native_half_tables, native_half_tiles
+from talea._teacher_histogram import _half_histogram, native_half_tables, native_half_tiles
 
 
-@pytest.mark.parametrize("length", [1, 25, 64, 65, 127, 193, 271])
+@pytest.mark.parametrize("length", [1, 25, 64, 65, 127, 159, 160, 161, 193, 271])
 def test_native_teacher_half_tiles_match_full_reference(length):
     rng = np.random.default_rng(203)
     words = rng.integers(0, 0x7c00, size=(length, length), dtype=np.uint16)
@@ -37,3 +37,25 @@ def test_native_teacher_half_tiles_match_full_reference(length):
 def test_bad_half_words_are_rejected(word):
     with pytest.raises(ValueError, match="finite and nonnegative"):
         native_half_tiles([np.array([[word]], np.uint16).view(np.float16)], central_tile_spans(1), 128, .95, 8.0)
+
+
+@pytest.mark.parametrize("size", [160 * 160 - 1, 160 * 160, 160 * 160 + 1, 2 * 0x7c00])
+def test_native_half_histogram_counts_positive_words_and_both_zeros(size):
+    words = (np.arange(size, dtype=np.uint32) % 0x7c00).astype(np.uint16)
+    words[::7] = 0x8000
+    for view in (words, words[::-1]):
+        expected = np.bincount(view[(view != 0) & (view != 0x8000)], minlength=0x7c00)
+        counts, count = _half_histogram(view)
+        np.testing.assert_array_equal(counts, expected)
+        assert count == expected.sum()
+    words[::2], words[1::2] = 0, 0x8000
+    counts, count = _half_histogram(words)
+    assert count == 0 and not counts.any()
+
+
+@pytest.mark.parametrize("word", [0x7c00, 0x7c01, 0x7fff, 0x8001, 0xfbff, 0xfc00, 0xffff])
+def test_native_half_histogram_rejects_invalid_large_maps(word):
+    words = np.zeros((160, 160), dtype=np.uint16)
+    words[-1, -1] = word
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        native_half_tables([words.view(np.float16)], .95, 8.0)

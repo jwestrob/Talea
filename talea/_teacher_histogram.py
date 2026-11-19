@@ -89,9 +89,22 @@ def _half_levels():
 
 @njit(cache=True, nogil=True)
 def _half_histogram(words):
+    flat = words.ravel()
+    if 160 * 160 <= flat.size < 2**31:
+        # For large maps, count each raw word first and validate the occupied
+        # ranges once. The two zero encodings are valid and carry no rank.
+        all_counts = np.zeros(1 << 16, np.int32)
+        for word in flat:
+            all_counts[word] += 1
+        if np.any(all_counts[0x7c00:0x8000]) or np.any(all_counts[0x8001:]):
+            raise ValueError("APC attention matrix must be finite and nonnegative")
+        total = flat.size - all_counts[0] - all_counts[0x8000]
+        all_counts[0] = 0
+        return all_counts[:0x7c00], total
+
     counts = np.zeros(0x7c00, np.int32)
     total = 0
-    for word in words.ravel():
+    for word in flat:
         if 0 < word < 0x7c00:
             counts[word] += 1
             total += 1
