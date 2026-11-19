@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
                         help="group ordered teacher probability transfers for up to this many proteins")
+    parser.add_argument("--native-half-readout", action="store_true",
+                        help="retain fp16 attention through teacher normalization and topology transport on CUDA")
     parser.add_argument("--teacher-quantile-histogram", action="store_true",
                         help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
     parser.add_argument("--teacher-owner-thread", action="store_true",
@@ -253,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
+        **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
@@ -309,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
+        **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}

@@ -355,12 +355,17 @@ class _AttentionStaging(threading.local):
             self._buffers[layer] = buffer
         buffer[:count].view_as(matrix).copy_(matrix, non_blocking=True)
 
-    def unpack_after_readouts(self, length):
+    def unpack_after_readouts(self, length, native_half=False):
         matrices = {}
         for layer, buffer in self._buffers.items():
             host = buffer[:length * length].reshape(length, length)
             # Workers (and possibly their IPC feeder) retain these arrays after
             # the following protein starts using our pinned storage.
+            if native_half and host.dtype == torch.float16:
+                # The teacher histogram validates every half word before this
+                # record is submitted to a topology worker.
+                matrices[layer] = host.numpy().copy()
+                continue
             matrix = host.to(dtype=torch.float32, copy=True).numpy()
             matrices[layer] = _checked_attention_matrix(matrix, length)
         return matrices
@@ -943,6 +948,7 @@ class TaleaPredictor:
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
         teacher_quantile_histogram: bool = False,
+        native_half_readout: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -1052,6 +1058,13 @@ class TaleaPredictor:
             raise ValueError(f"unsupported attention storage dtype: {storage_dtype}")
         device_storage_dtype = torch.float16 if storage_dtype == "fp16" else None
         quantile_function = compiled_teacher_quantile() if teacher_quantile_histogram and storage_dtype == "fp16" else None
+        half_decoder = None
+        if native_half_readout and self.device.type == "cuda" and storage_dtype == "fp16":
+            if compiled_teacher_quantile() is not None:
+                from talea._teacher_histogram import native_half_tiles
+                half_decoder = native_half_tiles
+                teacher_owner_thread = True
+        self.native_half_readout_active = half_decoder is not None
         self.teacher_quantile_histogram_active = quantile_function is not None
         minimum_separation = int(
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
@@ -1350,10 +1363,10 @@ class TaleaPredictor:
                     if attention_staging is not None:
                         # _hidden_readouts' blocking D2H copy is on the same CUDA
                         # stream as both enqueued attention copies.
-                        matrices = attention_staging.unpack_after_readouts(record.length)
+                        matrices = attention_staging.unpack_after_readouts(record.length, native_half=half_decoder is not None)
                     inputs = pooled, matrices, probabilities, region_track, gate_logit
                     if teacher_owner_thread:
-                        return inputs, prepare_teacher_tiles(matrices, self.teacher_contract, quantile_function=quantile_function)
+                        return inputs, prepare_teacher_tiles(matrices, self.teacher_contract, quantile_function=quantile_function, half_decoder=half_decoder)
                     return finish_teacher(inputs)
 
                 # Bound concurrent quadratic APC scratch as records get longer.

@@ -1,4 +1,4 @@
-"""Bounded shared storage for float32 attention maps sent to process workers."""
+"""Bounded shared storage for fp16 and fp32 attention maps sent to process workers."""
 
 from __future__ import annotations
 
@@ -15,10 +15,11 @@ class AttentionSpan(NamedTuple):
     offset: int
     length: int
     layers: tuple[int, ...]
+    half: bool = False
 
     def matrices(self, buffer):
         size = self.length**2
-        flat = np.frombuffer(buffer, dtype=np.float32, count=len(self.layers) * size,
+        flat = np.frombuffer(buffer, dtype=np.float16 if self.half else np.float32, count=len(self.layers) * size,
                              offset=self.offset * np.dtype(np.float32).itemsize)
         stack = flat.reshape(len(self.layers), self.length, self.length)
         stack.flags.writeable = False
@@ -47,10 +48,14 @@ class SharedAttentionArena:
         metadata, matrices, *rest = payload
         length = metadata["length"]
         layers = tuple(matrices)
-        count = len(layers) * length**2
+        elements = len(layers) * length**2
+        half = bool(layers) and matrices[layers[0]].dtype == np.float16
+        dtype = np.float16 if half else np.float32
+        # Ring offsets count 4-byte words. Round odd-sized half spans up.
+        count = (elements + 1) // 2 if half else elements
         capacity = self._flat.size
         suitable = 0 < count <= capacity and all(
-            matrix.dtype == np.float32 and matrix.shape == (length, length)
+            matrix.dtype == dtype and matrix.shape == (length, length)
             for matrix in matrices.values())
         with self._lock:
             while self._live:
@@ -66,10 +71,10 @@ class SharedAttentionArena:
             if not suitable or (self._live and start + count - self._live[0][0] > capacity):
                 self.pickled_records += 1
                 return pool.submit(function, payload)
-            dest = self._flat[offset:offset + count].reshape(len(layers), length, length)
+            dest = self._flat[offset:offset + count].view(dtype)[:elements].reshape(len(layers), length, length)
             for dest_layer, layer in zip(dest, layers, strict=True):
                 np.copyto(dest_layer, matrices[layer])
-            span = AttentionSpan(offset, length, layers)
+            span = AttentionSpan(offset, length, layers, half)
             future = pool.submit(function, (metadata, span, *rest))
             self._head = start + count
             self._live.append((start, ref(future)))

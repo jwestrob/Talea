@@ -65,3 +65,18 @@ def test_cancel_and_submit_failure_leave_capacity_available():
         ring.submit(Broken(), None, data)
     ring.submit(pool, None, data)
     assert isinstance(pool.tasks[-1][0][1], AttentionSpan)
+
+
+def test_odd_half_span_preserves_bits_and_adjacent_float_span():
+    ring = SharedAttentionArena(72)
+    pool = DeferredPool()
+    half = np.arange(9, dtype=np.float16).reshape(3, 3)
+    half[1, 1] = -0.
+    full = np.full((3, 3), 1.115, dtype=np.float32)
+    for m in (half, full):
+        ring.submit(pool, None, ({"length": 3}, {13:m}, ()))
+    assert ring.shared_records == 2
+    for (task, _), m in zip(pool.tasks, (half, full)):
+        recovered = task[1].matrices(ring.buffer)[13]
+        assert recovered.dtype == m.dtype
+        assert recovered.tobytes() == m.tobytes()
