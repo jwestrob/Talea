@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+from typing import NamedTuple
 from collections import deque
 from collections.abc import Iterable, Iterator, Sequence
 
@@ -318,6 +319,56 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
             yield start + offset, {layer: maps[layer][offset] for layer in layers}
 
 
+class _PendingAPC(NamedTuple):
+    shape: torch.Size
+    itemsize: int
+    future: concurrent.futures.Future
+
+    def element_size(self):
+        return self.itemsize
+
+
+def _layer_apc(weights, indices_by_record, separation, dtype, grouped):
+    """Run the existing scalar and equal-length kernels, in record order."""
+    maps = []
+    groups = (_equal_apc_groups(indices_by_record, weights.shape[1]) if grouped
+              else ((i, i + 1) for i in range(len(indices_by_record))))
+    for start, stop in groups:
+        indices, span = indices_by_record[start]
+        length = len(indices)
+        if stop == start + 1:
+            maps.append(_apc_head_mean_tensor(weights[start], indices, length, separation, dtype, span))
+        else:
+            maps.extend(_equal_length_apc(weights[start:stop], length, separation, dtype, span).unbind())
+    return maps
+
+
+def _queue_layer_apc(weights, *, executor, stream, indices, separation, dtype, grouped):
+    """Launch correction from the capture hook, while the producer continues to encode."""
+    ready = torch.cuda.current_stream(weights.device).record_event()
+
+    @torch.inference_mode()
+    def work():
+        with torch.cuda.stream(stream):
+            stream.wait_event(ready)
+            weights.record_stream(stream)
+            maps = _layer_apc(weights, indices, separation, dtype, grouped)
+            return maps, stream.record_event()
+
+    return _PendingAPC(weights.shape, weights.element_size(), executor.submit(work))
+
+
+def _collect_layer_apc(pending, consumer):
+    result = {}
+    for layer, value in pending.items():
+        maps, ready = value.future.result()
+        consumer.wait_event(ready)
+        for matrix in maps:
+            matrix.record_stream(consumer)
+        result[layer] = maps
+    return result
+
+
 def _checked_attention_matrix(result, sequence_length):
     if result.shape != (sequence_length, sequence_length) or not result.size:
         raise ValueError("cropped attention matrix does not match sequence length")
@@ -601,6 +652,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.fused_rotary_calls = 0
+        self.early_apc_layers = 0
         self.unit_residual_blocks = 0
         self.fused_swiglu_calls = 0
         self.unit_placement = unit_placement
@@ -948,6 +1000,7 @@ class TaleaPredictor:
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
         unit_residual: bool = False,
+        early_apc: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         shared_attention_mib: int = 0,
@@ -1014,6 +1067,8 @@ class TaleaPredictor:
                 "eligible_squared_lengths": 0, "group_size_counts": {},
                 "element_budget": _APC_GROUP_ELEMENTS,
             }
+        if early_apc and (self.device.type != "cuda" or _device_autocast_enabled("cuda")):
+            raise ValueError("early APC requires CUDA and an explicit model dtype")
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
@@ -1241,6 +1296,11 @@ class TaleaPredictor:
                 from talea.swiglu import swiglu_context
                 swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device))
                 stack.callback(lambda: setattr(self, "fused_swiglu_calls", swiglu_calls[0]))
+            self.early_apc_layers = 0
+            if early_apc:
+                apc_stream = torch.cuda.Stream(device=self.device)
+                stack.callback(apc_stream.synchronize)
+                apc_executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=1))
             producer = None
             if overlap_enabled:
                 # Join the producer before restoring the ESM hooks.
@@ -1269,6 +1329,14 @@ class TaleaPredictor:
                     if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
                 capture.reset()
+                if early_apc:
+                    for indices, _ in residue_indices:
+                        indices.record_stream(apc_stream)
+                    capture.transform_attention = partial(
+                        _queue_layer_apc, executor=apc_executor, stream=apc_stream,
+                        indices=residue_indices, separation=minimum_separation, dtype=device_storage_dtype,
+                        grouped=group_equal_apc,
+                    )
                 try:
                     model_output = self.esm_model(
                         **model_inputs,
@@ -1282,6 +1350,8 @@ class TaleaPredictor:
                 except BaseException:
                     capture.reset()
                     raise
+                finally:
+                    capture.transform_attention = None
                 ready = None
                 if readout_stream is not None:
                     ready = torch.cuda.current_stream(self.device).record_event()
@@ -1297,6 +1367,11 @@ class TaleaPredictor:
                     # Grouped correction temporaries can outgrow scalar scratch
                     # for a single record. Include six group-sized fp32 buffers.
                     required += 6 * 4 * _APC_GROUP_ELEMENTS
+                if early_apc:
+                    # The following capture can be reduced while this batch
+                    # still owns encoder outputs and readout scratch.
+                    heads = next(iter(attention.values())).shape[1]
+                    required += 6 * 4 * max(_APC_GROUP_ELEMENTS, heads * following[-1].length**2)
                 return required <= _prefetch_headroom(self.device)
 
             next_forward = None
@@ -1319,7 +1394,11 @@ class TaleaPredictor:
                 residue_indices, attentions, hidden_states, ready = captured
                 del captured
                 if ready is not None:
-                    _handoff_capture(readout_stream, ready, attentions, hidden_states, residue_indices)
+                    _handoff_capture(readout_stream, ready, {} if early_apc else attentions, hidden_states, residue_indices)
+                if early_apc:
+                    consumer = readout_stream if readout_stream is not None else torch.cuda.current_stream(self.device)
+                    layer_maps = _collect_layer_apc(attentions, consumer)
+                    self.early_apc_layers += len(layer_maps)
                 compact = []
                 pooled_rows = []
 
@@ -1338,7 +1417,9 @@ class TaleaPredictor:
                     indices, residue_slice = residue_indices[batch_position]
                     matrices = {}
                     for layer in self.expected_layers:
-                        if grouped is None:
+                        if early_apc:
+                            tensor = layer_maps[layer][batch_position]
+                        elif grouped is None:
                             tensor = _apc_head_mean_tensor(
                                 attentions[layer][batch_position], indices, record.length,
                                 minimum_separation, device_storage_dtype, residue_slice,
@@ -1386,7 +1467,12 @@ class TaleaPredictor:
                             stats["eligible_groups"] += 1
                             stats["eligible_records"] += size
                             stats["eligible_squared_lengths"] += squares
-                if group_equal_apc and self.device.type == "cuda":
+                if early_apc and group_equal_apc:
+                    for start, stop in groups:
+                        if stop - start > 1:
+                            stats["executed_groups"] += 1
+                            stats["executed_records"] += stop - start
+                if group_equal_apc and self.device.type == "cuda" and not early_apc:
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
                         device_storage_dtype, readout_stream, groups, stats,
@@ -1436,6 +1522,8 @@ class TaleaPredictor:
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )
+                if early_apc:
+                    del layer_maps
                 del residue_indices, attentions, hidden_states, pooled_rows
                 # empty_cache() returns blocks to the driver and forces later
                 # cudaMalloc; gc.collect() walks every generation. Both were

@@ -337,7 +337,7 @@ def test_device_autocast_matches_cpu_context():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
-    from talea.inference import _apc_head_mean_tensor, _equal_apc_groups, _grouped_apc_jobs
+    from talea.inference import _apc_head_mean_tensor, _equal_apc_groups, _grouped_apc_jobs, _layer_apc
     lengths = [63] * 11 + [64] * 5 + [65]
     positions = [(torch.arange(1, n + 1), slice(1, n + 1)) for n in lengths]
     positions[9] = (torch.cat((torch.arange(1, 63), torch.tensor([64]))), None)
@@ -352,13 +352,14 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
         delivered = list(_ordered_readouts(lambda item: item, len(lengths), pool, width=3, items=jobs))
     assert [n for n, _ in delivered] == list(range(len(lengths)))
     assert stats == {"executed_groups": 2, "executed_records": 13}
+    early = {k: _layer_apc(value, positions, 4, torch.float16, grouped=True) for k, value in maps.items()}
     for n, grouped in delivered:
-        if grouped is None:
-            continue
         ix, span = positions[n]
         for k in maps:
             scalar = _apc_head_mean_tensor(maps[k][n], ix, len(ix), 4, torch.float16, span)
-            assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
+            assert torch.equal(early[k][n].view(torch.int16), scalar.view(torch.int16))
+            if grouped is not None:
+                assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
 
 def test_record_workers_use_prefetch_or_ordinary_graph_stream(monkeypatch):
     from talea.inference import _record_worker_stream
