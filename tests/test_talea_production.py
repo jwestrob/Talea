@@ -14,6 +14,7 @@ from talea.production import (
     roundtrip_attention_storage,
     standardized_probability_z,
     summarize_teacher_prediction,
+    teacher_tracks_for_records,
     teacher_tracks_from_attention,
 )
 
@@ -132,3 +133,47 @@ def test_bundled_teacher_loads_and_emits_valid_tracks() -> None:
     assert teacher_track.shape == (80, len(contract["teacher"]["class_names"]))
     np.testing.assert_allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5)
     assert 0.0 <= summary["mean_probability"] <= 1.0
+
+
+def test_mixed_protein_teacher_batches_match_single_protein_tracks() -> None:
+    import json
+
+    assets = verified_runtime_assets()
+    contract = json.loads(assets.teacher_contract.read_text())
+    contract["model"]["batch_size"] = 3
+    model = AttentionStateTeacherUNet(
+        input_channels=int(contract["input_channels"]),
+        teacher_classes=len(contract["teacher"]["class_names"]),
+        base_channels=int(contract["model"]["base_channels"]),
+    )
+    model.load_state_dict(
+        torch.load(assets.teacher_model, map_location="cpu", weights_only=True)
+    )
+    rng = np.random.default_rng(551)
+    lengths = (1, 63, 64, 65, 193, 7)
+    matrix_rows = [
+        {layer: rng.random((length, length), dtype=np.float32) for layer in (13, 35)}
+        for length in lengths
+    ]
+    device = torch.device("cpu")
+    reference = [
+        teacher_tracks_from_attention(model, row, contract, device) for row in matrix_rows
+    ]
+    batch_sizes = []
+    hook = model.register_forward_pre_hook(
+        lambda module, inputs: batch_sizes.append(inputs[0].shape[0])
+    )
+    try:
+        batched = teacher_tracks_for_records(model, matrix_rows, contract, device)
+    finally:
+        hook.remove()
+    # 1+1+1+2+4+1 tiles. The 193-residue protein spans two teacher batches.
+    assert batch_sizes == [3, 3, 3, 1]
+    assert len(batched) == len(lengths)
+    for length, (state, classes), (ref_state, ref_classes) in zip(
+        lengths, batched, reference, strict=True
+    ):
+        assert state.shape == (length,)
+        assert classes.shape == (length, len(contract["teacher"]["class_names"]))
+        np.testing.assert_allclose(state, ref_state, rtol=1e-5, atol=3e-6)
+        np.testing.assert_allclose(classes, ref_classes, rtol=1e-5, atol=3e-6)

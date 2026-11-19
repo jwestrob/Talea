@@ -87,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--batch-teacher-tiles",
+        action="store_true",
+        help="pool teacher U-Net tiles from multiple proteins in one forward pass",
+    )
+    parser.add_argument(
         "--cache-clear-interval",
         type=int,
         default=0,
@@ -229,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_workers": args.postprocess_workers,
         "progress": not args.quiet,
         "capture_mode": args.capture_mode,
+        "batch_teacher_tiles": args.batch_teacher_tiles,
         "cache_clear_interval": args.cache_clear_interval,
         "postprocess_mode": args.postprocess_mode,
     }
@@ -274,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
         "device": str(predictor.device),
         "dtype": predictor.dtype_name,
         "capture_mode": args.capture_mode,
+        "batch_teacher_tiles": args.batch_teacher_tiles,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
         "deterministic": args.deterministic,

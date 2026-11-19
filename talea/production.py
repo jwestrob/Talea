@@ -196,21 +196,9 @@ def standardized_probability_z(
     return (probability_logit(float(probability)) - mean) / standard_deviation
 
 
-@torch.inference_mode()
-def teacher_tracks_from_attention(
-    model: torch.nn.Module,
-    matrices: Mapping[int, np.ndarray],
-    contract: Mapping,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Decode one protein's state and teacher-class tracks from attention.
-
-    Tiles are scored only on their central diagonal, so every residue is
-    reconstructed exactly once and padding never contributes to a summary.
-    """
-
-    attention = contract["attention"]
-    layers = tuple(int(value) for value in attention["layers_zero_based"])
+def _teacher_channels(
+    matrices: Mapping[int, np.ndarray], attention: Mapping, layers: Sequence[int]
+) -> np.ndarray:
     missing = [layer for layer in layers if layer not in matrices]
     if missing:
         raise KeyError(f"missing teacher attention layers: {missing}")
@@ -221,19 +209,26 @@ def teacher_tracks_from_attention(
     shape = next(iter(shapes))
     if len(shape) != 2 or shape[0] != shape[1] or shape[0] < 1:
         raise ValueError("teacher attention matrices must be non-empty and square")
-    length = int(shape[0])
-    channels = attention_channels(
+    return attention_channels(
         selected,
         quantile=float(attention["normalization_quantile"]),
         clip=float(attention["normalization_clip"]),
     )
+
+
+@torch.inference_mode()
+def teacher_tracks_for_records(
+    model: torch.nn.Module,
+    matrix_rows: Sequence[Mapping[int, np.ndarray]],
+    contract: Mapping,
+    device: torch.device,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Pool diagonal tiles across proteins, retaining each protein's normalization."""
+    attention = contract["attention"]
+    layers = tuple(int(value) for value in attention["layers_zero_based"])
     tile_size = int(attention["tile_size"])
     central_size = int(attention["central_size"])
-    spans = central_tile_spans(length, tile_size, central_size)
     teacher_classes = len(contract["teacher"]["class_names"])
-    state_track = np.zeros(length, dtype=np.float32)
-    teacher_track = np.zeros((length, teacher_classes), dtype=np.float32)
-    observed = np.zeros(length, dtype=np.int8)
     batch_size = int(contract["model"]["batch_size"])
     if batch_size < 1:
         raise ValueError("teacher tile batch size must be positive")
@@ -242,32 +237,61 @@ def teacher_tracks_from_attention(
     diagonal_indices = torch.arange(
         offset, offset + central_size, device=device, dtype=torch.long
     )
-    for batch_start in range(0, len(spans), batch_size):
-        batch_spans = spans[batch_start : batch_start + batch_size]
-        tiles = np.stack(
-            [extract_attention_tile(channels, span, tile_size) for span in batch_spans]
-        )
-        output = model(torch.from_numpy(tiles).to(device))
+
+    tracks = []
+    observed = []
+    tiles = []
+    destinations = []
+
+    def score_tiles():
+        tile_batch = torch.from_numpy(np.stack(tiles)).to(device)
+        output = model(tile_batch)
         if output.shape[1] != 1 + teacher_classes:
             raise ValueError("teacher model output channels disagree with its contract")
         diagonal = output[:, :, diagonal_indices, diagonal_indices]
-        state_probability = torch.sigmoid(diagonal[:, 0]).cpu().numpy()
-        teacher_probability = torch.softmax(diagonal[:, 1:], dim=1)
-        teacher_probability = teacher_probability.transpose(1, 2).cpu().numpy()
-        for row_index, span in enumerate(batch_spans):
-            start = int(span["central_start"])
-            end = int(span["central_end"])
-            width = end - start
-            state_track[start:end] = state_probability[row_index, :width]
-            teacher_track[start:end] = teacher_probability[row_index, :width]
-            observed[start:end] += 1
-    if not np.all(observed == 1):
-        raise RuntimeError("teacher tiles did not cover every residue exactly once")
-    if not np.isfinite(state_track).all() or not np.isfinite(teacher_track).all():
-        raise ValueError("teacher model emitted nonfinite values")
-    if not np.allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5):
-        raise ValueError("teacher class probabilities are not normalized")
-    return state_track, teacher_track
+        states = torch.sigmoid(diagonal[:, 0]).cpu().numpy()
+        classes = torch.softmax(diagonal[:, 1:], dim=1).transpose(1, 2).cpu().numpy()
+        for row, (protein, start, end) in enumerate(destinations):
+            state_track, teacher_track = tracks[protein]
+            state_track[start:end] = states[row, :end - start]
+            teacher_track[start:end] = classes[row, :end - start]
+            observed[protein][start:end] += 1
+        tiles.clear()
+        destinations.clear()
+
+    for protein, matrices in enumerate(matrix_rows):
+        channels = _teacher_channels(matrices, attention, layers)
+        length = channels.shape[1]
+        tracks.append((
+            np.zeros(length, dtype=np.float32),
+            np.zeros((length, teacher_classes), dtype=np.float32),
+        ))
+        observed.append(np.zeros(length, dtype=np.int8))
+        for span in central_tile_spans(length, tile_size, central_size):
+            tiles.append(extract_attention_tile(channels, span, tile_size))
+            destinations.append((protein, span["central_start"], span["central_end"]))
+            if len(tiles) == batch_size:
+                score_tiles()
+    if tiles:
+        score_tiles()
+    for (state_track, teacher_track), covered in zip(tracks, observed, strict=True):
+        if not np.all(covered == 1):
+            raise RuntimeError("teacher tiles did not cover every residue exactly once")
+        if not np.isfinite(state_track).all() or not np.isfinite(teacher_track).all():
+            raise ValueError("teacher model emitted nonfinite values")
+        if not np.allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5):
+            raise ValueError("teacher class probabilities are not normalized")
+    return tracks
+
+
+def teacher_tracks_from_attention(
+    model: torch.nn.Module,
+    matrices: Mapping[int, np.ndarray],
+    contract: Mapping,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode one protein's state and teacher-class tracks from attention."""
+    return teacher_tracks_for_records(model, [matrices], contract, device)[0]
 
 
 def summarize_teacher_prediction(

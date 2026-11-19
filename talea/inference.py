@@ -44,7 +44,7 @@ from talea.production import (
     pooled_hidden_features_for_layers,
     roundtrip_attention_storage,
     summarize_teacher_prediction,
-    teacher_tracks_from_attention,
+    teacher_tracks_for_records,
 )
 from talea.topology import process_attention_record
 
@@ -589,6 +589,7 @@ class TaleaPredictor:
         progress: bool = False,
         capture_mode: str = "auto",
         cache_clear_interval: int = 0,
+        batch_teacher_tiles: bool = False,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
         """Yield predictions in length-sorted order without retaining matrices.
@@ -649,6 +650,8 @@ class TaleaPredictor:
         )
         ordered = sorted(values, key=lambda value: (value.length, value.record_id))
         batches = list(make_batches(ordered, square_budget, maximum_batch))
+        teacher_tile_stride = int(self.teacher_contract["attention"]["central_size"])
+        teacher_tile_budget = int(self.teacher_contract["model"]["batch_size"])
         completed = 0
         window_sizes = (64, 96, 128, 192, 256, 384, 512)
         storage_dtype = self.deployment["esmplusplus"].get(
@@ -818,6 +821,8 @@ class TaleaPredictor:
                 hidden_states = capture.hidden_states
                 compact = []
                 pooled_rows = []
+                prepared = []
+                prepared_tiles = 0
                 for batch_position, record in enumerate(batch):
                     residue_mask = special[batch_position] == 0
                     if attention_mask is not None:
@@ -854,45 +859,53 @@ class TaleaPredictor:
                     probabilities = self.residue_structure_probabilities(
                         hidden_states, indices, batch_position
                     )
-                    # The residue-state track goes to the worker too: further
-                    # wedge calls are registered into units only where it
-                    # supports them.
-                    state_track, teacher_track = teacher_tracks_from_attention(
-                        self.teacher_model,
-                        matrices,
-                        self.teacher_contract,
-                        self.device,
-                    )
-                    if postprocess_mode == "process":
-                        future = pool.submit(
-                            run_record,
-                            (
-                                record.metadata(),
-                                matrices,
-                                window_sizes,
-                                probabilities,
-                                state_track,
-                            ),
-                        )
-                    else:
-                        future = pool.submit(
-                            process_attention_record,
-                            {
-                                "metadata": record.metadata(),
-                                "matrices": matrices,
-                                "window_sizes": window_sizes,
-                                "residue_structure_probabilities": probabilities,
-                                "residue_state_probabilities": state_track,
-                                **self.configs,
-                            },
-                        )
                     region_track = self.region_probabilities(
                         hidden_states, indices, batch_position
                     )
                     gate_logit = self.openness_logit(hidden_states, indices, batch_position)
-                    compact.append(
-                        (record, future, state_track, teacher_track, region_track, gate_logit)
+                    prepared.append((record, matrices, probabilities, region_track, gate_logit))
+                    prepared_tiles += (record.length + teacher_tile_stride - 1) // teacher_tile_stride
+                    # Release work to CPU workers after a teacher tile batch, even
+                    # when the ESM batch contains many more short proteins.
+                    if (batch_teacher_tiles and prepared_tiles < teacher_tile_budget
+                            and batch_position + 1 < len(batch)):
+                        continue
+                    tracks = teacher_tracks_for_records(
+                        self.teacher_model,
+                        [item[1] for item in prepared],
+                        self.teacher_contract,
+                        self.device,
                     )
+                    for item, (state_track, teacher_track) in zip(prepared, tracks, strict=True):
+                        record, matrices, probabilities, region_track, gate_logit = item
+                        if postprocess_mode == "process":
+                            future = pool.submit(
+                                run_record,
+                                (
+                                    record.metadata(),
+                                    matrices,
+                                    window_sizes,
+                                    probabilities,
+                                    state_track,
+                                ),
+                            )
+                        else:
+                            future = pool.submit(
+                                process_attention_record,
+                                {
+                                    "metadata": record.metadata(),
+                                    "matrices": matrices,
+                                    "window_sizes": window_sizes,
+                                    "residue_structure_probabilities": probabilities,
+                                    "residue_state_probabilities": state_track,
+                                    **self.configs,
+                                },
+                            )
+                        compact.append(
+                            (record, future, state_track, teacher_track, region_track, gate_logit)
+                        )
+                    prepared.clear()
+                    prepared_tiles = 0
                 global_probabilities = global_head_probabilities(
                     self.global_bundle, pooled_rows
                 )
