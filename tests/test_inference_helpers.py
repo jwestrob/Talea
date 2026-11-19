@@ -270,10 +270,9 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     import talea.inference as inference
     predictor = object.__new__(TaleaPredictor)
     predictor.device = torch.device("cpu")
-    assert predictor._get_teacher_graphs(True, 1) is None
+    assert predictor._get_teacher_graphs(True) is None
     predictor.device = torch.device("cuda")
-    assert predictor._get_teacher_graphs(True, 2) is None
-    assert predictor._get_teacher_graphs(False, 1) is None
+    assert predictor._get_teacher_graphs(False) is None
     predictor._teacher_graphs = None
     predictor.teacher_model = predictor.teacher_contract = None
     synchronized = []
@@ -282,16 +281,16 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda d: current[0])
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(inference, "CudaTeacherGraphs", lambda *args: SimpleNamespace(stream=current[0]))
-    cached = predictor._get_teacher_graphs(True, 1)
+    cached = predictor._get_teacher_graphs(True)
     assert cached is not None and predictor.teacher_cuda_graph_active
-    assert predictor._get_teacher_graphs(True, 1) is cached
+    assert predictor._get_teacher_graphs(True) is cached
     current[0] = object()
-    assert predictor._get_teacher_graphs(True, 1) is None
+    assert predictor._get_teacher_graphs(True) is None
     assert not predictor.teacher_cuda_graph_active
-    readout_graph = predictor._get_teacher_graphs(True, 1, replace_stream=True)
+    readout_graph = predictor._get_teacher_graphs(True, replace_stream=True)
     assert synchronized == ["warm-up"]
     assert readout_graph is not cached and readout_graph.stream is current[0]
-    assert predictor._get_teacher_graphs(True, 1, replace_stream=True) is readout_graph
+    assert predictor._get_teacher_graphs(True, replace_stream=True) is readout_graph
     assert predictor.teacher_cuda_graph_active
 
 
@@ -351,3 +350,20 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
         for k in maps:
             scalar = _apc_head_mean_tensor(maps[k][n], ix, len(ix), 4, torch.float16, span)
             assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
+
+def test_record_workers_use_prefetch_or_ordinary_graph_stream(monkeypatch):
+    from talea.inference import _record_worker_stream
+    ordinary, readout = object(), object()
+    calls = []
+
+    def current(device):
+        calls.append(device)
+        return ordinary
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current)
+    cuda = torch.device("cuda")
+    assert _record_worker_stream(cuda, readout) is readout
+    assert _record_worker_stream(torch.device("cpu"), None) is None
+    assert not calls
+    assert _record_worker_stream(cuda, None) is ordinary
+    assert calls == [cuda]

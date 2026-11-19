@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
-                        help="replay the teacher U-Net with CUDA graphs for one record worker")
+                        help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--group-equal-apc", action="store_true",
                         help="group CUDA attention correction for records with identical residue spans")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")

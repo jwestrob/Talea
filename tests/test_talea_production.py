@@ -148,9 +148,12 @@ def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
     rng = np.random.default_rng(7783)
     observed_sizes = []
 
-    def replay_on_cpu(host):
-        observed_sizes.append(len(host))
-        return model(host)
+    class ReplayOnCPU:
+        def diagonal(self, host, indices):
+            observed_sizes.append(len(host))
+            return model(host)[:, :, indices, indices]
+
+    replay_on_cpu = ReplayOnCPU()
 
     for length in (1, 63, 64, 129, 257):
         matrices = {layer: rng.random((length, length), dtype=np.float32) for layer in (13, 35)}
@@ -159,3 +162,32 @@ def test_teacher_graph_dispatch_preserves_per_protein_tile_shapes_and_tracks():
                                               cuda_graphs=replay_on_cpu)
         assert all(a.tobytes() == b.tobytes() for a, b in zip(eager, replay, strict=True))
     assert observed_sizes == [1, 1, 1, 3, 3, 2]
+
+
+def test_concurrent_graph_readouts_own_independent_diagonal_results():
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+    from talea.production import CudaTeacherGraphs
+
+    class Replay(CudaTeacherGraphs):
+        def __init__(self):
+            self._locks = {1: threading.Lock()}
+            self.output = torch.empty(1, 3, 8, 8)
+
+        def __call__(self, host):
+            self.output.copy_(host)
+            time.sleep(0.002)  # give another worker a chance to overwrite it
+            return self.output
+
+    replay = Replay()
+    indices = torch.arange(2, 6)
+
+    def run(protein):
+        host = torch.full((1, 3, 8, 8), float(protein))
+        return replay.diagonal(host, indices)
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        diagonals = list(workers.map(run, range(16)))
+    for protein, values in enumerate(diagonals):
+        assert torch.equal(values, torch.full((1, 3, 4), float(protein)))

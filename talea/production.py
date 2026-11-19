@@ -14,6 +14,7 @@ outputs are unverified model scores intended for ranking candidate proteins.
 from __future__ import annotations
 
 import math
+import threading
 import warnings
 from collections.abc import Mapping, Sequence
 
@@ -202,6 +203,7 @@ class CudaTeacherGraphs:
     def __init__(self, model, contract, device):
         self.stream = torch.cuda.current_stream(device)
         self.graphs = {}
+        self._locks = {}
         tile_size = int(contract["attention"]["tile_size"])
         channels = int(contract["input_channels"])
         # CUDA requires a non-default capture stream. If the caller already
@@ -222,16 +224,28 @@ class CudaTeacherGraphs:
                     output = model(static)
                 # Independent graph pools allow arbitrary replay order.
                 self.graphs[size] = graph, static, output
+                self._locks[size] = threading.Lock()
         if side != self.stream:
             self.stream.wait_stream(side)
 
     def __call__(self, host_tiles):
-        # The caller completes the diagonal readouts on this stream before the
-        # next protein reuses this shape's static input or output.
+        # The static output is borrowed until the calling thread releases the
+        # shape lock in diagonal().
         graph, static, output = self.graphs[len(host_tiles)]
-        static.copy_(host_tiles)
+        # The per-protein tile tensor stays alive through the synchronous
+        # state/class host reads; replay is ordered behind the H2D on this stream.
+        static.copy_(host_tiles, non_blocking=True)
         graph.replay()
         return output
+
+
+    def diagonal(self, host_tiles, indices):
+        # Record workers issue work to one CUDA stream. Queue the advanced
+        # indexing copy before another thread can overwrite the static output.
+        # Each caller owns its diagonal until its host transfers are complete.
+        with self._locks[len(host_tiles)]:
+            output = self(host_tiles)
+            return output[:, :, indices, indices]
 
 
 @torch.inference_mode()
@@ -290,11 +304,11 @@ def teacher_tracks_from_attention(
         host_tiles = torch.from_numpy(tile_batch)
         if cuda_graphs is None:
             output = model(host_tiles.to(device))
+            diagonal = output[:, :, diagonal_indices, diagonal_indices]
         else:
-            output = cuda_graphs(host_tiles)
-        if output.shape[1] != 1 + teacher_classes:
+            diagonal = cuda_graphs.diagonal(host_tiles, diagonal_indices)
+        if diagonal.shape[1] != 1 + teacher_classes:
             raise ValueError("teacher model output channels disagree with its contract")
-        diagonal = output[:, :, diagonal_indices, diagonal_indices]
         state_probability = torch.sigmoid(diagonal[:, 0]).cpu().numpy()
         teacher_probability = torch.softmax(diagonal[:, 1:], dim=1)
         teacher_probability = teacher_probability.transpose(1, 2).cpu().numpy()

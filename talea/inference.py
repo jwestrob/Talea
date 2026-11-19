@@ -422,6 +422,12 @@ def _forward_pair(batch, following, future, forward, producer, can_overlap):
     return current, upcoming
 
 
+def _record_worker_stream(device, readout_stream):
+    if device.type != "cuda":
+        return None
+    return readout_stream if readout_stream is not None else torch.cuda.current_stream(device)
+
+
 def _handoff_capture(stream, ready, attentions, hidden_states, residue_indices):
     stream.wait_event(ready)
     # Producer-owned storage must remain valid through consumer operations.
@@ -614,9 +620,9 @@ class TaleaPredictor:
         self._load_models()
         self.loaded_seconds = time.time() - self.loaded_at
 
-    def _get_teacher_graphs(self, requested, record_workers, *, replace_stream=False):
+    def _get_teacher_graphs(self, requested, *, replace_stream=False):
         self.teacher_cuda_graph_active = False
-        if (not requested or record_workers != 1 or self.device.type != "cuda"
+        if (not requested or self.device.type != "cuda"
                 or _device_autocast_enabled("cuda") or not hasattr(torch.cuda, "CUDAGraph")):
             return None
         with torch.cuda.device(self.device):
@@ -1121,8 +1127,7 @@ class TaleaPredictor:
             overlap_enabled = prefetch_forward and len(batches) > 1
             forward_stream = readout_stream = None
             graph_prefetch = (
-                prefetch_forward and teacher_cuda_graph and record_workers == 1
-                and self.device.type == "cuda"
+                prefetch_forward and teacher_cuda_graph and self.device.type == "cuda"
             )
             if overlap_enabled or graph_prefetch:
                 # Also use the same stream for single-batch warm-up so its
@@ -1143,12 +1148,13 @@ class TaleaPredictor:
             # Capture and warm every teacher shape before starting the producer.
             with torch.cuda.stream(readout_stream) if graph_prefetch else contextlib.nullcontext():
                 teacher_graphs = self._get_teacher_graphs(
-                    teacher_cuda_graph, record_workers, replace_stream=graph_prefetch
+                    teacher_cuda_graph, replace_stream=graph_prefetch
                 )
             record_pool = None
             if record_workers > 1 and not _device_autocast_enabled(self.device.type):
-                # The normal readout path uses the caller's original CUDA stream.
-                stream = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+                # Bind every worker to the graph's readout stream, including
+                # when prefetch moves the encoder onto a separate stream.
+                stream = _record_worker_stream(self.device, readout_stream)
                 record_pool = stack.enter_context(concurrent.futures.ThreadPoolExecutor(
                     max_workers=record_workers,
                     initializer=torch.cuda.set_stream if stream is not None else None,
