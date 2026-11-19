@@ -550,3 +550,18 @@ def test_compiled_wedge_accumulation_matches_numpy(monkeypatch):
     assert actual.keys() == expected.keys()
     for key in expected:
         assert actual[key].tobytes() == expected[key].tobytes()
+
+
+@pytest.mark.parametrize("n", [31, 63, 94, 191, 383, 511])
+def test_compact_harmonic_calls_keep_reference_dot_and_ties(n):
+    from talea.attention import _compact_harmonic_calls
+
+    rng = np.random.default_rng(11 + n)
+    random = rng.normal(size=(16, n // 2 + 1)) * 3
+    tied = np.rint(random)
+    near_tied = np.nextafter(tied, np.where(random > tied, np.inf, -np.inf))
+    spectra = np.vstack((random, tied, near_tied, np.ones_like(tied)))
+    actual = _compact_harmonic_calls(spectra, n)
+    for spectrum, result in zip(spectra, actual, strict=True):
+        expected = best_harmonic_comb(spectrum, n, max_period=min(250.0, n / 3))
+        assert result == {key: getattr(expected, key) for key in result}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import median_filter
 
-from talea.physical import best_harmonic_comb, score_signals, window_plan
+from talea.physical import _harmonic_weights, best_harmonic_comb, score_signals, window_plan
 
 
 # Above this side length the vectorized path's (L, L+1) working grid stops
@@ -134,11 +134,63 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     small = scale[:, 0] < 1e-8
     scale[small, 0] = usable[small].std(axis=1)
     spectral_z = np.divide(residual - center, scale, out=np.zeros_like(residual), where=scale >= 1e-8)
-    calls = []
-    for spectrum in spectral_z:
-        call = best_harmonic_comb(spectrum, n, max_period=min(250.0, n / 3))
-        calls.append({"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics})
-    return calls
+    return _compact_harmonic_calls(spectral_z, n)
+
+
+def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dict]:
+    """Find window peaks in bulk, then score all possible ties with the reference dot.
+
+    All harmonic excesses and weights are nonnegative. Summing at most eight
+    products has a relative roundoff bound below 17*eps, including division
+    by the weight norm. A 128*eps band around the largest preliminary score
+    therefore contains every candidate that could win with the reference BLAS
+    dot product. Return only the fields used by the local decoder.
+    """
+    maximum = spectra.shape[1] - 1
+    max_period = min(250.0, signal_length / 3)
+    minimum_bin = max(3, int(np.ceil(signal_length / max_period)))
+    bins = np.arange(minimum_bin, min(maximum // 2, signal_length // 5) + 1)
+    if not len(bins) or not np.isfinite(spectra).all():
+        result = []
+        for spectrum in spectra:
+            call = best_harmonic_comb(spectrum, signal_length, max_period=max_period)
+            result.append({"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics})
+        return result
+    counts = np.minimum(8, maximum // bins)
+    harmonics = np.arange(1, 9)
+    centers = np.minimum(maximum, bins[:, None] * harmonics)
+    # Tolerance of one frequency bin, clamped inside [1, maximum].
+    peaks = np.maximum(
+        spectra[:, centers],
+        np.maximum(spectra[:, np.maximum(1, centers - 1)], spectra[:, np.minimum(maximum, centers + 1)]),
+    )
+    # Preserve the contiguous BLAS ddot used by the scalar scorer.
+    excess = np.ascontiguousarray(np.maximum(0.0, peaks - 1.0))
+    table = _harmonic_weights(8)
+    weights = np.where(harmonics <= counts[:, None], table[8][0], 0.0)
+    norms = np.asarray([table[k][1] for k in counts])
+    preliminary = np.sum(excess * weights, axis=2) / norms
+    results = []
+    for row, scores in enumerate(preliminary):
+        top = np.max(scores)
+        if top == 0.0:
+            results.append({"score": 0.0, "period": float(signal_length / bins[0]), "n_harmonics": 0})
+            continue
+        cutoff = top - (128 * np.finfo(np.float64).eps) * top
+        # An overflowed preliminary score can mask other overflowing candidates.
+        # Evaluate all of them with the original arithmetic in that case.
+        candidates = np.flatnonzero(scores >= cutoff) if np.isfinite(top) else range(len(scores))
+        best_key = (-1.0, -1)
+        for i in candidates:
+            k = counts[i]
+            score = float(np.dot(excess[row, i, :k], table[k][0]) / norms[i])
+            significant = int(np.count_nonzero(peaks[row, i, :k] >= 2.5))
+            if (score, significant) > best_key:
+                best_key = (score, significant)
+                best_bin = bins[i]
+        results.append({"score": best_key[0], "period": float(signal_length / best_bin), "n_harmonics": best_key[1]})
+    return results
+
 
 
 def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
