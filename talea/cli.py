@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
     parser.add_argument("--teacher-owner-thread", action="store_true",
                         help="prepare tiles in record workers and run the teacher in order on the predictor thread")
+    parser.add_argument("--teacher-graph-tracks", action="store_true",
+                        help="include the per-protein probability readout in the teacher CUDA graph")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--group-equal-apc", action="store_true",
@@ -262,7 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         "group_equal_apc": args.group_equal_apc,
         "prefetch_forward": args.prefetch_forward,
-        "teacher_cuda_graph": args.teacher_cuda_graph,
+        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
+        **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "postprocess_mode": args.postprocess_mode,
     }
     if args.long_proteins == "window":
@@ -321,7 +324,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
-        "teacher_cuda_graph": args.teacher_cuda_graph,
+        "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
+        **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,
         **({"fused_rotary_calls": predictor.fused_rotary_calls} if args.fused_rotary else {}),
         "deterministic": args.deterministic,
