@@ -131,6 +131,8 @@ def secondary_wedge_calls(
     widths: Sequence[int],
     wedge: Mapping,
     primary: Mapping | None,
+    *,
+    plan: WedgePlan | None = None,
 ) -> list[dict]:
     """Further wedge calls after the primary one, strongest first."""
 
@@ -147,7 +149,8 @@ def secondary_wedge_calls(
         "interharmonic_controls": bool(wedge["interharmonic_controls"]),
     }
     # Suppression edits values only, so every search shares one template plan.
-    plan = WedgePlan([len(track) for track in work], length, periods, widths, **settings)
+    if plan is None:
+        plan = WedgePlan([len(track) for track in work], length, periods, widths, **settings)
     calls = []
     for rank in range(2, 2 + SECONDARY_MAXIMUM_CALLS):
         call = best_wedge_interval(work, length, periods, widths, plan=plan, **settings)

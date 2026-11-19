@@ -85,6 +85,8 @@ def score_attention_window(
     min_period: float = 5.0,
     max_period: float = 250.0,
     min_cycles: int = 3,
+    *,
+    include_diagnostics: bool = True,
 ) -> dict:
     """Score periodic off-diagonal bands in one APC attention window."""
     profile = diagonal_mean_profile(matrix)
@@ -95,7 +97,10 @@ def score_attention_window(
         min_period=min_period,
         max_period=effective_maximum,
         min_cycles=min_cycles,
-    ).to_dict()
+    )
+    if not include_diagnostics:
+        return {"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics}
+    call = call.to_dict()
     center = float(np.median(profile)) if len(profile) else 0.0
     call["profile_mad"] = (
         float(np.median(np.abs(profile - center))) if len(profile) else 0.0

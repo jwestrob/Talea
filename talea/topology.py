@@ -7,7 +7,8 @@ import math
 import numpy as np
 
 from talea.application import frozen_operational_scores, frozen_spectrum_score
-from talea.attention import scan_attention_matrix, score_attention_window
+from talea.attention import score_attention_window
+from talea.physical import window_plan
 from talea.phase_ssm import apply_placement, place_units
 from talea.regions import SECONDARY_MINIMUM_STATE, secondary_wedge_calls
 from talea.unit_registration import (
@@ -17,6 +18,7 @@ from talea.unit_registration import (
     scan_plausible_boundary_pairs,
 )
 from talea.wedge import (
+    WedgePlan,
     best_wedge_interval,
     candidate_periods_from_windows,
     fuse_diagonal_tracks,
@@ -53,34 +55,23 @@ def fused_local_windows(
     protein_length: int,
     calibration: dict,
     window_sizes: tuple[int, ...],
+    whole_scores: dict[int, dict] | None = None,
 ) -> list[dict]:
     layers = tuple(int(value) for value in calibration["layers_zero_based"])
     parameters = {
         int(key): value for key, value in calibration["parameters"].items()
     }
-    per_layer = {
-        layer: scan_attention_matrix(
-            matrices[layer],
-            min_period=5.0,
-            max_period=250.0,
-            min_cycles=3,
-            window_sizes=window_sizes,
-        )
-        for layer in layers
-    }
-    grouped: dict[tuple[int, int, int], dict[int, dict]] = {}
-    for layer, windows in per_layer.items():
-        for window in windows:
-            key = (
-                int(window["start"]),
-                int(window["end"]),
-                int(window["window_size"]),
-            )
-            grouped.setdefault(key, {})[layer] = window
+    whole_scores = {} if whole_scores is None else whole_scores
     fused = []
-    for (start, end, window_size), by_layer in sorted(grouped.items()):
-        if set(by_layer) != set(layers):
-            raise ValueError("local layer windows do not align")
+    for start, end in sorted(window_plan(protein_length, window_sizes=window_sizes)):
+        window_size = end - start
+        by_layer = {}
+        for layer in layers:
+            if start == 0 and end == protein_length and layer in whole_scores:
+                score = whole_scores[layer]
+            else:
+                score = score_attention_window(matrices[layer][start:end, start:end], include_diagnostics=False)
+            by_layer[layer] = {"window_size": window_size, "attention": score}
         zscores = {
             layer: window_zscore(by_layer[layer], protein_length, parameters[layer])
             for layer in layers
@@ -116,10 +107,13 @@ def process_attention_record(task: dict) -> dict:
     local_calibration = task["local_calibration"]
     wedge_config = task["wedge_config"]
     operational_config = task["operational_config"]
+    whole_scores = {
+        layer: score_attention_window(matrix, include_diagnostics=False)
+        for layer, matrix in sorted(matrices.items())
+    }
     spectrum_input = {
         "layer_features": [
-            {"layer": layer, **score_attention_window(matrix)}
-            for layer, matrix in sorted(matrices.items())
+            {"layer": layer, **score} for layer, score in whole_scores.items()
         ]
     }
     spectrum = frozen_spectrum_score(
@@ -130,6 +124,7 @@ def process_attention_record(task: dict) -> dict:
         length,
         local_calibration,
         tuple(task["window_sizes"]),
+        whole_scores,
     )
     period_config = wedge_config["period_candidates"]
     periods = candidate_periods_from_windows(
@@ -160,25 +155,19 @@ def process_attention_record(task: dict) -> dict:
             ]
         )
         wedge = wedge_config["wedge"]
-        candidate = best_wedge_interval(
-            tracks,
-            length,
-            periods,
-            widths_from_config(wedge_config),
-            tolerance=int(wedge["tolerance"]),
-            max_harmonics=int(wedge["max_harmonics"]),
-            min_harmonics=int(wedge["min_harmonics"]),
-            interharmonic_controls=bool(wedge["interharmonic_controls"]),
-        )
+        widths = widths_from_config(wedge_config)
+        settings = {
+            "tolerance": int(wedge["tolerance"]),
+            "max_harmonics": int(wedge["max_harmonics"]),
+            "min_harmonics": int(wedge["min_harmonics"]),
+            "interharmonic_controls": bool(wedge["interharmonic_controls"]),
+        }
+        plan = WedgePlan([len(track) for track in tracks], length, periods, widths, **settings)
+        candidate = best_wedge_interval(tracks, length, periods, widths, plan=plan, **settings)
         if math.isfinite(float(candidate["score"])):
             wedge_call = candidate
             secondary_calls = secondary_wedge_calls(
-                tracks,
-                length,
-                periods,
-                widths_from_config(wedge_config),
-                wedge,
-                wedge_call,
+                tracks, length, periods, widths, wedge, wedge_call, plan=plan
             )
     registration = None
     closure = None
