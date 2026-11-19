@@ -36,14 +36,8 @@ from talea.long_protein import (
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
 from talea.repeat_state import compiled_teacher_quantile
-from talea.regions import (
-    PRIMARY_EXTENTS,
-    registration_for_primary,
-    registration_for_probe,
-    repeat_regions,
-    trim_registration,
-)
-from talea.postprocess_pool import initialize_worker, run_record
+from talea.regions import PRIMARY_EXTENTS, finish_regions
+from talea.postprocess_pool import initialize_worker, run_record, run_finalized_record
 from talea.production import (
     CudaTeacherGraphs,
     compose_talea_score,
@@ -144,7 +138,7 @@ def resolve_postprocess_workers(workers: int | None, mode: str) -> int:
     return int(workers)
 
 
-def postprocess_result(future: concurrent.futures.Future) -> dict:
+def postprocess_result(future: concurrent.futures.Future):
     """A postprocess future's result, explaining a broken worker pool."""
 
     try:
@@ -1076,6 +1070,7 @@ class TaleaPredictor:
         teacher_quantile_histogram: bool = False,
         native_half_readout: bool = False,
         device_teacher_tiles: bool = False,
+        worker_finalization: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -1243,6 +1238,13 @@ class TaleaPredictor:
             pool_context = concurrent.futures.ThreadPoolExecutor(
                 max_workers=postprocess_workers
             )
+        worker_finalization = worker_finalization and postprocess_mode == "process"
+        if worker_finalization:
+            finalization_settings = (
+                self.primary_extent, self.region_probe_settings,
+                {"teacher": {"class_names": self.teacher_contract["teacher"]["class_names"]},
+                 "output": {"state_threshold": self.teacher_contract["output"]["state_threshold"]}},
+            )
         reference_maximum = int(
             self.deployment["input_contract"]["lockbox_reference_maximum_residues"]
         )
@@ -1259,37 +1261,16 @@ class TaleaPredictor:
                 region_track,
                 gate_logit,
             ), global_probability in zip(compact, global_probabilities, strict=True):
-                teacher_summary = summarize_teacher_prediction(
-                    state_track,
-                    teacher_track,
-                    self.teacher_contract,
-                )
-                topology = postprocess_result(future)
-                # Regions are built from the untrimmed call, then the
-                # registration is cut to the same state track.
-                regions = repeat_regions(
-                    topology,
-                    state_track,
-                    self.primary_extent,
-                    region_track,
-                    self.region_probe_settings,
-                )
-                wedge = topology.get("wedge_call")
-                if self.primary_extent == "state" and wedge is not None:
-                    topology = {
-                        **topology,
-                        "registration": registration_for_probe(
-                            registration_for_primary(
-                                trim_registration(
-                                    topology.get("registration"),
-                                    state_track,
-                                    (int(wedge["start"]), int(wedge["end"])),
-                                ),
-                                regions,
-                            ),
-                            regions,
-                        ),
-                    }
+                if worker_finalization:
+                    topology, regions, teacher_summary = postprocess_result(future)
+                else:
+                    teacher_summary = summarize_teacher_prediction(
+                        state_track, teacher_track, self.teacher_contract,
+                    )
+                    topology, regions = finish_regions(
+                        postprocess_result(future), state_track, region_track,
+                        self.primary_extent, self.region_probe_settings,
+                    )
                 scores = compose_talea_score(
                     teacher_summary["mean_probability"],
                     topology["topology_development_control_z"],
@@ -1692,16 +1673,16 @@ class TaleaPredictor:
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
                     if postprocess_mode == "process":
-                        future = submit_record(
-                            run_record,
-                            (
-                                record.metadata(),
-                                matrices,
-                                window_sizes,
-                                probabilities,
-                                state_track,
-                            ),
+                        payload = (
+                            record.metadata(), matrices, window_sizes, probabilities, state_track,
                         )
+                        if worker_finalization:
+                            payload += ((teacher_track, region_track, finalization_settings),)
+                            future = submit_record(run_finalized_record, payload)
+                            # Workers own the remaining region and teacher reductions.
+                            state_track = teacher_track = region_track = None
+                        else:
+                            future = submit_record(run_record, payload)
                     else:
                         future = pool.submit(
                             process_attention_record,

@@ -27,6 +27,7 @@ from talea.repeat_state import (
     central_tile_spans,
     normalized_attention_tiles,
     summarize_state_track,
+    summarize_teacher_prediction,
 )
 
 
@@ -394,27 +395,6 @@ def unpack_teacher_tracks(host):
     if not np.allclose(teacher_track.sum(axis=1), 1.0, atol=1e-5):
         raise ValueError("teacher class probabilities are not normalized")
     return state_track, teacher_track
-
-
-def summarize_teacher_prediction(
-    state_track: np.ndarray,
-    teacher_track: np.ndarray,
-    contract: Mapping,
-) -> dict:
-    """Create the compact per-protein teacher output retained in discovery runs."""
-
-    names = tuple(str(value) for value in contract["teacher"]["class_names"])
-    teacher_values = np.asarray(teacher_track, dtype=np.float64)
-    if teacher_values.ndim != 2 or teacher_values.shape[1] != len(names):
-        raise ValueError("teacher track dimensions disagree with the class contract")
-    threshold = float(contract["output"]["state_threshold"])
-    return {
-        **summarize_state_track(state_track, threshold=threshold),
-        "predicted_teacher_mean_class_probability": {
-            name: float(value)
-            for name, value in zip(names, teacher_values.mean(axis=0))
-        },
-    }
 
 
 def compose_talea_score(

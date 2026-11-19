@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="fill teacher tiles on CUDA from fp16 attention and exact normalization tables")
     parser.add_argument("--native-half-readout", action="store_true",
                         help="retain fp16 attention through teacher normalization and topology transport on CUDA")
+    parser.add_argument("--worker-finalization", action="store_true",
+                        help="finish region boundaries and teacher summaries in process workers")
     parser.add_argument("--teacher-quantile-histogram", action="store_true",
                         help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
     parser.add_argument("--teacher-owner-thread", action="store_true",
@@ -293,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
         **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "postprocess_mode": args.postprocess_mode,
+        **({"worker_finalization": True} if args.worker_finalization else {}),
     }
     if args.long_proteins == "window":
         rows = iter_windowed_predictions(
@@ -338,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
+        **({"worker_finalization": True} if args.worker_finalization else {}),
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
         **({"readout_streams": args.readout_streams} if args.readout_streams else {}),

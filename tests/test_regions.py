@@ -264,7 +264,15 @@ def test_the_worker_passes_the_state_track_through():
     pool_module.initialize_worker({key: task[key] for key in (
         "protein_calibration", "local_calibration", "wedge_config", "operational_config")})
     try:
-        row = pool_module.run_record((task["metadata"], task["matrices"], task["window_sizes"], None, state))
+        from talea.regions import finish_regions
+        from talea.repeat_state import summarize_teacher_prediction
+
+        payload = (task["metadata"], task["matrices"], task["window_sizes"], None, state)
+        row = pool_module.run_record(payload)
+        teacher = np.stack((state, 1 - state), axis=1).astype(np.float32)
+        contract = {"teacher": {"class_names": ["first", "second"]}, "output": {"state_threshold": 0.5}}
+        expected = (*finish_regions(row, state, None, "state", None), summarize_teacher_prediction(state, teacher, contract))
+        assert pool_module.run_finalized_record((*payload, (teacher, None, ("state", None, contract)))) == expected
     finally:
         pool_module._CONFIGS = saved
     assert [call["units"] for call in row["secondary_wedge_calls"]] == [None]

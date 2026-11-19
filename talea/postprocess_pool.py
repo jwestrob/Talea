@@ -85,3 +85,18 @@ def run_record(payload: tuple) -> dict:
             **_CONFIGS,
         }
     )
+
+
+def run_finalized_record(payload):
+    """Return topology, output regions and teacher summary from the same worker."""
+    from talea.regions import finish_regions
+    from talea.repeat_state import summarize_teacher_prediction
+
+    teacher_track, region_track, settings = payload[-1]
+    primary_extent, region_settings, teacher_contract = settings
+    state_track = payload[4]
+    summary = summarize_teacher_prediction(state_track, teacher_track, teacher_contract)
+    topology, regions = finish_regions(
+        run_record(payload[:-1]), state_track, region_track, primary_extent, region_settings,
+    )
+    return topology, regions, summary
