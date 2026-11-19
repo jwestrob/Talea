@@ -337,10 +337,13 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
     assert groups == [(0, 8), (8, 9), (9, 10), (10, 11), (11, 16), (16, 17)]
     generator = torch.Generator().manual_seed(78)
     maps = {k: torch.rand(len(lengths), 18, 68, 68, generator=generator, dtype=dtype) / 68 for k in (13, 35)}
-    jobs = _grouped_apc_jobs(maps, (13, 35), positions, 4, torch.float16)
+    stats = {"executed_groups": 0, "executed_records": 0}
+    jobs = _grouped_apc_jobs(maps, (13, 35), positions, 4, torch.float16,
+                             groups=groups, stats=stats)
     with concurrent.futures.ThreadPoolExecutor(3) as pool:
         delivered = list(_ordered_readouts(lambda item: item, len(lengths), pool, width=3, items=jobs))
     assert [n for n, _ in delivered] == list(range(len(lengths)))
+    assert stats == {"executed_groups": 2, "executed_records": 13}
     for n, grouped in delivered:
         if grouped is None:
             continue

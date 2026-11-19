@@ -290,21 +290,24 @@ def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMEN
         start = stop
 
 
-def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None):
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None):
     """Yield one device map per layer and protein, or the scalar singleton path."""
     heads = attentions[layers[0]].shape[1]
-    for start, stop in _equal_apc_groups(indices_by_record, heads):
+    for start, stop in (_equal_apc_groups(indices_by_record, heads) if groups is None else groups):
         if stop == start + 1:
             yield start, None
             continue
         indices, span = indices_by_record[start]
-        # The producer thread must issue grouped work on the consumer's stream
+        # The dispatcher must issue grouped work on the consumer's stream
         # after the wait_event() for this capture.
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
             maps = {
                 layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span)
                 for layer in layers
             }
+        if stats is not None:
+            stats["executed_groups"] += 1
+            stats["executed_records"] += stop - start
         for offset in range(stop - start):
             yield start + offset, {layer: maps[layer][offset] for layer in layers}
 
@@ -551,6 +554,7 @@ class TaleaPredictor:
         self.primary_extent = primary_extent
         self._postprocess_pool: concurrent.futures.ProcessPoolExecutor | None = None
         self._postprocess_pool_workers = 0
+        self.apc_group_stats = None
         self._teacher_graphs = None
         self._graph_readout_stream = None
         self.teacher_cuda_graph_active = False
@@ -930,6 +934,15 @@ class TaleaPredictor:
         batch returns blocks to the driver and forces later reallocation.
         """
 
+        self.apc_group_stats = None
+        if group_equal_apc:
+            self.apc_group_stats = {
+                "cuda_active": self.device.type == "cuda",
+                "batches": 0, "model_records": 0, "eligible_groups": 0, "eligible_records": 0,
+                "executed_groups": 0, "executed_records": 0, "squared_lengths": 0,
+                "eligible_squared_lengths": 0, "group_size_counts": {},
+                "element_budget": _APC_GROUP_ELEMENTS,
+            }
         if record_workers < 1:
             raise ValueError("record_workers must be positive")
         if prefetch_forward and self.device.type not in ("cuda", "mps"):
@@ -1260,10 +1273,26 @@ class TaleaPredictor:
                         return readout(*args)
 
                 read = readout if readout_stream is None else stream_readout
+                if group_equal_apc:
+                    heads = attentions[self.expected_layers[0]].shape[1]
+                    groups = list(_equal_apc_groups(residue_indices, heads))
+                    stats = self.apc_group_stats
+                    stats["batches"] += 1
+                    stats["model_records"] += len(batch)
+                    for start, stop in groups:
+                        size = stop - start
+                        squares = size * batch[start].length ** 2
+                        hist = stats["group_size_counts"]
+                        hist[size] = hist.get(size, 0) + 1
+                        stats["squared_lengths"] += squares
+                        if size > 1:
+                            stats["eligible_groups"] += 1
+                            stats["eligible_records"] += size
+                            stats["eligible_squared_lengths"] += squares
                 if group_equal_apc and self.device.type == "cuda":
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
-                        device_storage_dtype, readout_stream,
+                        device_storage_dtype, readout_stream, groups, stats,
                     )
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:

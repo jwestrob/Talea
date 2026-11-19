@@ -293,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
-        "group_equal_apc": args.group_equal_apc,
+        **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
+           if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
         "teacher_cuda_graph": args.teacher_cuda_graph,
         "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,
