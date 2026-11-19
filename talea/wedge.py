@@ -17,16 +17,18 @@ import numpy as np
 
 
 _compiled_wedge_scores = None
+_compiled_mad = None
 
 
 def enable_compiled_wedge_scores() -> None:
     """Compile on first use in long-lived process workers when Numba is installed."""
-    global _compiled_wedge_scores
+    global _compiled_wedge_scores, _compiled_mad
     try:
-        from talea._wedge_numba import accumulate_scores
+        from talea._wedge_numba import accumulate_scores, median_absolute_deviations
     except ImportError:
         return
     _compiled_wedge_scores = accumulate_scores
+    _compiled_mad = median_absolute_deviations
 
 
 def candidate_periods_from_windows(
@@ -112,7 +114,7 @@ def robust_diagonal_tracks(
     kept as the concordance oracle): each diagonal's quantile, median and MAD come from one ascending sort
     of a padded separation-by-position array, with numpy's own interpolation formulas.
     """
-    values = np.asarray(matrix, dtype=np.float64)
+    values = np.asarray(matrix)
     if values.ndim != 2 or values.shape[0] != values.shape[1]:
         raise ValueError("attention matrix must be square")
     if not 0.0 <= baseline_quantile < 0.5:
@@ -130,17 +132,20 @@ def robust_diagonal_tracks(
     counts = length - separations
     # Row d - 1 holds diagonal d, left-aligned and padded with +inf so padding sorts last.
     padded = np.full((maximum, length - 1), np.inf)
-    position = np.arange(length - 1)
-    valid = position[None, :] < counts[:, None]
-    rows, columns = np.nonzero(valid)
-    padded[rows, columns] = values[columns, columns + rows + 1]
+    for row, separation in enumerate(separations):
+        padded[row, : counts[row]] = np.diagonal(values, offset=separation)
     ordered = np.sort(padded, axis=1)
     baseline = _sorted_row_quantile(ordered, counts, baseline_quantile)
     centered_sorted = ordered - baseline[:, None]
     median = _sorted_row_median(centered_sorted, counts)
-    deviation = np.where(valid, np.abs(padded - baseline[:, None] - median[:, None]), np.inf)
-    scale = 1.4826 * _sorted_row_median(np.sort(deviation, axis=1), counts)
     centered = padded - baseline[:, None]
+    if (_compiled_mad is not None and np.isfinite(median).all() and np.isfinite(ordered[:, 0]).all()
+            and np.isfinite(ordered[np.arange(maximum), counts - 1]).all()):
+        scale = 1.4826 * _compiled_mad(centered_sorted, median, counts)
+    else:
+        valid = np.arange(length - 1)[None, :] < counts[:, None]
+        deviation = np.where(valid, np.abs(centered - median[:, None]), np.inf)
+        scale = 1.4826 * _sorted_row_median(np.sort(deviation, axis=1), counts)
     for row in np.flatnonzero(scale < 1e-12):  # rare: fall back to the standard deviation
         scale[row] = float(np.std(centered[row, : counts[row]]))
     usable = scale >= 1e-12
@@ -204,6 +209,17 @@ def fuse_diagonal_tracks(
     maximum = min(len(tracks) for tracks in track_sets)
     result = [np.empty(0, dtype=np.float64) for _ in range(maximum)]
     for separation in range(1, maximum):
+        if len(track_sets) == 2:
+            left, right = (part[separation] for part in track_sets)
+            if (isinstance(left, np.ndarray) and isinstance(right, np.ndarray)
+                    and left.shape == right.shape and left.dtype == right.dtype == np.float64):
+                # np.mean starts its reduction at positive zero. Positive
+                # zero must remain positive even if both inputs are -0.0.
+                combined = left + right
+                combined += 0.0
+                combined *= 0.5
+                result[separation] = combined
+                continue
         lengths = {len(tracks[separation]) for tracks in track_sets}
         if len(lengths) != 1:
             raise ValueError("layer diagonal lengths differ")

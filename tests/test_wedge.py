@@ -193,3 +193,26 @@ def test_vectorized_diagonal_tracks_equal_the_reference_loop_exactly():
             slow = _robust_diagonal_tracks_reference(matrix, max_separation=separation)
             assert len(fast) == len(slow)
             assert all(np.array_equal(a, b) for a, b in zip(fast, slow))
+
+
+def test_mad_from_sorted_halves_matches_full_sort():
+    import pytest
+    pytest.importorskip("numba")
+    from talea._wedge_numba import median_absolute_deviations
+
+    rng = np.random.default_rng(73)
+    lengths = np.arange(1, 258)
+    sorted_rows = np.full((len(lengths), max(lengths)), np.inf)
+    centers, expected = [], []
+    for i, length in enumerate(lengths):
+        raw = rng.normal(size=length)
+        if i % 3 == 1:
+            raw = np.rint(raw)
+        if i % 3 == 2:
+            raw.fill(-1.0)
+        sorted_rows[i, :length] = np.sort(raw)
+        center = np.median(raw)
+        centers.append(center)
+        expected.append(np.median(np.abs(raw - center)))
+    actual = median_absolute_deviations(sorted_rows, np.array(centers), lengths)
+    assert actual.tobytes() == np.asarray(expected).tobytes()
