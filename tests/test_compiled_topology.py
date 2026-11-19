@@ -39,3 +39,35 @@ def test_banded_phase_transitions_reproduce_ties_and_boundaries(monkeypatch):
                 expected = phase_ssm.viterbi_units(*tables, minimum, 0.05, step)
                 monkeypatch.setattr(phase_ssm, "_compiled_transitions", transitions)
                 assert phase_ssm.viterbi_units(*tables, minimum, 0.05, step) == expected
+
+
+def test_diagonal_projection_matches_both_numpy_reduction_orders(monkeypatch):
+    from talea._attention_numba import diagonal_means_f32
+    rng = np.random.default_rng(21)
+    for length in (15, 124, 1025):
+        values = rng.normal(size=(length, length)).astype(np.float16).astype(np.float32)
+        values[0, -1] = -0.0
+        monkeypatch.setattr(attention, "_compiled_diagonal_means", None)
+        reference = attention.diagonal_mean_profile(values)
+        monkeypatch.setattr(attention, "_compiled_diagonal_means", diagonal_means_f32)
+        assert attention.diagonal_mean_profile(values).tobytes() == reference.tobytes()
+    values[1, 2] = 2e-21
+    assert diagonal_means_f32(values, True) is None
+
+
+def test_registration_candidates_offsets_and_medians_match_numpy(monkeypatch):
+    from talea._attention_numba import interval_medians, registration_geometry
+    rng = np.random.default_rng(119)
+    for period in (7, 8.5, 11.1, 21):
+        values = rng.uniform(0.01, 1, size=(105, 105))
+        prefix = unit_registration.integral_image(values)
+        for start, end in ((0, 27), (17, 83), (62, 78)):
+            args = (values, period, start, end)
+            monkeypatch.setattr(unit_registration, "_compiled_registration_geometry", None)
+            monkeypatch.setattr(unit_registration, "_compiled_interval_medians", None)
+            reg = unit_registration.register_periodic_units(*args, phase_step=0.5, prefix=prefix)
+            scan = unit_registration.scan_plausible_boundary_pairs(values, reg, prefix=prefix)
+            monkeypatch.setattr(unit_registration, "_compiled_registration_geometry", registration_geometry)
+            monkeypatch.setattr(unit_registration, "_compiled_interval_medians", interval_medians)
+            assert unit_registration.register_periodic_units(*args, phase_step=0.5, prefix=prefix) == reg
+            assert unit_registration.scan_plausible_boundary_pairs(values, reg, prefix=prefix) == scan

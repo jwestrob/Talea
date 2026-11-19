@@ -53,12 +53,15 @@ def _enable_compiled_topology_kernels() -> None:
         from numba import config
         if config.DISABLE_JIT:
             return
-        from talea._attention_numba import diagonal_prefix_f32, integral_image_f32
+        from talea._attention_numba import diagonal_means_f32, diagonal_prefix_f32, integral_image_f32, interval_medians, registration_geometry
         from talea._phase_numba import transitions
     except ImportError:
         return
     from talea import attention, phase_ssm, unit_registration
+    attention._compiled_diagonal_means = diagonal_means_f32
     attention._compiled_diagonal_prefix = diagonal_prefix_f32
+    unit_registration._compiled_registration_geometry = registration_geometry
+    unit_registration._compiled_interval_medians = interval_medians
     unit_registration._compiled_integral_image = integral_image_f32
     phase_ssm._compiled_transitions = transitions
 

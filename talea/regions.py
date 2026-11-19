@@ -92,10 +92,14 @@ TRIMMED_MINIMUM_UNITS = 3
 STATE_CHOICE_RATIO = 2.0
 
 
-def suppress_interval(tracks: Sequence[np.ndarray], start: int, end: int) -> None:
+def suppress_interval(
+    tracks: Sequence[np.ndarray], start: int, end: int, *, separations=None
+) -> None:
     """Set, in place, every diagonal value whose pair touches ``[start, end)`` to the diagonal's median."""
 
-    for separation in range(1, len(tracks)):
+    if separations is None:
+        separations = range(1, len(tracks))
+    for separation in separations:
         track = tracks[separation]
         size = len(track)
         if not size:
@@ -140,8 +144,6 @@ def secondary_wedge_calls(
         return []
     primary_score = float(primary["score"])
     minimum = max(SECONDARY_MINIMUM_SCORE, SECONDARY_MINIMUM_RELATIVE_SCORE * primary_score)
-    work = [np.array(track, dtype=np.float64, copy=True) for track in tracks]
-    suppress_interval(work, int(primary["start"]), int(primary["end"]))
     settings = {
         "tolerance": int(wedge["tolerance"]),
         "max_harmonics": int(wedge["max_harmonics"]),
@@ -150,7 +152,13 @@ def secondary_wedge_calls(
     }
     # Suppression edits values only, so every search shares one template plan.
     if plan is None:
-        plan = WedgePlan([len(track) for track in work], length, periods, widths, **settings)
+        plan = WedgePlan([len(track) for track in tracks], length, periods, widths, **settings)
+    # Wedge evaluation only uses these separations. Preserve the other
+    # tracks by reference for the plan's shape checks.
+    work = list(tracks)
+    for separation in plan.separations:
+        work[separation] = np.array(tracks[separation], dtype=np.float64, copy=True)
+    suppress_interval(work, int(primary["start"]), int(primary["end"]), separations=plan.separations)
     calls = []
     for rank in range(2, 2 + SECONDARY_MAXIMUM_CALLS):
         call = best_wedge_interval(work, length, periods, widths, plan=plan, **settings)
@@ -166,7 +174,7 @@ def secondary_wedge_calls(
                 "score": score,
             }
         )
-        suppress_interval(work, int(call["start"]), int(call["end"]))
+        suppress_interval(work, int(call["start"]), int(call["end"]), separations=plan.separations)
     return calls
 
 

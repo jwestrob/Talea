@@ -68,3 +68,29 @@ def track_prefixes(values, offsets, used, length):
                 total += values[first + i]
                 prefix[row, i + 1] = total
     return prefix
+
+
+@njit(cache=True, fastmath=False)
+def scores_from_prefixes(prefix, width, used, indices, weights, counts, denominators):
+    """Compute the needed window sums directly into their shared row buffer."""
+    starts = prefix.shape[1] - width
+    sums = np.empty((len(used), starts), dtype=np.float64)
+    for row in range(len(used)):
+        separation = used[row]
+        span = width - separation
+        for j in range(starts):
+            sums[row, j] = prefix[separation, j + span] - prefix[separation, j]
+    return accumulate_scores(sums, indices, weights, counts, denominators)
+
+
+@njit(cache=True, fastmath=False)
+def padded_diagonals_f32(matrix, maximum):
+    """Gather the spatial diagonals into the row order consumed by NumPy sort."""
+    length = len(matrix)
+    result = np.empty((maximum, length - 1), dtype=np.float32)
+    for d in range(1, maximum + 1):
+        for i in range(length - d):
+            result[d - 1, i] = matrix[i, i + d]
+        for i in range(length - d, length - 1):
+            result[d - 1, i] = np.inf
+    return result
