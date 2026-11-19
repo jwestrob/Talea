@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fp16", "fp32", "bf16"),
         default="auto",
     )
+    parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
@@ -247,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        **({"fused_swiglu": True} if args.fused_swiglu else {}),
         "group_equal_apc": args.group_equal_apc,
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph,
@@ -299,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"shared_attention_mib": args.shared_attention_mib} if args.shared_attention_mib else {}),
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
