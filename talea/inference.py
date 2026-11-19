@@ -942,6 +942,7 @@ class TaleaPredictor:
         record_workers: int = 1,
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
+        readout_square_budget: int = 1024 ** 2,
         teacher_quantile_histogram: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
@@ -970,6 +971,9 @@ class TaleaPredictor:
 
         With teacher_owner_thread enabled, record workers normalize tiles ahead
         of the ordered teacher calls on the thread that warmed the network.
+
+        readout_square_budget bounds the concurrent per-record square matrices by
+        limiting readout workers and grouped probability transfers for long inputs.
 
         With prefetch_forward enabled, one ESM forward can run ahead of the
         current batch's readouts when accelerator memory permits. On CUDA these
@@ -1014,6 +1018,8 @@ class TaleaPredictor:
             }
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
+        if readout_square_budget < 1:
+            raise ValueError("readout_square_budget must be positive")
         teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
         if shared_attention_mib < 0:
             raise ValueError("shared_attention_mib must be nonnegative")
@@ -1283,7 +1289,7 @@ class TaleaPredictor:
 
             def can_overlap(current, following, captured):
                 _, attention, hidden, _ = captured
-                width = min(record_workers, max(1, 1024 ** 2 // current[-1].length ** 2))
+                width = min(len(current), record_workers, max(1, readout_square_budget // current[-1].length ** 2))
                 required = _prefetch_memory_required(
                     current, following, next(iter(attention.values())), next(iter(hidden.values())), width,
                 )
@@ -1357,7 +1363,8 @@ class TaleaPredictor:
                     return finish_teacher(inputs)
 
                 # Bound concurrent quadratic APC scratch as records get longer.
-                width = min(record_workers, max(1, 1024 ** 2 // batch[-1].length ** 2))
+                readout_capacity = max(1, readout_square_budget // batch[-1].length ** 2)
+                width = min(record_workers, readout_capacity)
 
                 def stream_readout(*args):
                     with torch.cuda.stream(readout_stream):
@@ -1391,7 +1398,7 @@ class TaleaPredictor:
                 if teacher_owner_thread:
                     # Submit teacher calls in stock order on the graph-capture thread.
                     # The same quadratic bound used for record workers limits retained maps.
-                    depth = min(teacher_readback_records, max(1, 1024 ** 2 // batch[-1].length ** 2))
+                    depth = min(teacher_readback_records, readout_capacity)
                     def launch_teacher(tiles):
                         return teacher_device_probabilities(
                             self.teacher_model, tiles, self.teacher_contract, self.device,
