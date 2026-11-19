@@ -407,3 +407,25 @@ def test_grouped_teacher_transfers_preserve_order_and_partial_group():
         expected_state, expected_classes = unpack_teacher_tracks(launch(n).numpy())
         assert state.tobytes() == expected_state.tobytes()
         assert classes.tobytes() == expected_classes.tobytes()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned-host transfers")
+def test_async_teacher_readback_preserves_partial_group_and_order():
+    from talea.inference import _ordered_teacher_readbacks
+
+    stream = torch.cuda.Stream()
+    lengths = [3, 6, 1, 4, 2, 7, 5]
+    def run(asynchronous):
+        calls = []
+        def launch(length):
+            calls.append(length)
+            packed = torch.zeros((length, 3), device="cuda")
+            packed[:, 0] = torch.arange(length, device="cuda") * 0.125
+            packed[:, 1] = 1.0
+            return packed
+        rows = list(_ordered_teacher_readbacks(
+            (((n,), n) for n in lengths), launch, stream, 3, asynchronous=asynchronous,
+        ))
+        assert calls == lengths
+        return [(length, state.tobytes(), classes.tobytes()) for length, state, classes in rows]
+    assert run(True) == run(False)

@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arithmetic-swiglu", action="store_true", help="calibrate direct CUDA SiLU against every fp16 input")
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
+    parser.add_argument("--async-teacher-readback", action="store_true",
+                        help="overlap one grouped CUDA teacher probability transfer with subsequent readouts")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
                         help="group ordered teacher probability transfers for up to this many proteins")
     parser.add_argument("--device-teacher-tiles", action="store_true",
@@ -280,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
+        **({"async_teacher_readback": True} if args.async_teacher_readback else {}),
         **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"early_gate": args.early_gate} if args.early_gate != "off" else {}),
@@ -350,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
+        **({"async_teacher_readback": True, "async_teacher_readback_batches": predictor.async_teacher_readback_batches}
+           if args.async_teacher_readback else {}),
         **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}
            if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),

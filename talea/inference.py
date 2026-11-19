@@ -533,32 +533,56 @@ def _ordered_readouts(function, count, executor, width, items=None):
             future.cancel()
 
 
-def _ordered_teacher_readbacks(readouts, launch, stream, depth):
-    """Queue unchanged per-protein calls, then transfer their probability rows together."""
+def _ordered_teacher_readbacks(readouts, launch, stream, depth, *, asynchronous=False):
+    """Launch teacher calls in order and optionally overlap one grouped transfer."""
     def activate():
         return torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
 
-    def retrieve(group):
+    def transfer(group):
         with activate():
             tensors = [tensor for _, tensor in group]
             packed = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
-            host = packed.cpu().numpy()
+            event = None
+            if asynchronous:
+                host = torch.empty_like(packed, device="cpu", pin_memory=True)
+                host.copy_(packed, non_blocking=True)
+                event = torch.cuda.current_stream(packed.device).record_event()
+            else:
+                host = packed.cpu()
+        return [(inputs, len(tensor)) for inputs, tensor in group], host, event
+
+    def retrieve(transfer_result):
+        records, host, event = transfer_result
+        if event is not None:
+            event.synchronize()
+        array = host.numpy()
         offset = 0
-        for inputs, tensor in group:
-            end = offset + len(tensor)
-            yield (*inputs, *unpack_teacher_tracks(host[offset:end]))
+        for inputs, length in records:
+            end = offset + length
+            yield (*inputs, *unpack_teacher_tracks(array[offset:end]))
             offset = end
 
     group = []
+    pending = None
     for inputs, tiles in readouts:
         with activate():
             tensor = launch(tiles)
         group.append((inputs, tensor))
         if len(group) == depth:
-            yield from retrieve(group)
+            current = transfer(group)
             group.clear()
+            if pending is not None:
+                yield from retrieve(pending)
+            if asynchronous:
+                pending = current
+            else:
+                yield from retrieve(current)
+            del current
+    if pending is not None:
+        yield from retrieve(pending)
+        del pending
     if group:
-        yield from retrieve(group)
+        yield from retrieve(transfer(group))
 
 
 def _forward_pair(batch, following, future, forward, producer, can_overlap):
@@ -1066,6 +1090,7 @@ class TaleaPredictor:
         readout_streams: int = 0,
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
+        async_teacher_readback: bool = False,
         readout_square_budget: int = 1024 ** 2,
         teacher_quantile_histogram: bool = False,
         native_half_readout: bool = False,
@@ -1166,7 +1191,10 @@ class TaleaPredictor:
             raise ValueError("teacher_readback_records must be positive")
         if readout_square_budget < 1:
             raise ValueError("readout_square_budget must be positive")
-        teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1
+        if async_teacher_readback and self.device.type != "cuda":
+            raise ValueError("asynchronous teacher readback requires CUDA")
+        teacher_owner_thread = teacher_owner_thread or teacher_readback_records > 1 or async_teacher_readback
+        self.async_teacher_readback_batches = 0
         if shared_attention_mib < 0:
             raise ValueError("shared_attention_mib must be nonnegative")
         if not 0 <= readout_streams <= record_workers:
@@ -1668,7 +1696,12 @@ class TaleaPredictor:
                             self.teacher_model, tiles, self.teacher_contract, self.device,
                             teacher_graphs, teacher_diagonal,
                         )
-                    readouts = _ordered_teacher_readbacks(readouts, launch_teacher, readout_stream, depth)
+                    # Both resident groups must fit the original matrix budget.
+                    overlap_copy = async_teacher_readback and 2 * depth <= readout_capacity and len(batch) > depth
+                    self.async_teacher_readback_batches += int(overlap_copy)
+                    readouts = _ordered_teacher_readbacks(
+                        readouts, launch_teacher, readout_stream, depth, asynchronous=overlap_copy,
+                    )
                 for record, outputs in zip(batch, readouts, strict=True):
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)
