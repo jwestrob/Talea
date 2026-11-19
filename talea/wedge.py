@@ -19,23 +19,25 @@ import numpy as np
 _compiled_wedge_scores = None
 _compiled_mad = None
 _compiled_track_prefixes = None
+_compiled_padded_diagonals = None
 
 
 def enable_compiled_wedge_scores() -> None:
     """Compile on first use in long-lived process workers when Numba is installed."""
-    global _compiled_wedge_scores, _compiled_mad, _compiled_track_prefixes
+    global _compiled_wedge_scores, _compiled_mad, _compiled_track_prefixes, _compiled_padded_diagonals
     try:
         from numba import config
         if config.DISABLE_JIT:
             return
         from talea._wedge_numba import (
-            accumulate_scores, median_absolute_deviations, track_prefixes,
+            scores_from_prefixes, median_absolute_deviations, track_prefixes, padded_diagonals_f32,
         )
     except ImportError:
         return
-    _compiled_wedge_scores = accumulate_scores
+    _compiled_wedge_scores = scores_from_prefixes
     _compiled_mad = median_absolute_deviations
     _compiled_track_prefixes = track_prefixes
+    _compiled_padded_diagonals = padded_diagonals_f32
 
 
 def candidate_periods_from_windows(
@@ -123,6 +125,34 @@ def robust_diagonal_tracks(
     kept as the concordance oracle): each diagonal's quantile, median and MAD come from one ascending sort
     of a padded separation-by-position array, with numpy's own interpolation formulas.
     """
+    rows = _normalized_diagonals(matrix, max_separation, baseline_quantile, clip)
+    return _diagonal_views(rows, len(matrix))
+
+
+def _diagonal_views(rows, length):
+    if length == 0:
+        return []
+    return [np.empty(0, dtype=np.float64)] + [
+        row[: length - separation] for separation, row in enumerate(rows, 1)
+    ]
+
+
+def fused_robust_diagonal_tracks(first, second, max_separation, baseline_quantile, clip):
+    """Normalize the two layers and fuse their rectangular buffers in place."""
+    if first.shape != second.shape:
+        return fuse_diagonal_tracks([
+            robust_diagonal_tracks(matrix, max_separation, baseline_quantile, clip)
+            for matrix in (first, second)
+        ])
+    left = _normalized_diagonals(first, max_separation, baseline_quantile, clip)
+    right = _normalized_diagonals(second, max_separation, baseline_quantile, clip)
+    left += right
+    left += 0.0  # the NumPy mean reduction begins at positive zero
+    left *= 0.5
+    return _diagonal_views(left, len(first))
+
+
+def _normalized_diagonals(matrix, max_separation, baseline_quantile, clip):
     values = np.asarray(matrix)
     if values.ndim != 2 or values.shape[0] != values.shape[1]:
         raise ValueError("attention matrix must be square")
@@ -134,16 +164,18 @@ def robust_diagonal_tracks(
         raise ValueError("clip must be positive")
     length = len(values)
     maximum = min(int(max_separation), length - 1)
-    tracks = [np.empty(0, dtype=np.float64) for _ in range(maximum + 1)]
     if maximum < 1:
-        return tracks
+        return np.empty((0, 0), dtype=np.float64)
     separations = np.arange(1, maximum + 1)
     counts = length - separations
     # Row d - 1 holds diagonal d, left-aligned and padded with +inf so padding sorts last.
     storage = np.float32 if values.dtype in (np.float32, np.float16) else np.float64
-    padded = np.full((maximum, length - 1), np.inf, dtype=storage)
-    for row, separation in enumerate(separations):
-        padded[row, : counts[row]] = np.diagonal(values, offset=separation)
+    if _compiled_padded_diagonals is not None and values.dtype == np.float32:
+        padded = _compiled_padded_diagonals(values, maximum)
+    else:
+        padded = np.full((maximum, length - 1), np.inf, dtype=storage)
+        for row, separation in enumerate(separations):
+            padded[row, : counts[row]] = np.diagonal(values, offset=separation)
     # Nonnegative attention retains its exact order statistics in its native
     # precision. Keep the float64 ordering for NaNs and signed-zero ties.
     if padded.dtype == np.float32 and (np.signbit(padded).any() or np.isnan(padded).any()):
@@ -163,11 +195,13 @@ def robust_diagonal_tracks(
     for row in np.flatnonzero(scale < 1e-12):  # rare: fall back to the standard deviation
         scale[row] = float(np.std(centered[row, : counts[row]]))
     usable = scale >= 1e-12
+    if np.all(usable):
+        centered /= scale[:, None]
+        np.clip(centered, -clip, clip, out=centered)
+        return centered
     normalized = np.zeros_like(centered)
     normalized[usable] = np.clip(centered[usable] / scale[usable, None], -clip, clip)
-    for separation, count in zip(separations, counts):
-        tracks[separation] = normalized[separation - 1, :count].copy()
-    return tracks
+    return normalized
 
 
 def _robust_diagonal_tracks_reference(
@@ -632,24 +666,25 @@ class WedgePlan:
                 continue
             n_starts = length - width + 1
             used = layout["used"]
-            # Element (d, width - d + j) of the prefix matrix sits at flat index
-            # d * length + width + j, so one strided view holds every diagonal's
-            # upper prefix values for all starts j.
-            upper = np.lib.stride_tricks.as_strided(
-                flat[width:],
-                shape=(len(tracks), n_starts),
-                strides=(length * flat.itemsize, flat.itemsize),
-                writeable=False,
-            )
-            sums = upper[used] - prefix[used, :n_starts]
             index, weight = layout["index"], layout["weight"]
-            if _compiled_wedge_scores is None:
+            if _compiled_wedge_scores is not None:
+                scores = _compiled_wedge_scores(
+                    prefix, width, used, index, weight, layout["counts"], layout["denominator"]
+                )
+            else:
+                # Flat index d * length + width + j supplies diagonal d's
+                # upper prefix at width - d + j.
+                upper = np.lib.stride_tricks.as_strided(
+                    flat[width:],
+                    shape=(len(tracks), n_starts),
+                    strides=(length * flat.itemsize, flat.itemsize),
+                    writeable=False,
+                )
+                sums = upper[used] - prefix[used, :n_starts]
                 scores = np.zeros((len(layout["periods"]), n_starts), dtype=np.float64)
                 for slot, rows in enumerate(layout["rows"]):
                     scores[:rows] += weight[:rows, slot, None] * sums[index[:rows, slot]]
                 scores /= layout["denominator"][:, None]
-            else:
-                scores = _compiled_wedge_scores(sums, index, weight, layout["counts"], layout["denominator"])
             yield width, layout["periods"], scores
 
 

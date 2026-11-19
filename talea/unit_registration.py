@@ -16,6 +16,8 @@ import numpy as np
 
 
 _compiled_integral_image = None
+_compiled_interval_medians = None
+_compiled_registration_geometry = None
 
 
 def integral_image(matrix: np.ndarray) -> np.ndarray:
@@ -101,6 +103,58 @@ def _core_unit_indices(
     return indices
 
 
+def _registration_phases(sequence_length, period, offsets, fraction, core_start, core_end, prefix):
+    if (_compiled_registration_geometry is not None and 1 <= period <= sequence_length
+            and prefix.shape == (sequence_length + 1, sequence_length + 1)
+            and prefix.dtype == np.float64 and 0.0 <= fraction <= 1.0):
+        units_by_phase, edges_by_phase, separated, counts, core = _compiled_registration_geometry(
+            prefix, offsets, period, fraction, core_start, core_end
+        )
+        for i, offset in enumerate(offsets):
+            count = counts[i]
+            units = units_by_phase[i, :count]
+            first, last = core[i]
+            if last - first < 2:
+                # Preserve NumPy's argsort tie ordering in the three-nearest fallback.
+                indices = _core_unit_indices(units, core_start, core_end)
+                if len(indices) < 3:
+                    continue
+                first, last = indices[0], indices[-1]
+            edges = edges_by_phase[i, :count - 1]
+            background = separated[i, max(0, first - 1) : min(count - 2, last)]
+            yield offset, units, (first, last), edges, edges[first:last], background
+        return
+    for offset in offsets:
+        units = periodic_tiles(
+            sequence_length,
+            period,
+            float(offset),
+            minimum_terminal_fraction=fraction,
+        )
+        core_indices = _core_unit_indices(units, core_start, core_end)
+        if len(core_indices) < 3:
+            continue
+        edges = np.asarray(
+            [
+                block_mean(prefix, units[index], units[index + 1])
+                for index in range(len(units) - 1)
+            ],
+            dtype=np.float64,
+        )
+        core_edges = edges[core_indices[0] : core_indices[-1]]
+        background = np.asarray(
+            [
+                block_mean(prefix, units[index], units[index + 2])
+                for index in range(
+                    max(0, int(core_indices[0]) - 1),
+                    min(len(units) - 2, int(core_indices[-1])),
+                )
+            ],
+            dtype=np.float64,
+        )
+        yield offset, units, core_indices, edges, core_edges, background
+
+
 def register_periodic_units(
     attention: np.ndarray,
     period: float,
@@ -130,34 +184,9 @@ def register_periodic_units(
     # of values within each candidate phase.
     groups = {}
     offsets = np.arange(0.0, max(float(period), phase_step), phase_step)
-    for offset in offsets:
-        units = periodic_tiles(
-            sequence_length,
-            period,
-            float(offset),
-            minimum_terminal_fraction=minimum_terminal_fraction,
-        )
-        core_indices = _core_unit_indices(units, core_start, core_end)
-        if len(core_indices) < 3:
-            continue
-        edges = np.asarray(
-            [
-                block_mean(prefix, units[index], units[index + 1])
-                for index in range(len(units) - 1)
-            ],
-            dtype=np.float64,
-        )
-        core_edges = edges[core_indices[0] : core_indices[-1]]
-        background = np.asarray(
-            [
-                block_mean(prefix, units[index], units[index + 2])
-                for index in range(
-                    max(0, int(core_indices[0]) - 1),
-                    min(len(units) - 2, int(core_indices[-1])),
-                )
-            ],
-            dtype=np.float64,
-        )
+    for offset, units, core_indices, edges, core_edges, background in _registration_phases(
+        sequence_length, period, offsets, minimum_terminal_fraction, core_start, core_end, prefix
+    ):
         candidate = {
             "offset": float(offset),
             "units": units,
@@ -292,6 +321,10 @@ def scan_plausible_boundary_pairs(
             for index in range(len(units) - 1)
         ]
     )
+    if _compiled_interval_medians is not None and prefix.dtype == np.float64 and np.isfinite(edge_scores).all():
+        fast = _compiled_boundary_scan(units, core_indices, edge_scores, prefix)
+        if fast is not None:
+            return fast
     candidates = []
     false_scan_candidates = []
     for left in range(len(units)):
@@ -347,5 +380,54 @@ def scan_plausible_boundary_pairs(
         ),
         "core_first_unit_index": int(core_indices[0]),
         "core_last_unit_index": int(core_indices[-1]),
+        "tiled_unit_count": len(units),
+    }
+
+def _compiled_boundary_scan(units, core, edges, prefix):
+    """Evaluate every span, retaining only the winning core and noncore records."""
+    starts, ends = np.asarray(units).T
+    left, right = np.triu_indices(len(units), k=2)
+    closures = (prefix[ends[right], ends[left]] - prefix[starts[right], ends[left]]
+                - prefix[ends[right], starts[left]] + prefix[starts[right], starts[left]])
+    closures /= (ends[right] - starts[right]) * (ends[left] - starts[left])
+    adjacent = _compiled_interval_medians(edges)
+    epsilon = np.maximum(np.abs(adjacent) * 1e-6, 1e-12)
+    ratios = (closures + epsilon) / (adjacent + epsilon)
+    # The legacy sort has special ordering for NaNs. Preserve that path for
+    # unusual negative or nonfinite inputs.
+    if not np.all(np.isfinite(ratios) & (ratios > 0)):
+        return None
+    # Scalar ufunc dispatch matches the reference across CPU SIMD variants.
+    scores = np.fromiter((-np.log(float(value)) for value in ratios), dtype=np.float64, count=len(ratios))
+    spans_core = (left <= core[0]) & (right >= core[-1])
+
+    def winner(indices):
+        if not len(indices):
+            return None
+        # triu_indices visits pairs in ascending (start, end) order.
+        i = indices[np.argmin(scores[indices])]
+        return {
+            "left_unit_index": int(left[i]), "right_unit_index": int(right[i]),
+            "start": int(starts[left[i]]), "end": int(ends[right[i]]),
+            "n_units": int(right[i] - left[i] + 1),
+            "open_path_score": float(scores[i]), "closure_attention": float(closures[i]),
+            "adjacent_attention_median": float(adjacent[i]),
+        }
+
+    core_scores = np.sort(scores[spans_core])
+    strongest = winner(np.flatnonzero(spans_core))
+    other = winner(np.flatnonzero(~spans_core))
+    quantiles = np.quantile(core_scores, [0.05, 0.10])
+    return {
+        "candidate_count": len(core_scores),
+        "open_path_score_minimum": strongest["open_path_score"],
+        "open_path_score_q05": float(quantiles[0]),
+        "open_path_score_q10": float(quantiles[1]),
+        "open_path_score_median": float(np.median(core_scores)),
+        "strongest_closure_candidate": strongest,
+        "noncore_false_scan_candidate_count": int(np.count_nonzero(~spans_core)),
+        "noncore_false_scan_open_path_score_minimum": other["open_path_score"] if other else None,
+        "noncore_false_scan_strongest_candidate": other,
+        "core_first_unit_index": int(core[0]), "core_last_unit_index": int(core[-1]),
         "tiled_unit_count": len(units),
     }

@@ -21,8 +21,7 @@ from talea.wedge import (
     WedgePlan,
     best_wedge_interval,
     candidate_periods_from_windows,
-    fuse_diagonal_tracks,
-    robust_diagonal_tracks,
+    fused_robust_diagonal_tracks,
 )
 
 
@@ -147,18 +146,10 @@ def process_attention_record(task: dict) -> dict:
     wedge_call = None
     secondary_calls: list[dict] = []
     if periods:
-        tracks = fuse_diagonal_tracks(
-            [
-                robust_diagonal_tracks(
-                    matrices[layer],
-                    int(wedge_config["maximum_separation"]),
-                    baseline_quantile=float(
-                        wedge_config["diagonal_baseline_quantile"]
-                    ),
-                    clip=float(wedge_config["diagonal_z_clip"]),
-                )
-                for layer in (13, 35)
-            ]
+        tracks = fused_robust_diagonal_tracks(
+            matrices[13], matrices[35], int(wedge_config["maximum_separation"]),
+            baseline_quantile=float(wedge_config["diagonal_baseline_quantile"]),
+            clip=float(wedge_config["diagonal_z_clip"]),
         )
         wedge = wedge_config["wedge"]
         widths = widths_from_config(wedge_config)

@@ -50,6 +50,9 @@ def _diagonal_mean_profile_vectorized(values: np.ndarray) -> np.ndarray:
     return grid[counts - 1, offsets] / counts
 
 
+_compiled_diagonal_means = None
+
+
 def diagonal_mean_profile(matrix: np.ndarray) -> np.ndarray:
     """Mean APC intensity at residue separations 1..L-1.
 
@@ -57,11 +60,18 @@ def diagonal_mean_profile(matrix: np.ndarray) -> np.ndarray:
     matrix. Its one-dimensional DFT is therefore the corresponding Fourier
     slice of the two-dimensional matrix, without image rotation/interpolation.
     """
-    values = np.asarray(matrix, dtype=np.float64)
+    values = np.asarray(matrix)
     if values.ndim != 2 or values.shape[0] != values.shape[1]:
         raise ValueError("attention matrix must be square")
     if len(values) < 2:
         return np.empty(0, dtype=np.float64)
+    if _compiled_diagonal_means is not None and values.dtype == np.float32 and len(values) <= 8192:
+        # Above the scalar crossover the reference uses a pairwise sum. On
+        # the binary16 grid all partial sums are exact, in either order.
+        result = _compiled_diagonal_means(values, len(values) > DIAGONAL_FAST_PATH_MAXIMUM)
+        if result is not None:
+            return result
+    values = np.asarray(values, dtype=np.float64)
     if len(values) > DIAGONAL_FAST_PATH_MAXIMUM:
         return _diagonal_mean_profile_reference(values)
     return _diagonal_mean_profile_vectorized(values)
