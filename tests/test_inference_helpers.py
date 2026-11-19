@@ -380,6 +380,23 @@ def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype, ban
             if grouped is not None:
                 assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
 
+@pytest.mark.parametrize("alignment", [8, 16])
+def test_vector_alignment_reuses_only_contiguous_aligned_cuda_slices(alignment):
+    from unittest.mock import Mock
+    from talea.inference import _aligned_record
+
+    tensor = Mock()
+    tensor.device = torch.device("cuda")
+    for offset in range(0, 512, 2):
+        tensor.data_ptr.return_value = 4096 + offset
+        for contiguous in (True, False):
+            tensor.is_contiguous.return_value = contiguous
+            observed = _aligned_record(tensor, alignment)
+            same = offset % (alignment if contiguous else 512) == 0
+            assert (observed is tensor) == same
+        assert (_aligned_record(tensor) is tensor) == (offset == 0)
+
+
 def test_record_workers_use_prefetch_or_ordinary_graph_stream(monkeypatch):
     from talea.inference import _record_worker_stream
     ordinary, readout = object(), object()

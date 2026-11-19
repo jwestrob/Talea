@@ -87,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
     parser.add_argument("--grouped-apc-graph-min-uses", type=int, default=0,
                         help="capture repeated full-sized APC groups on a CUDA readout stream (zero disables)")
+    parser.add_argument("--apc-vector-alignment", action="store_true",
+                        help="reuse aligned contiguous per-record APC inputs on NVIDIA CUDA with Torch 2.7.1")
     parser.add_argument("--batched-apc-reductions", default="",
                         help="named reductions to apply across equal-length APC records (row,column,total,head)")
     parser.add_argument("--fused-apc", choices=("off", "sym", "full"), default="off",
@@ -321,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         "fused_apc": args.fused_apc,
         **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
+        **({"apc_vector_alignment": True} if args.apc_vector_alignment else {}),
         **({"apc_band_mode": args.apc_band_mode} if args.apc_band_mode != "off" else {}),
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks or args.teacher_graph_pool,
@@ -399,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
+        **({"apc_vector_alignment": True} if args.apc_vector_alignment else {}),
         **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active}
            if args.fused_apc != "off" else {}),
         **({"cache_sdpa_bias": True} if args.cache_sdpa_bias else {}),

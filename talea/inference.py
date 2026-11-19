@@ -302,17 +302,22 @@ def _apc_head_mean_tensor(
     return attention
 
 
-def _aligned_record(tensor):
-    # CUDA may vectorize a reduction differently for a misaligned input. Each
-    # reference reduction receives a fresh contiguous allocation.
-    if tensor.device.type == "cuda" and tensor.data_ptr() % 512:
+def _aligned_record(tensor, alignment_bytes=512):
+    # Keep the original contiguous allocation semantics for strided views.
+    # In CUDA ATen 2.7.1 both sum and mean use at most four input elements
+    # per vector. Their prefix handling and output vector width only consult
+    # the address modulo that vector's size.
+    alignment = alignment_bytes if alignment_bytes != 512 and tensor.is_contiguous() else 512
+    if tensor.device.type == "cuda" and tensor.data_ptr() % alignment:
         return tensor.clone(memory_format=torch.contiguous_format)
     return tensor
 
 
-def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None, batched=(), band_mode="off"):
+def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None, batched=(), band_mode="off", vector_alignment=False):
     """Batch pointwise operations; retain each original reduction's shape and strides."""
     fused = fusion is not None and attention.dtype == torch.float16
+    alignment_bytes = (4 * attention.element_size() if vector_alignment and
+                       attention.dtype in (torch.float16, torch.bfloat16, torch.float32) else 512)
     if fused:
         symmetric = fusion.symmetrize(attention, span.start, length)
     else:
@@ -320,7 +325,7 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
         symmetric = 0.5 * (cropped + cropped.transpose(-1, -2))
     if batched:
         # Each reference reduction starts from an independently aligned allocation.
-        records = (tuple(_aligned_record(record) for record in symmetric.unbind())
+        records = (tuple(_aligned_record(record, alignment_bytes) for record in symmetric.unbind())
                    if not all(which in batched for which in ("row", "column", "total")) else ())
         rows = (symmetric.sum(dim=-1, keepdim=True) if "row" in batched else
                 torch.stack([record.sum(dim=-1, keepdim=True) for record in records]))
@@ -332,7 +337,7 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
     else:
         rows, columns, totals = [], [], []
         for record in symmetric.unbind():
-            record = _aligned_record(record)
+            record = _aligned_record(record, alignment_bytes)
             rows.append(record.sum(dim=-1, keepdim=True))
             columns.append(record.sum(dim=-2, keepdim=True))
             totals.append(record.sum(dim=(-1, -2), keepdim=True))
@@ -343,7 +348,7 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
     else:
         corrected = torch.relu(symmetric - (rows * columns) / total)
     result = (corrected.mean(dim=1) if "head" in batched else
-              torch.stack([_aligned_record(record).mean(dim=0) for record in corrected.unbind()]))
+              torch.stack([_aligned_record(record, alignment_bytes).mean(dim=0) for record in corrected.unbind()]))
     result = _mask_apc_map(result, minimum_separation, band_mode)
     return result.to(storage_dtype) if storage_dtype is not None else result
 
@@ -379,12 +384,12 @@ class _GroupedAPCGraphs:
         self.capture_stream = None
         self.stats = {"captures": 0, "replays": 0, "eager": 0}
 
-    def apply(self, attention, length, separation, dtype, span, fusion, batched, band_mode="off"):
+    def apply(self, attention, length, separation, dtype, span, fusion, batched, band_mode="off", vector_alignment=False):
         stream = torch.cuda.current_stream(attention.device)
         capacity = min(8, max(1, _APC_GROUP_ELEMENTS // (attention.shape[1] * length**2)))
         if len(attention) != capacity or stream == torch.cuda.default_stream(attention.device):
             self.stats["eager"] += 1
-            return _equal_length_apc(attention, length, separation, dtype, span, fusion, batched, band_mode)
+            return _equal_length_apc(attention, length, separation, dtype, span, fusion, batched, band_mode, vector_alignment)
         key = (length, len(attention))
         if self.key != key:
             if self.capture_stream is not None:
@@ -393,7 +398,7 @@ class _GroupedAPCGraphs:
         self.uses += 1
         if self.uses < self.minimum_uses:
             self.stats["eager"] += 1
-            return _equal_length_apc(attention, length, separation, dtype, span, fusion, batched, band_mode)
+            return _equal_length_apc(attention, length, separation, dtype, span, fusion, batched, band_mode, vector_alignment)
         source = attention[:, :, span, span]
         if self.graph is None:
             # Other record workers are concurrently enqueuing operations on the
@@ -409,11 +414,11 @@ class _GroupedAPCGraphs:
                 self.mask = near_diagonal_mask(length, separation, source.device) if separation else None
                 self.band_indices = (_flat_band_indices(length, separation, source.device)
                                      if band_mode == "sparse" and 1 < separation and 2 * separation < length else None)
-                _equal_length_apc(self.input, length, separation, dtype, cropped, fusion, batched, band_mode)
+                _equal_length_apc(self.input, length, separation, dtype, cropped, fusion, batched, band_mode, vector_alignment)
                 graph = torch.cuda.CUDAGraph()
                 graph.capture_begin(capture_error_mode="thread_local")
                 try:
-                    self.output = _equal_length_apc(self.input, length, separation, dtype, cropped, fusion, batched, band_mode)
+                    self.output = _equal_length_apc(self.input, length, separation, dtype, cropped, fusion, batched, band_mode, vector_alignment)
                 finally:
                     graph.capture_end()
                 self.graph = graph
@@ -434,7 +439,7 @@ class _GroupedAPCGraphs:
         return self.output.clone()
 
 
-def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, fusion=None, batched=(), handoff=False, graphs=None, band_mode="off"):
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, fusion=None, batched=(), handoff=False, graphs=None, band_mode="off", vector_alignment=False):
     """Yield one device map per layer and protein, or the scalar singleton path."""
     heads = attentions[layers[0]].shape[1]
     for start, stop in (_equal_apc_groups(indices_by_record, heads) if groups is None else groups):
@@ -447,7 +452,7 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
             apply = graphs.apply if graphs is not None else _equal_length_apc
             maps = {
-                layer: apply(attentions[layer][start:stop], len(indices), separation, dtype, span, fusion, batched, band_mode)
+                layer: apply(attentions[layer][start:stop], len(indices), separation, dtype, span, fusion, batched, band_mode, vector_alignment)
                 for layer in layers
             }
         if stats is not None:
@@ -468,7 +473,7 @@ class _PendingCapture(NamedTuple):
         return self.itemsize
 
 
-def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=None, batched=(), graphs=None, band_mode="off"):
+def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=None, batched=(), graphs=None, band_mode="off", vector_alignment=False):
     """Run the existing scalar and equal-length kernels, in record order."""
     maps = []
     groups = (_equal_apc_groups(indices_by_record, weights.shape[1]) if grouped
@@ -480,7 +485,7 @@ def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=No
             maps.append(_apc_head_mean_tensor(weights[start], indices, length, separation, dtype, span, fusion, band_mode))
         else:
             correct = graphs.apply if graphs is not None else _equal_length_apc
-            maps.extend(correct(weights[start:stop], length, separation, dtype, span, fusion, batched, band_mode).unbind())
+            maps.extend(correct(weights[start:stop], length, separation, dtype, span, fusion, batched, band_mode, vector_alignment).unbind())
     return maps
 
 
@@ -1253,6 +1258,7 @@ class TaleaPredictor:
         group_equal_apc: bool = False,
         fused_apc: str = "off",
         batched_apc_reductions: str = "",
+        apc_vector_alignment: bool = False,
         grouped_apc_graph_min_uses: int = 0,
         apc_band_mode: str = "off",
         teacher_cuda_graph: bool = False,
@@ -1320,6 +1326,9 @@ class TaleaPredictor:
         batched = frozenset(batched_apc_reductions.split(",")) if batched_apc_reductions else frozenset()
         if not batched <= {"row", "column", "total", "head"}:
             raise ValueError("batched_apc_reductions accepts row,column,total,head")
+        vector_alignment = (apc_vector_alignment and group_equal_apc and self.device.type == "cuda"
+                            and torch.version.hip is None and torch.__version__.partition("+")[0] == "2.7.1")
+        self.apc_vector_alignment_active = vector_alignment
         if apc_band_mode not in ("off", "dense", "sparse"):
             raise ValueError("apc_band_mode must be off, dense or sparse")
         if grouped_apc_graph_min_uses < 0:
@@ -1703,7 +1712,8 @@ class TaleaPredictor:
                         indices.record_stream(capture_stream)
                 if early_apc:
                     correct = partial(_layer_apc, indices_by_record=residue_indices, separation=minimum_separation,
-                                      dtype=device_storage_dtype, grouped=group_equal_apc, fusion=apc_fusion, batched=batched, graphs=grouped_graphs, band_mode=apc_band_mode)
+                                      dtype=device_storage_dtype, grouped=group_equal_apc, fusion=apc_fusion, batched=batched, graphs=grouped_graphs, band_mode=apc_band_mode,
+                                      vector_alignment=vector_alignment)
                     capture.transform_attention = partial(
                         _queue_capture, function=correct, executor=capture_executor, stream=capture_stream,
                     )
@@ -1915,6 +1925,7 @@ class TaleaPredictor:
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
                         device_storage_dtype, readout_stream, groups, stats, apc_fusion, batched, handoff=bool(private_streams), graphs=grouped_graphs, band_mode=apc_band_mode,
+                        vector_alignment=vector_alignment,
                     )
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:
