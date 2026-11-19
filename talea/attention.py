@@ -108,6 +108,17 @@ def score_attention_window(
     return call
 
 
+def _median_filter_rows(values: np.ndarray, width: int) -> np.ndarray:
+    """Use the optimized 1D rank filter with independent nearest-edge rows."""
+    halo = width // 2
+    padded = np.empty((len(values), values.shape[1] + 2 * halo), dtype=values.dtype)
+    padded[:, :halo] = values[:, :1]
+    padded[:, halo:-halo] = values
+    padded[:, -halo:] = values[:, -1:]
+    filtered = median_filter(padded.ravel(), size=width, mode="nearest")
+    return filtered.reshape(padded.shape)[:, halo:-halo]
+
+
 def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     """Score rows of equal-length diagonal profiles with independent transforms.
 
@@ -116,7 +127,7 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     """
     n = profiles.shape[1]
     width = min(31, n if n % 2 else n - 1)
-    residual = profiles - median_filter(profiles, size=(1, width), mode="nearest")
+    residual = profiles - _median_filter_rows(profiles, width)
     time = np.arange(n, dtype=np.float64) - (n - 1) / 2
     centered = residual - residual.mean(axis=1, keepdims=True)
     slopes = np.sum(centered * time, axis=1, keepdims=True) / np.dot(time, time)
@@ -127,7 +138,7 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     transformed = np.stack([np.fft.rfft(row) for row in normalized * window])
     log_power = np.log1p(np.abs(transformed) ** 2 / np.sum(window**2))
     width = min(15, max(5, (log_power.shape[1] // 8) | 1))
-    residual = log_power - median_filter(log_power, size=(1, width), mode="nearest")
+    residual = log_power - _median_filter_rows(log_power, width)
     usable = residual[:, 2:]
     center = np.median(usable, axis=1, keepdims=True)
     scale = 1.4826 * np.median(np.abs(usable - center), axis=1, keepdims=True)
