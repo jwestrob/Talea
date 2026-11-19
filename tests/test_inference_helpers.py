@@ -262,3 +262,35 @@ def test_record_worker_threads_own_independent_attention_staging():
         result = list(workers.map(simulate_readout, range(4)))
     for protein, matrix in enumerate(result):
         np.testing.assert_array_equal(matrix, np.full((20, 20), protein, dtype=np.float32))
+
+
+def test_device_autocast_uses_legacy_torch22_queries(monkeypatch):
+    from talea.inference import _device_autocast_enabled
+
+    monkeypatch.delattr(torch.amp, "is_autocast_available", raising=False)
+    monkeypatch.setattr(torch, "is_autocast_enabled", lambda: False)
+    monkeypatch.setattr(torch, "is_autocast_cpu_enabled", lambda: True)
+    assert _device_autocast_enabled("cpu")
+    assert not _device_autocast_enabled("cuda")
+    assert not _device_autocast_enabled("mps")
+
+
+def test_device_autocast_skips_unsupported_backend(monkeypatch):
+    from talea.inference import _device_autocast_enabled
+
+    monkeypatch.setattr(torch.amp, "is_autocast_available", lambda backend: backend == "cpu", raising=False)
+    def supported_only(backend):
+        assert backend == "cpu"
+        return True
+    monkeypatch.setattr(torch, "is_autocast_enabled", supported_only)
+    assert _device_autocast_enabled("cpu")
+    assert not _device_autocast_enabled("mps")
+
+
+def test_device_autocast_matches_cpu_context():
+    from talea.inference import _device_autocast_enabled
+
+    with torch.autocast("cpu", enabled=False):
+        assert not _device_autocast_enabled("cpu")
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert _device_autocast_enabled("cpu")
