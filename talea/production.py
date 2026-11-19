@@ -343,7 +343,10 @@ def prepare_teacher_tiles(
     tile_size = int(attention["tile_size"])
     central_size = int(attention["central_size"])
     spans = central_tile_spans(length, tile_size, central_size)
-    if half_decoder is not None and all(m.dtype == np.float16 and m.flags.c_contiguous for m in selected):
+    # Below 96 residues, widening the input and normalizing the matrix directly
+    # takes less CPU time than generating a half-word lookup table per channel.
+    use_half_decoder = half_decoder is not None and (length >= 96 or quantile_function is None)
+    if use_half_decoder and all(m.dtype == np.float16 and m.flags.c_contiguous for m in selected):
         return length, half_decoder(selected, spans, tile_size, float(attention["normalization_quantile"]),
                                     float(attention["normalization_clip"]))
     tiles = normalized_attention_tiles(

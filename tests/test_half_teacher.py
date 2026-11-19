@@ -59,3 +59,20 @@ def test_native_half_histogram_rejects_invalid_large_maps(word):
     words[-1, -1] = word
     with pytest.raises(ValueError, match="finite and nonnegative"):
         native_half_tables([words.view(np.float16)], .95, 8.0)
+
+
+@pytest.mark.parametrize("length", [95, 96])
+def test_host_tile_crossover_preserves_channels_and_masks(length):
+    from talea._teacher_histogram import grid_quantile
+    from talea.production import prepare_teacher_tiles
+
+    rng = np.random.default_rng(621)
+    words = rng.integers(0, 0x3c00, size=(length, length), dtype=np.uint16)
+    words[::3, ::2] = 0x8000
+    channels = {13: words.view(np.float16), 35: np.zeros_like(words).view(np.float16)}
+    contract = {"attention": {"layers_zero_based": [13, 35], "tile_size": 128, "central_size": 64,
+                              "normalization_quantile": .95, "normalization_clip": 8.0}}
+    for quantile in (None, grid_quantile):
+        _, tiles = prepare_teacher_tiles(channels, contract, quantile_function=quantile, half_decoder=native_half_tiles)
+        _, reference = prepare_teacher_tiles(channels, contract)
+        assert tiles.tobytes() == reference.tobytes()
