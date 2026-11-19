@@ -567,6 +567,14 @@ class WedgePlan:
 
     def scores(self, tracks: Sequence[np.ndarray]) -> dict[tuple[float, int], np.ndarray]:
         """Start scores of every valid template, keyed by (period, clipped width)."""
+        return {
+            (period, width): scores[row]
+            for width, periods, scores in self._width_scores(tracks)
+            for row, period in enumerate(periods)
+        }
+
+    def _width_scores(self, tracks: Sequence[np.ndarray]):
+        """Yield a matrix of start scores for the templates at each width."""
         if tuple(len(track) for track in tracks) != self.track_lengths:
             raise ValueError("tracks differ in shape from the plan")
         length = self.protein_length
@@ -576,7 +584,6 @@ class WedgePlan:
             track = np.asarray(tracks[separation], dtype=np.float64)
             prefix[separation, 1 : len(track) + 1] = np.cumsum(track)
         flat = prefix.reshape(-1)
-        result = {}
         for width, layout in self.layouts.items():
             if layout is None:
                 continue
@@ -600,9 +607,7 @@ class WedgePlan:
                 scores /= layout["denominator"][:, None]
             else:
                 scores = _compiled_wedge_scores(sums, index, weight, layout["counts"], layout["denominator"])
-            for row, period in enumerate(layout["periods"]):
-                result[(period, width)] = scores[row]
-        return result
+            yield width, layout["periods"], scores
 
 
 def best_wedge_interval(
@@ -639,29 +644,39 @@ def best_wedge_interval(
             )
         elif not plan.matches(tracks, protein_length, periods, widths, settings):
             raise ValueError("plan was built for a different search")
-        template_scores = plan.scores(tracks)
-    else:
-        template_scores = {}
-    for period in sorted({float(value) for value in periods if value > 0}):
-        for requested_width in sorted({int(value) for value in widths if value > 0}):
-            width = min(requested_width, protein_length)
-            scores = template_scores.get((period, width))
-            if scores is None or not len(scores) or not np.any(np.isfinite(scores)):
-                continue
-            start = int(np.nanargmax(scores))
-            candidate = {
-                "start": start,
-                "end": start + width,
-                "window_size": width,
-                "period": period,
-                "score": float(scores[start]),
-                "tolerance": tolerance,
-                "max_harmonics": max_harmonics,
-                "min_harmonics": min_harmonics,
-                "interharmonic_controls": interharmonic_controls,
-            }
-            if best is None or candidate["score"] > best["score"]:
-                best = candidate
+        for width, row_periods, scores in plan._width_scores(tracks):
+            # Collect the winning start for all periods of this width together.
+            # The reference visits ascending period, then width, then start.
+            valid = np.isfinite(scores)
+            if valid.all():
+                starts = np.argmax(scores, axis=1)
+                valid_rows = None
+            else:
+                valid_rows = valid.any(axis=1)
+                if not valid_rows.any():
+                    continue
+                starts = np.argmax(np.where(np.isnan(scores), -np.inf, scores), axis=1)
+            row_scores = scores[np.arange(len(starts)), starts]
+            if valid_rows is not None:
+                row_scores = np.where(valid_rows, row_scores, -np.inf)
+            maximum = np.max(row_scores)
+            tied_rows = np.flatnonzero(row_scores == maximum)
+            row = min(tied_rows, key=lambda index: row_periods[index])
+            period = row_periods[row]
+            start = int(starts[row])
+            score = float(scores[row, start])
+            if best is None or (score, -period, -width) > (best["score"], -best["period"], -best["window_size"]):
+                best = {
+                    "start": start,
+                    "end": start + width,
+                    "window_size": width,
+                    "period": period,
+                    "score": score,
+                    "tolerance": tolerance,
+                    "max_harmonics": max_harmonics,
+                    "min_harmonics": min_harmonics,
+                    "interharmonic_controls": interharmonic_controls,
+                }
     if best is None:
         return {
             "start": 0,
