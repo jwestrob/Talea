@@ -851,6 +851,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.cached_sdpa_bias_calls = 0
+        self.fused_qk_calls = 0
         self.fused_rotary_calls = 0
         self.early_gate_layers = 0
         self.early_apc_layers = 0
@@ -1237,6 +1238,7 @@ class TaleaPredictor:
         direct_shared_half: str = "off",
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
+        fused_qk: bool = False,
         fused_swiglu: bool = False,
         unit_residual: bool = False,
         early_apc: bool = False,
@@ -1615,11 +1617,17 @@ class TaleaPredictor:
                 from talea.sdpa_bias import cached_padding_bias
                 bias_cache = stack.enter_context(cached_padding_bias(capture.blocks))
                 stack.callback(lambda: setattr(self, "cached_sdpa_bias_calls", bias_cache.calls))
+            self.fused_qk_calls = 0
+            qk_calls = [0]
+            if fused_qk:
+                from talea.qk import fused_qk_context
+                qk_calls = stack.enter_context(fused_qk_context(capture.blocks, self.device))
+                stack.callback(lambda: setattr(self, "fused_qk_calls", qk_calls[0]))
             self.fused_rotary_calls = 0
             if fused_rotary:
                 from talea.rotary import fused_rotary_context
                 rotary_calls = stack.enter_context(fused_rotary_context(capture.blocks, self.device))
-                stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0]))
+                stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0] + qk_calls[0]))
             self.fused_swiglu_calls = 0
             self.arithmetic_swiglu_repairs = None
             if fused_swiglu or arithmetic_swiglu:

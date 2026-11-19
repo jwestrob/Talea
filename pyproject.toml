@@ -32,7 +32,7 @@ packages = ["talea"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-talea = ["assets/*"]
+talea = ["assets/*", "_qk_rope.cu"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
