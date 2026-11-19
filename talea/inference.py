@@ -42,7 +42,6 @@ from talea.production import (
     compose_talea_score,
     global_head_probabilities,
     pooled_hidden_features_for_layers,
-    roundtrip_attention_storage,
     summarize_teacher_prediction,
     teacher_tracks_for_records,
 )
@@ -226,8 +225,10 @@ def apc_head_mean(
     if storage_dtype is not None and attention.dtype != storage_dtype:
         attention = attention.to(storage_dtype)
     result = attention.to("cpu", dtype=torch.float32).numpy()
-    if result.shape != (sequence_length, sequence_length):
+    if result.shape != (sequence_length, sequence_length) or not result.size:
         raise ValueError("cropped attention matrix does not match sequence length")
+    if not np.isfinite(result).all():
+        raise ValueError("attention matrix contains nonfinite values")
     return result
 
 
@@ -657,10 +658,9 @@ class TaleaPredictor:
         storage_dtype = self.deployment["esmplusplus"].get(
             "decoder_matrix_storage_dtype", "fp32"
         )
-        device_storage_dtype = {
-            "fp16": torch.float16,
-            "fp32": None,
-        }.get(storage_dtype)
+        if storage_dtype not in ("fp16", "fp32"):
+            raise ValueError(f"unsupported attention storage dtype: {storage_dtype}")
+        device_storage_dtype = torch.float16 if storage_dtype == "fp16" else None
         minimum_separation = int(
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
         )
@@ -836,15 +836,12 @@ class TaleaPredictor:
                             f"{record.record_id}"
                         )
                     matrices = {
-                        layer: roundtrip_attention_storage(
-                            apc_head_mean(
-                                attentions[layer][batch_position],
-                                indices,
-                                record.length,
-                                minimum_separation,
-                                storage_dtype=device_storage_dtype,
-                            ),
-                            storage_dtype,
+                        layer: apc_head_mean(
+                            attentions[layer][batch_position],
+                            indices,
+                            record.length,
+                            minimum_separation,
+                            storage_dtype=device_storage_dtype,
                         )
                         for layer in self.expected_layers
                     }

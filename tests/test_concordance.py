@@ -402,10 +402,15 @@ def test_device_side_fp16_cast_matches_host_roundtrip(length, padded):
     host = roundtrip_attention_storage(
         apc_head_mean(raw, indices, length, 6, storage_dtype=None), "fp16"
     )
-    device_cast = roundtrip_attention_storage(
-        apc_head_mean(raw, indices, length, 6, storage_dtype=torch.float16), "fp16"
-    )
+    device_cast = apc_head_mean(raw, indices, length, 6, storage_dtype=torch.float16)
+    assert device_cast.dtype == np.float32
     assert np.array_equal(host, device_cast)
+
+
+def test_apc_head_mean_rejects_nonfinite_output():
+    raw = torch.full((2, 12, 12), float("nan"))
+    with pytest.raises(ValueError, match="nonfinite"):
+        apc_head_mean(raw, torch.arange(12), 12, 6, storage_dtype=torch.float16)
 
 
 def test_near_diagonal_mask_matches_the_inline_construction():
