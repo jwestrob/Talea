@@ -88,6 +88,103 @@ def _normalization_positive_values(
     return selected[selected > 0]
 
 
+def _matrix_quantile(values: np.ndarray, quantile: float) -> float:
+    """Exact quantile of positive entries, retaining NumPy's interpolation."""
+    # Use a sample only to pick a cutoff. Entries below it may be replaced by
+    # zeros if both order statistics for the requested quantile are above it.
+    # This leaves a small tail to partition, even for a multi-million-entry map.
+    if values.size >= 65536 and quantile >= 0.8:
+        sample = values.flat[:: max(1, values.size // 1024)]
+        sample = sample[sample > 0]
+        if sample.size:
+            index = int((sample.size - 1) * (quantile - 0.04))
+            sample.partition(index)
+            tail = values[values >= sample[index]]
+            count = np.count_nonzero(values > 0)
+            omitted = count - len(tail)
+            # Margin covers rounding of NumPy's fractional index in float32.
+            rank = (count - 1) * quantile
+            margin = 1 + int(np.ceil(count * np.finfo(np.float32).eps))
+            low, high = int(rank) - margin, int(rank) + margin + 1
+            if omitted <= low and high < count:
+                lo, hi = low - omitted, high - omitted
+                tail.partition((lo, hi))
+                if tail[lo] == tail[hi]:
+                    return float(tail[lo])
+                positive = np.empty(count, dtype=values.dtype)
+                positive[:omitted] = 0
+                positive[omitted:] = tail
+                return float(np.quantile(positive, quantile, overwrite_input=True))
+    positive = values[values > 0]
+    if not positive.size:
+        return 0.0
+    return float(np.quantile(positive, quantile, overwrite_input=True))
+
+
+def normalized_attention_tiles(
+    matrices: Sequence[np.ndarray],
+    spans: Sequence[Mapping[str, int]],
+    tile_size: int,
+    quantile: float,
+    clip: float,
+) -> np.ndarray:
+    """Build the teacher's diagonal tiles using the full-map normalization scale."""
+    if not 0.5 <= quantile < 1.0:
+        raise ValueError("quantile must be in [0.5, 1)")
+    if clip <= 0:
+        raise ValueError("clip must be positive")
+    length = matrices[0].shape[0]
+    tiles = np.zeros((len(spans), len(matrices) + 1, tile_size, tile_size), np.float32)
+    bounds = []
+    for i, span in enumerate(spans):
+        start, end = span["source_start"], span["source_end"]
+        src = slice(max(0, start), min(length, end))
+        dst = slice(max(0, -start), tile_size - max(0, end - length))
+        bounds.append((src, dst))
+        tiles[i, -1, dst, dst] = 1.0
+
+    # On any row, the tiles covering it start at most (tile_size - 1) apart,
+    # in multiples of the central step. Their union fits in this many columns.
+    step = (
+        spans[1]["source_start"] - spans[0]["source_start"]
+        if len(spans) > 1 else tile_size
+    )
+    row_width = min(length, tile_size + (tile_size - 1) // step * step)
+    denominator = np.log1p(clip)
+    for channel, matrix in enumerate(matrices):
+        if not np.isfinite(matrix).all():
+            raise ValueError("attention matrix contains nonfinite values")
+        if np.min(matrix) < 0:
+            raise ValueError("APC attention matrix must be nonnegative")
+        scale = _matrix_quantile(matrix, quantile)
+        if scale <= 0 or not np.isfinite(scale):
+            continue
+
+        if row_width == length:
+            buffer = band = matrix.copy(order="C")
+        else:
+            # Store (i, j) at i * row_width + j. Only the tile squares are
+            # accessed: their column ranges move right with each successive
+            # row, so different used rows occupy disjoint storage. Intersections
+            # of consecutive tiles share the exact same cells.
+            buffer = np.zeros((length - 1) * (row_width + 1) + 1, np.float32)
+            band = np.ndarray(
+                matrix.shape,
+                dtype=np.float32,
+                buffer=buffer,
+                strides=(row_width * buffer.itemsize, buffer.itemsize),
+            )
+            for src, _ in bounds:
+                band[src, src] = matrix[src, src]
+
+        np.divide(buffer, scale, out=buffer)
+        np.log1p(buffer, out=buffer)
+        np.divide(np.clip(buffer, 0.0, denominator), denominator, out=buffer)
+        for i, (src, dst) in enumerate(bounds):
+            tiles[i, channel, dst, dst] = band[src, src]
+    return tiles
+
+
 def robust_attention_channel(
     matrix: np.ndarray,
     quantile: float = 0.95,

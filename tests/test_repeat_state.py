@@ -75,3 +75,33 @@ def test_longest_run_and_track_summary():
     assert summary["longest_run_length"] == 3
     assert summary["longest_run_fraction"] == pytest.approx(3 / 7)
     assert summary["supported_fraction"] == pytest.approx(5 / 7)
+
+
+@pytest.mark.parametrize("length,tile,central", [
+    (1, 128, 64), (96, 128, 64), (257, 128, 64), (259, 12, 4),
+    (430, 31, 27), (600, 31, 31),
+])
+def test_normalized_diagonal_tiles_match_full_channels(length, tile, central):
+    from talea.repeat_state import normalized_attention_tiles
+
+    rng = np.random.default_rng(length)
+    matrix = rng.random((length, length), dtype=np.float32)
+    matrix[::2, ::7] = np.float32(-0.0)
+    layers = [matrix.T, matrix.astype(np.float16).astype(np.float32)]
+    spans = central_tile_spans(length, tile, central)
+    for quantile, clip in ((0.5, .001), (.95, 8.0), (.999, 100.0)):
+        channels = attention_channels(layers, quantile=quantile, clip=clip)
+        expected = np.stack([extract_attention_tile(channels, s, tile) for s in spans])
+        actual = normalized_attention_tiles(layers, spans, tile, quantile, clip)
+        assert actual.tobytes() == expected.tobytes()
+
+
+def test_matrix_quantile_matches_full_selection_for_unrepresentative_samples():
+    from talea.repeat_state import _matrix_quantile
+
+    matrix = np.zeros((512, 512), dtype=np.float32)
+    assert _matrix_quantile(matrix, 0.95) == 0.0
+    matrix.flat[::256] = 10.0
+    matrix.flat[1::3] = 0.25
+    for quantile in (0.5, 0.95, 0.9999):
+        assert _matrix_quantile(matrix, quantile) == np.quantile(matrix[matrix > 0], quantile)

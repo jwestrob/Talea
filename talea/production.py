@@ -22,9 +22,8 @@ import torch
 
 from talea.architecture_router import probability_logit
 from talea.repeat_state import (
-    attention_channels,
     central_tile_spans,
-    extract_attention_tile,
+    normalized_attention_tiles,
     summarize_state_track,
 )
 
@@ -222,14 +221,16 @@ def teacher_tracks_from_attention(
     if len(shape) != 2 or shape[0] != shape[1] or shape[0] < 1:
         raise ValueError("teacher attention matrices must be non-empty and square")
     length = int(shape[0])
-    channels = attention_channels(
-        selected,
-        quantile=float(attention["normalization_quantile"]),
-        clip=float(attention["normalization_clip"]),
-    )
     tile_size = int(attention["tile_size"])
     central_size = int(attention["central_size"])
     spans = central_tile_spans(length, tile_size, central_size)
+    tiles = normalized_attention_tiles(
+        selected,
+        spans,
+        tile_size,
+        float(attention["normalization_quantile"]),
+        float(attention["normalization_clip"]),
+    )
     teacher_classes = len(contract["teacher"]["class_names"])
     state_track = np.zeros(length, dtype=np.float32)
     teacher_track = np.zeros((length, teacher_classes), dtype=np.float32)
@@ -244,10 +245,8 @@ def teacher_tracks_from_attention(
     )
     for batch_start in range(0, len(spans), batch_size):
         batch_spans = spans[batch_start : batch_start + batch_size]
-        tiles = np.stack(
-            [extract_attention_tile(channels, span, tile_size) for span in batch_spans]
-        )
-        output = model(torch.from_numpy(tiles).to(device))
+        tile_batch = tiles[batch_start : batch_start + len(batch_spans)]
+        output = model(torch.from_numpy(tile_batch).to(device))
         if output.shape[1] != 1 + teacher_classes:
             raise ValueError("teacher model output channels disagree with its contract")
         diagonal = output[:, :, diagonal_indices, diagonal_indices]
