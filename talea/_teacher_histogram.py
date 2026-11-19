@@ -15,7 +15,26 @@ _BINS = ((_LAST - _FIRST) >> _SHIFT) + 1
 
 
 @njit(cache=True, nogil=True)
+def _count_large_grid(words):
+    # The extra bin collects signed zeros and any value outside the grid.
+    # Unsigned subtraction maps values below the first bin to that bin too.
+    counts = np.zeros(_BINS + 1, np.int32)
+    zeros = 0
+    used_bits = np.uint32(0)
+    for word in words:
+        index = np.uint32((word >> _SHIFT) - (_FIRST >> _SHIFT))
+        counts[min(index, np.uint32(_BINS))] += 1
+        zeros += (word & np.uint32(0x7fffffff)) == 0
+        used_bits |= word
+    if counts[_BINS] != zeros or used_bits & ((1 << _SHIFT) - 1):
+        return counts[:_BINS], -1
+    return counts[:_BINS], words.size - zeros
+
+
+@njit(cache=True, nogil=True)
 def _count_grid(words):
+    if words.size >= 160 * 160:
+        return _count_large_grid(words)
     histogram = np.zeros(_BINS, np.int32)
     count = 0
     used_bits = np.uint32(0)

@@ -56,3 +56,14 @@ def test_full_tiles_are_bit_identical_for_widened_apc_matrices(histogram):
             expected = normalized_attention_tiles(values, spans, 128, q, 8)
             actual = normalized_attention_tiles(values, spans, 128, q, 8, quantile_function=histogram)
             assert expected.tobytes() == actual.tobytes()
+
+
+def test_large_grid_validates_the_overflow_bin_and_tail(histogram):
+    values = np.zeros(160 * 160, np.float32)
+    values[::2] = -0.
+    assert histogram(values, .95) == 0.
+    values[-1] = np.finfo(np.float16).max
+    assert histogram(values, .95) == values[-1]
+    for word in (1, 0x337fffff, 0x33800001, 0x477fe001, 0x7f800000, 0xffc00000, 0x80000001, 0xbf800000):
+        values.view(np.uint32)[-1] = word
+        assert histogram(values, .95) is None
