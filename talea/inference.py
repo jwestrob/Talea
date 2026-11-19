@@ -282,7 +282,7 @@ def _aligned_record(tensor):
     return tensor
 
 
-def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None):
+def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span, fusion=None, batched=()):
     """Batch pointwise operations; retain each original reduction's shape and strides."""
     fused = fusion is not None and attention.dtype == torch.float16
     if fused:
@@ -290,19 +290,32 @@ def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span
     else:
         cropped = attention[:, :, span, span].contiguous()
         symmetric = 0.5 * (cropped + cropped.transpose(-1, -2))
-    rows, columns, totals = [], [], []
-    for record in symmetric.unbind():
-        record = _aligned_record(record)
-        rows.append(record.sum(dim=-1, keepdim=True))
-        columns.append(record.sum(dim=-2, keepdim=True))
-        totals.append(record.sum(dim=(-1, -2), keepdim=True))
-    total = torch.stack(totals) + 1e-12
-    rows, columns = torch.stack(rows), torch.stack(columns)
+    if batched:
+        # Each reference reduction starts from an independently aligned allocation.
+        records = (tuple(_aligned_record(record) for record in symmetric.unbind())
+                   if not all(which in batched for which in ("row", "column", "total")) else ())
+        rows = (symmetric.sum(dim=-1, keepdim=True) if "row" in batched else
+                torch.stack([record.sum(dim=-1, keepdim=True) for record in records]))
+        columns = (symmetric.sum(dim=-2, keepdim=True) if "column" in batched else
+                   torch.stack([record.sum(dim=-2, keepdim=True) for record in records]))
+        totals = (symmetric.sum(dim=(-1, -2), keepdim=True) if "total" in batched else
+                  torch.stack([record.sum(dim=(-1, -2), keepdim=True) for record in records]))
+        total = totals + 1e-12
+    else:
+        rows, columns, totals = [], [], []
+        for record in symmetric.unbind():
+            record = _aligned_record(record)
+            rows.append(record.sum(dim=-1, keepdim=True))
+            columns.append(record.sum(dim=-2, keepdim=True))
+            totals.append(record.sum(dim=(-1, -2), keepdim=True))
+        total = torch.stack(totals) + 1e-12
+        rows, columns = torch.stack(rows), torch.stack(columns)
     if fused and fusion.full:
         corrected = fusion.correct(symmetric, rows, columns, total)
     else:
         corrected = torch.relu(symmetric - (rows * columns) / total)
-    result = torch.stack([_aligned_record(record).mean(dim=0) for record in corrected.unbind()])
+    result = (corrected.mean(dim=1) if "head" in batched else
+              torch.stack([_aligned_record(record).mean(dim=0) for record in corrected.unbind()]))
     if minimum_separation > 0:
         result = result.masked_fill(near_diagonal_mask(length, minimum_separation, result.device), 0)
     result.diagonal(dim1=-2, dim2=-1).fill_(0)
@@ -328,7 +341,7 @@ def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMEN
         start = stop
 
 
-def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, fusion=None, handoff=False):
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None, groups=None, stats=None, fusion=None, batched=(), handoff=False):
     """Yield one device map per layer and protein, or the scalar singleton path."""
     heads = attentions[layers[0]].shape[1]
     for start, stop in (_equal_apc_groups(indices_by_record, heads) if groups is None else groups):
@@ -340,7 +353,7 @@ def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, 
         # after the wait_event() for this capture.
         with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
             maps = {
-                layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span, fusion)
+                layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span, fusion, batched)
                 for layer in layers
             }
         if stats is not None:
@@ -361,7 +374,7 @@ class _PendingCapture(NamedTuple):
         return self.itemsize
 
 
-def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=None):
+def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=None, batched=()):
     """Run the existing scalar and equal-length kernels, in record order."""
     maps = []
     groups = (_equal_apc_groups(indices_by_record, weights.shape[1]) if grouped
@@ -372,7 +385,7 @@ def _layer_apc(weights, indices_by_record, separation, dtype, grouped, fusion=No
         if stop == start + 1:
             maps.append(_apc_head_mean_tensor(weights[start], indices, length, separation, dtype, span, fusion))
         else:
-            maps.extend(_equal_length_apc(weights[start:stop], length, separation, dtype, span, fusion).unbind())
+            maps.extend(_equal_length_apc(weights[start:stop], length, separation, dtype, span, fusion, batched).unbind())
     return maps
 
 
@@ -1071,6 +1084,7 @@ class TaleaPredictor:
         skip_all_valid_mask: bool = False,
         group_equal_apc: bool = False,
         fused_apc: str = "off",
+        batched_apc_reductions: str = "",
         teacher_cuda_graph: bool = False,
         teacher_graph_tracks: bool = False,
         shared_attention_mib: int = 0,
@@ -1131,6 +1145,9 @@ class TaleaPredictor:
         batch returns blocks to the driver and forces later reallocation.
         """
 
+        batched = frozenset(batched_apc_reductions.split(",")) if batched_apc_reductions else frozenset()
+        if not batched <= {"row", "column", "total", "head"}:
+            raise ValueError("batched_apc_reductions accepts row,column,total,head")
         apc_fusion = _apc_fusion(self.device, self.dtype, fused_apc)
         self.apc_fusion_active = apc_fusion is not None
         self.apc_group_stats = None
@@ -1460,7 +1477,7 @@ class TaleaPredictor:
                         indices.record_stream(capture_stream)
                 if early_apc:
                     correct = partial(_layer_apc, indices_by_record=residue_indices, separation=minimum_separation,
-                                      dtype=device_storage_dtype, grouped=group_equal_apc, fusion=apc_fusion)
+                                      dtype=device_storage_dtype, grouped=group_equal_apc, fusion=apc_fusion, batched=batched)
                     capture.transform_attention = partial(
                         _queue_capture, function=correct, executor=capture_executor, stream=capture_stream,
                     )
@@ -1650,7 +1667,7 @@ class TaleaPredictor:
                 if group_equal_apc and self.device.type == "cuda" and not early_apc:
                     items = _grouped_apc_jobs(
                         attentions, self.expected_layers, residue_indices, minimum_separation,
-                        device_storage_dtype, readout_stream, groups, stats, apc_fusion, handoff=bool(private_streams),
+                        device_storage_dtype, readout_stream, groups, stats, apc_fusion, batched, handoff=bool(private_streams),
                     )
                     readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
                 else:
