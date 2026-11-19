@@ -121,12 +121,26 @@ def _matrix_quantile(values: np.ndarray, quantile: float) -> float:
     return float(np.quantile(positive, quantile, overwrite_input=True))
 
 
+def compiled_teacher_quantile():
+    """Load the optional CPU histogram only when the caller requests it."""
+    try:
+        from numba import config
+        if not config.DISABLE_JIT:
+            from talea._teacher_histogram import grid_quantile
+            return grid_quantile
+    except ImportError:
+        pass
+    return None
+
+
 def normalized_attention_tiles(
     matrices: Sequence[np.ndarray],
     spans: Sequence[Mapping[str, int]],
     tile_size: int,
     quantile: float,
     clip: float,
+    *,
+    quantile_function=None,
 ) -> np.ndarray:
     """Build the teacher's diagonal tiles using the full-map normalization scale."""
     if not 0.5 <= quantile < 1.0:
@@ -152,11 +166,13 @@ def normalized_attention_tiles(
     row_width = min(length, tile_size + (tile_size - 1) // step * step)
     denominator = np.log1p(clip)
     for channel, matrix in enumerate(matrices):
-        if not np.isfinite(matrix).all():
-            raise ValueError("attention matrix contains nonfinite values")
-        if np.min(matrix) < 0:
-            raise ValueError("APC attention matrix must be nonnegative")
-        scale = _matrix_quantile(matrix, quantile)
+        scale = quantile_function(matrix, quantile) if quantile_function is not None else None
+        if scale is None:
+            if not np.isfinite(matrix).all():
+                raise ValueError("attention matrix contains nonfinite values")
+            if np.min(matrix) < 0:
+                raise ValueError("APC attention matrix must be nonnegative")
+            scale = _matrix_quantile(matrix, quantile)
         if scale <= 0 or not np.isfinite(scale):
             continue
 

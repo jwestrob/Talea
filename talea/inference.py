@@ -33,6 +33,7 @@ from talea.long_protein import (
 )
 from talea.model import AttentionStateTeacherUNet
 from talea.phase_ssm import probe_parameters, runtime_config
+from talea.repeat_state import compiled_teacher_quantile
 from talea.regions import (
     PRIMARY_EXTENTS,
     registration_for_primary,
@@ -597,6 +598,7 @@ class TaleaPredictor:
         self._attention_arena = None
         self._teacher_graphs = None
         self._graph_readout_stream = None
+        self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.fused_rotary_calls = 0
         self.fused_swiglu_calls = 0
@@ -940,6 +942,7 @@ class TaleaPredictor:
         record_workers: int = 1,
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
+        teacher_quantile_histogram: bool = False,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
@@ -1048,6 +1051,8 @@ class TaleaPredictor:
         if storage_dtype not in ("fp16", "fp32"):
             raise ValueError(f"unsupported attention storage dtype: {storage_dtype}")
         device_storage_dtype = torch.float16 if storage_dtype == "fp16" else None
+        quantile_function = compiled_teacher_quantile() if teacher_quantile_histogram and storage_dtype == "fp16" else None
+        self.teacher_quantile_histogram_active = quantile_function is not None
         minimum_separation = int(
             self.deployment["esmplusplus"]["minimum_sequence_separation"]
         )
@@ -1317,6 +1322,7 @@ class TaleaPredictor:
                     tracks = teacher_tracks_from_attention(
                         self.teacher_model, matrices, self.teacher_contract, self.device,
                         cuda_graphs=teacher_graphs, _prepared_diagonal=teacher_diagonal,
+                        _quantile_function=quantile_function,
                     )
                     return (*inputs, *tracks)
 
@@ -1347,7 +1353,7 @@ class TaleaPredictor:
                         matrices = attention_staging.unpack_after_readouts(record.length)
                     inputs = pooled, matrices, probabilities, region_track, gate_logit
                     if teacher_owner_thread:
-                        return inputs, prepare_teacher_tiles(matrices, self.teacher_contract)
+                        return inputs, prepare_teacher_tiles(matrices, self.teacher_contract, quantile_function=quantile_function)
                     return finish_teacher(inputs)
 
                 # Bound concurrent quadratic APC scratch as records get longer.

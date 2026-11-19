@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
                         help="group ordered teacher probability transfers for up to this many proteins")
+    parser.add_argument("--teacher-quantile-histogram", action="store_true",
+                        help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
     parser.add_argument("--teacher-owner-thread", action="store_true",
                         help="prepare tiles in record workers and run the teacher in order on the predictor thread")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
@@ -253,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         "record_workers": args.record_workers,
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
+        **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         "group_equal_apc": args.group_equal_apc,
@@ -308,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         "record_workers": args.record_workers,
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
+        **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}
+           if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}

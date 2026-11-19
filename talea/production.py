@@ -261,7 +261,7 @@ def prepare_teacher_readout(
 
 
 def prepare_teacher_tiles(
-    matrices: Mapping[int, np.ndarray], contract: Mapping,
+    matrices: Mapping[int, np.ndarray], contract: Mapping, *, quantile_function=None,
 ) -> tuple[int, np.ndarray]:
     """Normalize one record's tiles on the host, in the model's original order."""
     attention = contract["attention"]
@@ -286,6 +286,7 @@ def prepare_teacher_tiles(
         tile_size,
         float(attention["normalization_quantile"]),
         float(attention["normalization_clip"]),
+        quantile_function=quantile_function,
     )
     return length, tiles
 
@@ -300,6 +301,7 @@ def teacher_tracks_from_attention(
     cuda_graphs: CudaTeacherGraphs | None = None,
     _prepared_diagonal: torch.Tensor | None = None,
     _prepared_tiles: tuple[int, np.ndarray] | None = None,
+    _quantile_function=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode one protein's state and teacher-class tracks from attention.
 
@@ -309,7 +311,7 @@ def teacher_tracks_from_attention(
     """
 
     if _prepared_tiles is None:
-        _prepared_tiles = prepare_teacher_tiles(matrices, contract)
+        _prepared_tiles = prepare_teacher_tiles(matrices, contract, quantile_function=_quantile_function)
     packed = teacher_device_probabilities(model, _prepared_tiles, contract, device,
                                           cuda_graphs, _prepared_diagonal)
     return unpack_teacher_tracks(packed.cpu().numpy())
