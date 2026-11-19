@@ -213,6 +213,9 @@ def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dic
     return results
 
 
+_compiled_diagonal_prefix = None
+
+
 def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
     """Shared window sums for the binary16 storage grid.
 
@@ -225,6 +228,9 @@ def _exact_diagonal_prefix(matrix: np.ndarray, width: int) -> np.ndarray | None:
     length = len(matrix)
     if matrix.dtype not in (np.float16, np.float32) or length > 8192:
         return None
+    if (_compiled_diagonal_prefix is not None and matrix.dtype == np.float32
+            and matrix.flags.c_contiguous and 0 < width <= length):
+        return _compiled_diagonal_prefix(matrix, width)
     if not np.max(np.abs(matrix)) <= 65504:
         return None
     if matrix.dtype == np.float32:

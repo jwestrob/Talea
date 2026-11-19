@@ -23,6 +23,7 @@ and are unchanged by it. Parameters live in ``assets/phase_ssm.json``.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 import statistics
 from collections.abc import Mapping, Sequence
@@ -148,6 +149,17 @@ def length_emissions(
     return emissions - np.median(emissions, axis=0, keepdims=True)
 
 
+def _phase_rotations(size: int, unit_length: int) -> tuple[np.ndarray, np.ndarray]:
+    """Prefix-compatible phase factors shared by extents of similar lengths."""
+    positions = np.arange(size)
+    rotation = np.exp(-2j * np.pi * positions / unit_length)
+    realign = np.exp(2j * np.pi * positions / unit_length)
+    return rotation, realign
+
+
+_cached_phase_rotations = lru_cache(maxsize=128)(_phase_rotations)
+
+
 def unit_tables(
     votes: np.ndarray,
     emissions: np.ndarray,
@@ -175,55 +187,40 @@ def unit_tables(
     full = np.full((n + 1, len(lengths)), -np.inf)
     lead = np.full((n + 1, len(lengths)), -np.inf)
     tail = np.full((n + 1, len(lengths)), -np.inf)
-    positions = np.arange(n + 1)
+    capacity = 1 << n.bit_length()
     for r, unit_length in enumerate(lengths):
-        rotation = np.exp(-2j * np.pi * np.arange(n) / unit_length)
-        phase_sum = np.concatenate(([0.0], np.cumsum(votes * rotation)))
+        if capacity <= 4096:
+            rotation, realign = _cached_phase_rotations(capacity, int(unit_length))
+        else:
+            rotation, realign = _phase_rotations(n + 1, int(unit_length))
+        phase_sum = np.empty(n + 1, np.complex128)
+        phase_sum[0] = 0
+        np.cumsum(votes * rotation[:n], out=phase_sum[1:])
         emission_sum = np.concatenate(([0.0], np.cumsum(emissions[r])))
-        realign = np.exp(2j * np.pi * positions / unit_length)
 
-        starts = positions[: max(0, n - unit_length + 1)]
-        full[starts, r] = phase_weight * np.real(
-            realign[starts] * (phase_sum[starts + unit_length] - phase_sum[starts])
-        ) + (emission_sum[starts + unit_length] - emission_sum[starts])
+        count = max(0, n - unit_length + 1)
+        if count:
+            full[:count, r] = phase_weight * np.real(
+                realign[:count] * (phase_sum[unit_length:] - phase_sum[:count])
+            ) + (emission_sum[unit_length:] - emission_sum[:count])
 
-        heads = positions[: min(unit_length, n + 1)]
-        lead[heads, r] = (
-            phase_weight * np.real(realign[heads] * phase_sum[heads])
-            + emission_sum[heads]
+        heads = min(unit_length, n + 1)
+        lead[:heads, r] = (
+            phase_weight * np.real(realign[:heads] * phase_sum[:heads])
+            + emission_sum[:heads]
         )
-
-        ends = positions[max(0, n - unit_length + 1) :]
-        tail[ends, r] = phase_weight * np.real(
-            realign[ends] * (phase_sum[n] - phase_sum[ends])
-        ) + (emission_sum[n] - emission_sum[ends])
+        tail[count:, r] = phase_weight * np.real(
+            realign[count : n + 1] * (phase_sum[n] - phase_sum[count:])
+        ) + (emission_sum[n] - emission_sum[count:])
     return full, lead, tail
 
 
-def viterbi_units(
-    full: np.ndarray,
-    lead: np.ndarray,
-    tail: np.ndarray,
-    minimum_length: int,
-    length_change_penalty: float,
-    maximum_step: int,
-) -> tuple[list[int], list[int]]:
-    """Best segmentation of the extent into consecutive full units.
+_compiled_transitions = None
 
-    Returns the full-unit boundaries (first unit start to last unit end) and the
-    unit lengths in order. Residues before the first boundary are scored as the
-    tail of a preceding unit and residues after the last as the head of a
-    following one. Ties resolve to the earliest position, then the shortest
-    length.
-    """
 
-    n = full.shape[0] - 1
-    count = full.shape[1]
-    if count == 0:
-        return [], []
+def _numpy_transitions(full, lead, scores, back, minimum_length, length_change_penalty, maximum_step):
+    n, count = full.shape[0] - 1, full.shape[1]
     lengths = minimum_length + np.arange(count)
-    scores = np.full((n + 1, count), -np.inf)
-    back = np.full((n + 1, count), -1, dtype=np.int64)
     for r, unit_length in enumerate(lengths):
         offsets = np.arange(min(unit_length, n - unit_length + 1))
         scores[offsets + unit_length, r] = lead[offsets, r] + full[offsets, r]
@@ -250,6 +247,42 @@ def viterbi_units(
         better = proposal > scores[destination, columns]
         scores[destination[better], columns[better]] = proposal[better]
         back[destination[better], columns[better]] = previous[rows, columns][better]
+
+
+def viterbi_units(
+    full: np.ndarray,
+    lead: np.ndarray,
+    tail: np.ndarray,
+    minimum_length: int,
+    length_change_penalty: float,
+    maximum_step: int,
+) -> tuple[list[int], list[int]]:
+    """Best segmentation of the extent into consecutive full units.
+
+    Returns the full-unit boundaries (first unit start to last unit end) and the
+    unit lengths in order. Residues before the first boundary are scored as the
+    tail of a preceding unit and residues after the last as the head of a
+    following one. Ties resolve to the earliest position, then the shortest
+    length.
+    """
+
+    n = full.shape[0] - 1
+    count = full.shape[1]
+    if count == 0:
+        return [], []
+    lengths = minimum_length + np.arange(count)
+    scores = np.full((n + 1, count), -np.inf)
+    back = np.full((n + 1, count), -1, dtype=np.int64)
+    if (
+        _compiled_transitions is not None
+        and full.dtype == lead.dtype == np.float64
+        and math.isfinite(length_change_penalty)
+        and not np.any(np.isnan(full) | np.isposinf(full))
+        and not np.any(np.isnan(lead) | np.isposinf(lead))
+    ):
+        _compiled_transitions(full, lead, scores, back, minimum_length, length_change_penalty, maximum_step)
+    else:
+        _numpy_transitions(full, lead, scores, back, minimum_length, length_change_penalty, maximum_step)
     remainder = n - np.arange(n + 1)[:, None]
     final = np.where(
         (remainder < lengths[None, :]) & np.isfinite(scores), scores + tail, -np.inf
