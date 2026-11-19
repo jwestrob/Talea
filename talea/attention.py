@@ -184,6 +184,9 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     return _compact_harmonic_calls(spectral_z, n)
 
 
+_compiled_harmonic_screen = None
+
+
 def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dict]:
     """Find window peaks in bulk, then score all possible ties with the reference dot.
 
@@ -202,9 +205,23 @@ def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dic
             call = best_harmonic_comb(spectrum, signal_length, max_period=max_period)
             result.append({"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics})
         return result
+    table = _harmonic_weights(8)
+    if _compiled_harmonic_screen is not None and spectra.dtype == np.float64:
+        screened = _compiled_harmonic_screen(spectra, bins, counts, norms, table[8][0])
+        if screened is not None:
+            winners, excess, significant = screened
+            results = []
+            for row, i in enumerate(winners):
+                if i < 0:
+                    results.append({"score": 0.0, "period": float(signal_length / bins[0]), "n_harmonics": 0})
+                else:
+                    count = counts[i]
+                    score = float(np.dot(excess[row, :count], table[count][0]) / norms[i])
+                    results.append({"score": score, "period": float(signal_length / bins[i]),
+                                    "n_harmonics": int(significant[row])})
+            return results
     peaks = np.maximum(spectra[:, centers], np.maximum(spectra[:, lower], spectra[:, upper]))
     excess = np.ascontiguousarray(np.maximum(0.0, peaks - 1.0))
-    table = _harmonic_weights(8)
     preliminary = np.sum(excess * weights, axis=2) / norms
     results = []
     for row, scores in enumerate(preliminary):

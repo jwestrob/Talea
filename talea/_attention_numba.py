@@ -130,3 +130,41 @@ def registration_geometry(prefix, offsets, period, fraction, core_start, core_en
             start = end
         counts[idx] = count
     return units, adjacent, separated, counts, core
+
+
+@njit(cache=True, fastmath=False)
+def screen_harmonic_bins(spectra, bins, counts, norms, weights):
+    """Select isolated maxima, retaining their peaks for the original BLAS dot."""
+    rows, width = spectra.shape
+    winners = np.empty(rows, dtype=np.int64)
+    excess = np.empty((rows, len(weights)), dtype=np.float64)
+    significant = np.zeros(rows, dtype=np.int64)
+    for row in range(rows):
+        highest = runner_up = -1.0
+        best = 0
+        for i in range(len(bins)):
+            total = 0.0
+            for h in range(counts[i]):
+                center = bins[i] * (h + 1)
+                peak = max(spectra[row, center], spectra[row, max(1, center - 1)],
+                           spectra[row, min(width - 1, center + 1)])
+                total += max(0.0, peak - 1.0) * weights[h]
+            score = total / norms[i]
+            if score > highest:
+                runner_up, highest, best = highest, score, i
+            elif score > runner_up:
+                runner_up = score
+        if highest == 0.0:
+            winners[row] = -1
+        elif not np.isfinite(highest) or runner_up >= highest - highest * (128 * np.finfo(np.float64).eps):
+            # Preserve all near-tie candidates and the reference's secondary significance ordering.
+            return None
+        else:
+            winners[row] = best
+            for h in range(counts[best]):
+                center = bins[best] * (h + 1)
+                peak = max(spectra[row, center], spectra[row, max(1, center - 1)],
+                           spectra[row, min(width - 1, center + 1)])
+                excess[row, h] = max(0.0, peak - 1.0)
+                significant[row] += peak >= 2.5
+    return winners, excess, significant
