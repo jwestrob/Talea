@@ -88,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="named reductions to apply across equal-length APC records (row,column,total,head)")
     parser.add_argument("--fused-apc", choices=("off", "sym", "full"), default="off",
                         help="fuse fp16 APC pointwise operations on an RTX A5000")
+    parser.add_argument("--apc-band-mode", choices=("off", "dense", "sparse"), default="off",
+                        help="clear excluded APC entries in one pass, using a mask or sparse indices")
     parser.add_argument("--group-equal-apc", action="store_true",
                         help="group CUDA attention correction for records with identical residue spans")
     parser.add_argument("--readout-square-budget", type=int, default=1024 ** 2,
@@ -307,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         "fused_apc": args.fused_apc,
         **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
+        **({"apc_band_mode": args.apc_band_mode} if args.apc_band_mode != "off" else {}),
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks or args.teacher_graph_pool,
         **({"teacher_graph_pool": True} if args.teacher_graph_pool else {}),
@@ -385,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active}
            if args.fused_apc != "off" else {}),
         **({"cache_sdpa_bias": True} if args.cache_sdpa_bias else {}),
+        **({"apc_band_mode": args.apc_band_mode} if args.apc_band_mode != "off" else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
