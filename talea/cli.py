@@ -72,6 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="finish region boundaries and teacher summaries in process workers")
     parser.add_argument("--teacher-quantile-histogram", action="store_true",
                         help="use the optional Numba histogram for exact fp16 teacher normalization quantiles")
+    parser.add_argument("--hidden-graph-min-uses", type=int, default=0,
+                        help="use CUDA hidden readout graphs for lengths with this many records (zero disables)")
     parser.add_argument("--teacher-owner-thread", action="store_true",
                         help="prepare tiles in record workers and run the teacher in order on the predictor thread")
     parser.add_argument("--teacher-graph-tracks", action="store_true",
@@ -286,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"direct_shared_half": args.direct_shared_half} if args.direct_shared_half != "off" else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
+        **({"hidden_graph_min_uses": args.hidden_graph_min_uses} if args.hidden_graph_min_uses else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"async_teacher_readback": True} if args.async_teacher_readback else {}),
@@ -360,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"direct_shared_half": args.direct_shared_half} if args.direct_shared_half != "off" else {}),
         **({"native_half_readout": True} if args.native_half_readout else {}),
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
+        **({"hidden_graph_min_uses": args.hidden_graph_min_uses} if args.hidden_graph_min_uses else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"async_teacher_readback": True, "async_teacher_readback_batches": predictor.async_teacher_readback_batches}

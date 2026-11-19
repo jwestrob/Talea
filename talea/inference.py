@@ -990,13 +990,13 @@ class TaleaPredictor:
         weights = torch.as_tensor(self._openness_weights, device=pooled.device)
         return float(pooled @ weights + self._openness_bias)
 
-    def _hidden_readouts(self, hidden_states, indices, batch_position, residue_slice=None):
-        """Run fixed-shape per-record reductions, then copy all small outputs together."""
+    def _hidden_device_outputs(self, residues_for):
+        """Compute the fixed-shape readout for one protein in the source layer order."""
         features = {}
         structure = None
         region = None
         for layer in self.expected_layers:
-            residues = _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice)
+            residues = residues_for(layer)
             features[f"layer_{layer}_mean"] = residues.mean(dim=0)
             features[f"layer_{layer}_std"] = residues.std(dim=0, unbiased=False)
             if layer == self.probe_layer:
@@ -1004,12 +1004,10 @@ class TaleaPredictor:
             if layer == self.region_probe_layer and self.primary_extent == "state":
                 region = torch.sigmoid(residues @ self._region_probe_weights + self._region_probe_bias)
 
-        gate_means = [
-            hidden_states[layer][batch_position]
-            if hidden_states[layer].ndim == 2
-            else _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice).mean(dim=0)
-            for layer in self.openness_layers
-        ]
+        gate_means = []
+        for layer in self.openness_layers:
+            captured = residues_for(layer)
+            gate_means.append(captured if captured.ndim == 1 else captured.mean(dim=0))
         gate = torch.cat(gate_means) @ self._openness_weights + self._openness_bias
         outputs = dict(features)
         if structure is not None:
@@ -1017,17 +1015,29 @@ class TaleaPredictor:
         if region is not None:
             outputs["region"] = region
         outputs["gate"] = gate
-        packed = torch.cat([tensor.reshape(-1) for tensor in outputs.values()]).cpu().numpy()
+        return outputs
+
+    @staticmethod
+    def _unpack_hidden(packed, layout):
+        host = packed.cpu().numpy()
         arrays = {}
         offset = 0
-        for name, tensor in outputs.items():
-            end = offset + tensor.numel()
-            arrays[name] = packed[offset:end].reshape(tensor.shape)
+        for name, shape in layout:
+            end = offset + shape.numel()
+            arrays[name] = host[offset:end].reshape(shape)
             offset = end
         gate_logit = float(arrays.pop("gate"))
-        probabilities = arrays.pop("structure").astype(np.float64) if structure is not None else None
-        region_track = arrays.pop("region").astype(np.float64) if region is not None else None
+        probabilities = arrays.pop("structure").astype(np.float64) if "structure" in arrays else None
+        region_track = arrays.pop("region").astype(np.float64) if "region" in arrays else None
         return arrays, probabilities, region_track, gate_logit
+
+    def _hidden_readouts(self, hidden_states, indices, batch_position, residue_slice=None):
+        outputs = self._hidden_device_outputs(
+            lambda layer: (hidden_states[layer][batch_position] if hidden_states[layer].ndim == 2 else
+                           _record_hidden_states(hidden_states[layer], batch_position, indices, residue_slice))
+        )
+        packed = torch.cat([tensor.reshape(-1) for tensor in outputs.values()])
+        return self._unpack_hidden(packed, ((name, value.shape) for name, value in outputs.items()))
 
     @property
     def maximum_length(self) -> int:
@@ -1093,6 +1103,7 @@ class TaleaPredictor:
         cache_clear_interval: int = 0,
         record_workers: int = 1,
         readout_streams: int = 0,
+        hidden_graph_min_uses: int = 0,
         teacher_owner_thread: bool = False,
         teacher_readback_records: int = 1,
         async_teacher_readback: bool = False,
@@ -1199,6 +1210,8 @@ class TaleaPredictor:
             raise ValueError("early layer readouts require CUDA and an explicit model dtype")
         if direct_shared_half not in ("off", "host", "cuda"):
             raise ValueError(f"unknown direct_shared_half setting {direct_shared_half}")
+        if hidden_graph_min_uses < 0:
+            raise ValueError("hidden_graph_min_uses must be nonnegative")
         if teacher_readback_records < 1:
             raise ValueError("teacher_readback_records must be positive")
         if readout_square_budget < 1:
@@ -1370,6 +1383,12 @@ class TaleaPredictor:
                     future.cancel()
 
         attention_staging = _AttentionStaging() if self.device.type == "cuda" else None
+        hidden_graphs = None
+        self.hidden_graph_stats = None
+        if hidden_graph_min_uses and self.device.type == "cuda":
+            from talea.hidden_graph import HiddenReadoutGraphs
+            hidden_graphs = HiddenReadoutGraphs(self, values, hidden_graph_min_uses)
+            self.hidden_graph_stats = hidden_graphs.stats
         with contextlib.ExitStack() as stack:
             pool = stack.enter_context(pool_context)
             submit_record = pool.submit
@@ -1596,6 +1615,8 @@ class TaleaPredictor:
                 if early_apc:
                     layer_maps = {layer: _collect_capture(item, consumer) for layer, item in attentions.items()}
                     self.early_apc_layers += len(layer_maps)
+                prepared_hidden = (hidden_graphs.batch(hidden_states, residue_indices, readout_stream)
+                                   if hidden_graphs is not None else None)
                 if private_streams:
                     # Model capture and grouped operations belong to the owner stream.
                     # Publish the immutable separation-mask blocks there as well.
@@ -1653,9 +1674,15 @@ class TaleaPredictor:
                                 matrices[layer] = _checked_attention_matrix(host, record.length)
                             else:
                                 attention_staging.enqueue(layer, tensor)
-                        pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
-                            hidden_states, indices, batch_position, residue_slice
-                        )
+                        packed = prepared_hidden[batch_position] if prepared_hidden is not None else None
+                        if packed is None:
+                            pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
+                                hidden_states, indices, batch_position, residue_slice
+                            )
+                        else:
+                            if private_streams:
+                                packed[0].record_stream(torch.cuda.current_stream(self.device))
+                            pooled, probabilities, region_track, gate_logit = self._unpack_hidden(*packed)
                     except BaseException:
                         if direct:
                             # Release reserved storage only after queued DMA writes finish.
