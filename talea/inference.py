@@ -601,6 +601,7 @@ class TaleaPredictor:
         self.teacher_quantile_histogram_active = False
         self.teacher_cuda_graph_active = False
         self.fused_rotary_calls = 0
+        self.arithmetic_swiglu_repairs = None
         self.fused_swiglu_calls = 0
         self.unit_placement = unit_placement
         self.deterministic = bool(deterministic)
@@ -946,6 +947,7 @@ class TaleaPredictor:
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
         fused_swiglu: bool = False,
+        arithmetic_swiglu: bool = False,
         group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         shared_attention_mib: int = 0,
@@ -1231,9 +1233,11 @@ class TaleaPredictor:
                 rotary_calls = stack.enter_context(fused_rotary_context(capture.blocks, self.device))
                 stack.callback(lambda: setattr(self, "fused_rotary_calls", rotary_calls[0]))
             self.fused_swiglu_calls = 0
-            if fused_swiglu:
+            self.arithmetic_swiglu_repairs = None
+            if fused_swiglu or arithmetic_swiglu:
                 from talea.swiglu import swiglu_context
-                swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device))
+                swiglu_calls = stack.enter_context(swiglu_context(capture.blocks, self.device, arithmetic=arithmetic_swiglu))
+                self.arithmetic_swiglu_repairs = swiglu_calls[1]
                 stack.callback(lambda: setattr(self, "fused_swiglu_calls", swiglu_calls[0]))
             producer = None
             if overlap_enabled:

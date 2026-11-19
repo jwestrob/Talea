@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "fp16", "fp32", "bf16"),
         default="auto",
     )
+    parser.add_argument("--arithmetic-swiglu", action="store_true", help="calibrate direct CUDA SiLU against every fp16 input")
     parser.add_argument("--fused-swiglu", action="store_true", help="use the device's fp16 SiLU lookup table in ESM++")
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-readback-records", type=int, default=1,
@@ -257,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
         **({"teacher_quantile_histogram": True} if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        **({"arithmetic_swiglu": True} if args.arithmetic_swiglu else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         "group_equal_apc": args.group_equal_apc,
         "prefetch_forward": args.prefetch_forward,
@@ -314,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}
            if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        **({"arithmetic_swiglu": True} if args.arithmetic_swiglu else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
            if args.group_equal_apc else {}),
