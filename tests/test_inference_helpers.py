@@ -129,3 +129,52 @@ def test_teacher_runtime_model_output_shape() -> None:
     )
     observed = model(torch.zeros(2, 3, 32, 32))
     assert observed.shape == (2, 6, 32, 32)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("extent,phase", [("state", True), ("registered", False)])
+def test_packed_readouts_equal_individual_heads(dtype, extent, phase):
+    from talea.production import pooled_hidden_features_for_layers
+
+    generator = torch.Generator().manual_seed(2711)
+    predictor = object.__new__(TaleaPredictor)
+    predictor.expected_layers = (13, 35)
+    predictor.openness_layers = (7, 15, 23, 31)
+    predictor.region_probe_layer = 35
+    predictor.probe_layer = 35 if phase else None
+    predictor.primary_extent = extent
+    predictor._region_probe_weights = torch.randn(48, generator=generator)
+    predictor._region_probe_bias = 0.031
+    predictor._openness_weights = torch.randn(192, generator=generator)
+    predictor._openness_bias = -0.051
+    predictor.probe_weights = torch.randn(48, 3, generator=generator)
+    predictor.probe_bias = torch.randn(3, generator=generator)
+    hidden = {
+        layer: torch.randn(2, 58, 48, generator=generator, dtype=dtype)
+        for layer in (*predictor.expected_layers, *predictor.openness_layers)
+    }
+    for indices in (torch.tensor([7]), torch.arange(1, 54, 2)):
+        means, structure, region, gate = predictor._hidden_readouts(hidden, indices, 1)
+        reference = pooled_hidden_features_for_layers(hidden, indices, 1, predictor.expected_layers)
+        for name in reference:
+            np.testing.assert_array_equal(means[name], reference[name])
+        np.testing.assert_array_equal(
+            structure, predictor.residue_structure_probabilities(hidden, indices, 1)
+        )
+        np.testing.assert_array_equal(region, predictor.region_probabilities(hidden, indices, 1))
+        assert gate == predictor.openness_logit(hidden, indices, 1)
+
+
+def test_batch_token_positions_with_internal_specials_and_padding():
+    from types import SimpleNamespace
+    from talea.inference import _batch_residue_indices
+
+    tokenized = {
+        "special_tokens_mask": torch.tensor([[1, 0, 1, 0, 1], [1, 1, 0, 0, 0]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 0, 0]]),
+    }
+    records = [SimpleNamespace(length=2, record_id="A"), SimpleNamespace(length=1, record_id="B")]
+    result = _batch_residue_indices(tokenized, records, "cpu")
+    assert [positions.tolist() for positions in result] == [[1, 3], [2]]
+    with pytest.raises(ValueError, match="tokenized"):
+        _batch_residue_indices(tokenized, records[::-1], "cpu")

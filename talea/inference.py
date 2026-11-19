@@ -41,7 +41,6 @@ from talea.postprocess_pool import initialize_worker, run_record
 from talea.production import (
     compose_talea_score,
     global_head_probabilities,
-    pooled_hidden_features_for_layers,
     summarize_teacher_prediction,
     teacher_tracks_from_attention,
 )
@@ -232,6 +231,21 @@ def apc_head_mean(
     return result
 
 
+def _batch_residue_indices(tokenized, records, device):
+    """Resolve token positions on the host, then transfer indices once per batch."""
+    residue_mask = tokenized["special_tokens_mask"] == 0
+    if "attention_mask" in tokenized:
+        residue_mask &= tokenized["attention_mask"].bool()
+    lengths = [record.length for record in records]
+    tokens = residue_mask.nonzero(as_tuple=False)
+    # nonzero walks rows in order, including tokenizers with internal special tokens.
+    for record, count in zip(records, residue_mask.sum(dim=1).tolist(), strict=True):
+        if count != record.length:
+            raise ValueError(f"tokenized residue count disagrees for {record.record_id}")
+    positions = tokens[:, 1].contiguous().to(device)
+    return positions.split(lengths)
+
+
 def make_batches(
     records: Sequence[SequenceRecord],
     square_budget: int,
@@ -367,11 +381,15 @@ class TaleaPredictor:
         region_probe = json.loads(self.assets.region_probe.read_text())
         self.region_probe_settings = region_probe["extension"]
         self.region_probe_layer = int(region_probe["hidden_state_layer_zero_based"])
-        self._region_probe_weights = np.asarray(region_probe["weights"], dtype=np.float32)
+        self._region_probe_weights = torch.as_tensor(
+            region_probe["weights"], dtype=torch.float32, device=self.device
+        )
         self._region_probe_bias = float(region_probe["bias"])
         gate = json.loads(self.assets.openness_gate.read_text())
         self.openness_layers = tuple(int(layer) for layer in gate["hidden_state_layers_zero_based"])
-        self._openness_weights = np.asarray(gate["weights"], dtype=np.float32)
+        self._openness_weights = torch.as_tensor(
+            gate["weights"], dtype=torch.float32, device=self.device
+        )
         self._openness_bias = float(gate["bias"])
         self.openness_penalty_weight = float(gate["penalty_weight"])
         self.global_bundle = joblib.load(self.assets.global_model)
@@ -527,6 +545,43 @@ class TaleaPredictor:
         )
         weights = torch.as_tensor(self._openness_weights, device=pooled.device)
         return float(pooled @ weights + self._openness_bias)
+
+    def _hidden_readouts(self, hidden_states, indices, batch_position):
+        """Run fixed-shape per-record reductions, then copy all small outputs together."""
+        features = {}
+        structure = None
+        region = None
+        for layer in self.expected_layers:
+            residues = hidden_states[layer][batch_position].index_select(0, indices).float()
+            features[f"layer_{layer}_mean"] = residues.mean(dim=0)
+            features[f"layer_{layer}_std"] = residues.std(dim=0, unbiased=False)
+            if layer == self.probe_layer:
+                structure = torch.sigmoid(residues @ self.probe_weights + self.probe_bias)
+            if layer == self.region_probe_layer and self.primary_extent == "state":
+                region = torch.sigmoid(residues @ self._region_probe_weights + self._region_probe_bias)
+
+        gate_means = [
+            hidden_states[layer][batch_position].index_select(0, indices).float().mean(dim=0)
+            for layer in self.openness_layers
+        ]
+        gate = torch.cat(gate_means) @ self._openness_weights + self._openness_bias
+        outputs = dict(features)
+        if structure is not None:
+            outputs["structure"] = structure
+        if region is not None:
+            outputs["region"] = region
+        outputs["gate"] = gate
+        packed = torch.cat([tensor.reshape(-1) for tensor in outputs.values()]).cpu().numpy()
+        arrays = {}
+        offset = 0
+        for name, tensor in outputs.items():
+            end = offset + tensor.numel()
+            arrays[name] = packed[offset:end].reshape(tensor.shape)
+            offset = end
+        gate_logit = float(arrays.pop("gate"))
+        probabilities = arrays.pop("structure").astype(np.float64) if structure is not None else None
+        region_track = arrays.pop("region").astype(np.float64) if region is not None else None
+        return arrays, probabilities, region_track, gate_logit
 
     @property
     def maximum_length(self) -> int:
@@ -793,21 +848,16 @@ class TaleaPredictor:
                     padding=True,
                     return_special_tokens_mask=True,
                 )
-                tokenized = {
+                residue_indices = _batch_residue_indices(tokenized, batch, self.device)
+                model_inputs = {
                     key: value.to(self.device)
                     for key, value in tokenized.items()
-                    if isinstance(value, torch.Tensor)
-                }
-                special = tokenized["special_tokens_mask"]
-                attention_mask = tokenized.get("attention_mask")
-                model_inputs = {
-                    key: value
-                    for key, value in tokenized.items()
-                    if key != "special_tokens_mask"
+                    if key != "special_tokens_mask" and isinstance(value, torch.Tensor)
                 }
                 capture.reset()
                 model_output = self.esm_model(
                     **model_inputs,
+                    compute_logits=False,
                     output_attentions=False,
                     output_hidden_states=False,
                     return_dict=True,
@@ -819,17 +869,7 @@ class TaleaPredictor:
                 compact = []
                 pooled_rows = []
                 for batch_position, record in enumerate(batch):
-                    residue_mask = special[batch_position] == 0
-                    if attention_mask is not None:
-                        residue_mask &= attention_mask[batch_position].bool()
-                    indices = torch.nonzero(
-                        residue_mask, as_tuple=False
-                    ).squeeze(-1)
-                    if len(indices) != record.length:
-                        raise ValueError(
-                            "tokenized residue count disagrees for "
-                            f"{record.record_id}"
-                        )
+                    indices = residue_indices[batch_position]
                     matrices = {
                         layer: apc_head_mean(
                             attentions[layer][batch_position],
@@ -840,17 +880,10 @@ class TaleaPredictor:
                         )
                         for layer in self.expected_layers
                     }
-                    pooled_rows.append(
-                        pooled_hidden_features_for_layers(
-                            hidden_states,
-                            indices,
-                            batch_position,
-                            self.expected_layers,
-                        )
-                    )
-                    probabilities = self.residue_structure_probabilities(
+                    pooled, probabilities, region_track, gate_logit = self._hidden_readouts(
                         hidden_states, indices, batch_position
                     )
+                    pooled_rows.append(pooled)
                     # The residue-state track goes to the worker too: further
                     # wedge calls are registered into units only where it
                     # supports them.
@@ -883,10 +916,6 @@ class TaleaPredictor:
                                 **self.configs,
                             },
                         )
-                    region_track = self.region_probabilities(
-                        hidden_states, indices, batch_position
-                    )
-                    gate_logit = self.openness_logit(hidden_states, indices, batch_position)
                     compact.append(
                         (record, future, state_track, teacher_track, region_track, gate_logit)
                     )
@@ -898,8 +927,7 @@ class TaleaPredictor:
                     model_output,
                     tokenized,
                     model_inputs,
-                    special,
-                    attention_mask,
+                    residue_indices,
                     attentions,
                     hidden_states,
                     pooled_rows,
