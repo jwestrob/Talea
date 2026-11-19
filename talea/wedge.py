@@ -16,6 +16,19 @@ from functools import lru_cache
 import numpy as np
 
 
+_compiled_wedge_scores = None
+
+
+def enable_compiled_wedge_scores() -> None:
+    """Compile on first use in long-lived process workers when Numba is installed."""
+    global _compiled_wedge_scores
+    try:
+        from talea._wedge_numba import accumulate_scores
+    except ImportError:
+        return
+    _compiled_wedge_scores = accumulate_scores
+
+
 def candidate_periods_from_windows(
     windows: Iterable[dict],
     minimum_window_size: int = 96,
@@ -536,6 +549,7 @@ class WedgePlan:
                 "used": used,
                 "index": index,
                 "weight": weight,
+                "counts": counts,
                 "rows": tuple(int(np.sum(counts > slot)) for slot in range(slots)),
                 "denominator": np.array([members[period][2] for period in valid], dtype=np.float64),
             }
@@ -578,11 +592,14 @@ class WedgePlan:
                 writeable=False,
             )
             sums = upper[used] - prefix[used, :n_starts]
-            scores = np.zeros((len(layout["periods"]), n_starts), dtype=np.float64)
             index, weight = layout["index"], layout["weight"]
-            for slot, rows in enumerate(layout["rows"]):
-                scores[:rows] += weight[:rows, slot, None] * sums[index[:rows, slot]]
-            scores /= layout["denominator"][:, None]
+            if _compiled_wedge_scores is None:
+                scores = np.zeros((len(layout["periods"]), n_starts), dtype=np.float64)
+                for slot, rows in enumerate(layout["rows"]):
+                    scores[:rows] += weight[:rows, slot, None] * sums[index[:rows, slot]]
+                scores /= layout["denominator"][:, None]
+            else:
+                scores = _compiled_wedge_scores(sums, index, weight, layout["counts"], layout["denominator"])
             for row, period in enumerate(layout["periods"]):
                 result[(period, width)] = scores[row]
         return result

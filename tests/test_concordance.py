@@ -532,3 +532,21 @@ def test_batched_window_calls_match_flat_profiles():
     for row, item in zip(profiles, observed, strict=True):
         call = score_signals(local_distance_residual(row)[:, None], max_period=len(row) / 3)
         assert item == {"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics}
+
+
+def test_compiled_wedge_accumulation_matches_numpy(monkeypatch):
+    pytest.importorskip("numba")
+    import talea.wedge as wedge
+
+    tracks = fuse_diagonal_tracks([
+        robust_diagonal_tracks(synthetic_attention(214, 31, seed), 128)
+        for seed in (15, 19)
+    ])
+    plan = WedgePlan([len(t) for t in tracks], 214, [9.5, 18, 31.5], [96, 160, 192])
+    monkeypatch.setattr(wedge, "_compiled_wedge_scores", None)
+    expected = plan.scores(tracks)
+    wedge.enable_compiled_wedge_scores()
+    actual = plan.scores(tracks)
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        assert actual[key].tobytes() == expected[key].tobytes()

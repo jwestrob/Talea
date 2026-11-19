@@ -31,6 +31,8 @@ def initialize_worker(configs: dict) -> None:
     """
     global _CONFIGS
     _CONFIGS = configs
+    from talea.wedge import enable_compiled_wedge_scores
+    enable_compiled_wedge_scores()
     # Each worker is single-threaded NumPy; letting every one spin up a full
     # BLAS thread pool oversubscribes the node and undoes the parallelism.
     for variable in (
