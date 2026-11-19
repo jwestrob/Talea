@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from scipy.ndimage import median_filter
 
@@ -129,6 +131,27 @@ def _median_filter_rows(values: np.ndarray, width: int) -> np.ndarray:
     return filtered.reshape(padded.shape)[:, halo:-halo]
 
 
+@lru_cache(maxsize=32)
+def _window_constants(n):
+    time = np.arange(n, dtype=np.float64) - (n - 1) / 2
+    window = np.hanning(n)
+    return time, np.dot(time, time), window, np.sum(window**2)
+
+
+@lru_cache(maxsize=32)
+def _harmonic_geometry(maximum, length):
+    max_period = min(250.0, length / 3)
+    minimum_bin = max(3, int(np.ceil(length / max_period)))
+    bins = np.arange(minimum_bin, min(maximum // 2, length // 5) + 1)
+    counts = np.minimum(8, maximum // bins)
+    harmonics = np.arange(1, 9)
+    centers = np.minimum(maximum, bins[:, None] * harmonics)
+    table = _harmonic_weights(8)
+    weights = np.where(harmonics <= counts[:, None], table[8][0], 0.0)
+    norms = np.asarray([table[k][1] for k in counts])
+    return bins, counts, centers, np.maximum(1, centers - 1), np.minimum(maximum, centers + 1), weights, norms
+
+
 def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     """Score rows of equal-length diagonal profiles with independent transforms.
 
@@ -138,17 +161,16 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     n = profiles.shape[1]
     width = min(31, n if n % 2 else n - 1)
     residual = profiles - _median_filter_rows(profiles, width)
-    time = np.arange(n, dtype=np.float64) - (n - 1) / 2
+    time, time_denominator, window, window_power = _window_constants(n)
     centered = residual - residual.mean(axis=1, keepdims=True)
-    slopes = np.sum(centered * time, axis=1, keepdims=True) / np.dot(time, time)
+    slopes = np.sum(centered * time, axis=1, keepdims=True) / time_denominator
     centered -= time * slopes
     deviations = centered.std(axis=1, keepdims=True)
     normalized = np.divide(
         centered, deviations, out=np.zeros_like(centered), where=deviations > 1e-12
     )
-    window = np.hanning(n)
     transformed = np.stack([np.fft.rfft(row) for row in normalized * window])
-    log_power = np.log1p(np.abs(transformed) ** 2 / np.sum(window**2))
+    log_power = np.log1p(np.abs(transformed) ** 2 / window_power)
     width = min(15, max(5, (log_power.shape[1] // 8) | 1))
     residual = log_power - _median_filter_rows(log_power, width)
     usable = residual[:, 2:]
@@ -173,27 +195,16 @@ def _compact_harmonic_calls(spectra: np.ndarray, signal_length: int) -> list[dic
     """
     maximum = spectra.shape[1] - 1
     max_period = min(250.0, signal_length / 3)
-    minimum_bin = max(3, int(np.ceil(signal_length / max_period)))
-    bins = np.arange(minimum_bin, min(maximum // 2, signal_length // 5) + 1)
+    bins, counts, centers, lower, upper, weights, norms = _harmonic_geometry(maximum, signal_length)
     if not len(bins) or not np.isfinite(spectra).all():
         result = []
         for spectrum in spectra:
             call = best_harmonic_comb(spectrum, signal_length, max_period=max_period)
             result.append({"score": call.score, "period": call.period, "n_harmonics": call.n_harmonics})
         return result
-    counts = np.minimum(8, maximum // bins)
-    harmonics = np.arange(1, 9)
-    centers = np.minimum(maximum, bins[:, None] * harmonics)
-    # Tolerance of one frequency bin, clamped inside [1, maximum].
-    peaks = np.maximum(
-        spectra[:, centers],
-        np.maximum(spectra[:, np.maximum(1, centers - 1)], spectra[:, np.minimum(maximum, centers + 1)]),
-    )
-    # Preserve the contiguous BLAS ddot used by the scalar scorer.
+    peaks = np.maximum(spectra[:, centers], np.maximum(spectra[:, lower], spectra[:, upper]))
     excess = np.ascontiguousarray(np.maximum(0.0, peaks - 1.0))
     table = _harmonic_weights(8)
-    weights = np.where(harmonics <= counts[:, None], table[8][0], 0.0)
-    norms = np.asarray([table[k][1] for k in counts])
     preliminary = np.sum(excess * weights, axis=2) / norms
     results = []
     for row, scores in enumerate(preliminary):
