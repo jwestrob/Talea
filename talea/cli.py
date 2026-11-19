@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="share GPU scratch memory across ordered teacher tile-batch graphs")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with shape-specific CUDA graphs")
+    parser.add_argument("--grouped-apc-graph-min-uses", type=int, default=0,
+                        help="capture repeated full-sized APC groups on a CUDA readout stream (zero disables)")
     parser.add_argument("--batched-apc-reductions", default="",
                         help="named reductions to apply across equal-length APC records (row,column,total,head)")
     parser.add_argument("--fused-apc", choices=("off", "sym", "full"), default="off",
@@ -303,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"cache_sdpa_bias": True} if args.cache_sdpa_bias else {}),
         "group_equal_apc": args.group_equal_apc,
         "fused_apc": args.fused_apc,
+        **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks or args.teacher_graph_pool,
@@ -377,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"arithmetic_swiglu": True} if args.arithmetic_swiglu else {}),
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
+        **({"grouped_apc_graph_min_uses": args.grouped_apc_graph_min_uses} if args.grouped_apc_graph_min_uses else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
         **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active}
            if args.fused_apc != "off" else {}),
