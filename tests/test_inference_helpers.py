@@ -276,7 +276,8 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     assert predictor._get_teacher_graphs(False, 1) is None
     predictor._teacher_graphs = None
     predictor.teacher_model = predictor.teacher_contract = None
-    current = [object()]
+    synchronized = []
+    current = [SimpleNamespace(synchronize=lambda: synchronized.append("warm-up"))]
     monkeypatch.setattr(torch.cuda, "device", lambda d: contextlib.nullcontext())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda d: current[0])
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -287,3 +288,8 @@ def test_teacher_graph_cache_is_opt_in_and_uses_one_stream(monkeypatch):
     current[0] = object()
     assert predictor._get_teacher_graphs(True, 1) is None
     assert not predictor.teacher_cuda_graph_active
+    readout_graph = predictor._get_teacher_graphs(True, 1, replace_stream=True)
+    assert synchronized == ["warm-up"]
+    assert readout_graph is not cached and readout_graph.stream is current[0]
+    assert predictor._get_teacher_graphs(True, 1, replace_stream=True) is readout_graph
+    assert predictor.teacher_cuda_graph_active
