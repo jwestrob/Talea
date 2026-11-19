@@ -152,11 +152,30 @@ def _harmonic_geometry(maximum, length):
     return bins, counts, centers, np.maximum(1, centers - 1), np.minimum(maximum, centers + 1), weights, norms
 
 
+# NumPy rfft_impl (numpy/fft/_pocketfft_umath.cpp) uses its scalar loop on
+# these builds when the stored row is shorter than the transform. Retain per-row dispatch on
+# other implementations, where batched transforms may select different SIMD math.
+_PADDED_SCALAR_FFT = np.__version__ in ("2.1.3", "2.4.6")
+
+
+def _window_fft(rows: np.ndarray) -> np.ndarray:
+    """Transform Hann-tapered profiles; only the resulting power is consumed."""
+    if len(rows) == 1:
+        return np.fft.rfft(rows[0])[None, :]
+    length = rows.shape[1]
+    if (_PADDED_SCALAR_FFT and length > 1 and np.all(rows[:, -1] == 0.0)
+            and np.isfinite(rows).all()):
+        # Restore the endpoint by zero padding. The sign of an exact zero
+        # can only change signed zero components, whose magnitudes agree.
+        return np.fft.rfft(rows[:, :-1], n=length, axis=1)
+    return np.stack([np.fft.rfft(row) for row in rows])
+
+
 def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     """Score rows of equal-length diagonal profiles with independent transforms.
 
-    Reductions are along each contiguous row. Run each FFT independently to keep
-    the same single-transform kernel as the scalar implementation on every CPU.
+    Reductions are along each contiguous row. The Fourier transforms retain
+    the single-transform kernel used by the scalar implementation.
     """
     n = profiles.shape[1]
     width = min(31, n if n % 2 else n - 1)
@@ -169,7 +188,7 @@ def _batched_window_calls(profiles: np.ndarray) -> list[dict]:
     normalized = np.divide(
         centered, deviations, out=np.zeros_like(centered), where=deviations > 1e-12
     )
-    transformed = np.stack([np.fft.rfft(row) for row in normalized * window])
+    transformed = _window_fft(normalized * window)
     log_power = np.log1p(np.abs(transformed) ** 2 / window_power)
     width = min(15, max(5, (log_power.shape[1] // 8) | 1))
     residual = log_power - _median_filter_rows(log_power, width)
