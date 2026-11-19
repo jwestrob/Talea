@@ -244,6 +244,71 @@ def _apc_head_mean_tensor(
     return attention
 
 
+def _aligned_record(tensor):
+    # CUDA may vectorize a reduction differently for a misaligned input. Each
+    # reference reduction receives a fresh contiguous allocation.
+    if tensor.device.type == "cuda" and tensor.data_ptr() % 512:
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor
+
+
+def _equal_length_apc(attention, length, minimum_separation, storage_dtype, span):
+    """Batch pointwise operations; retain each original reduction's shape and strides."""
+    cropped = attention[:, :, span, span].contiguous()
+    symmetric = 0.5 * (cropped + cropped.transpose(-1, -2))
+    rows, columns, totals = [], [], []
+    for record in symmetric.unbind():
+        record = _aligned_record(record)
+        rows.append(record.sum(dim=-1, keepdim=True))
+        columns.append(record.sum(dim=-2, keepdim=True))
+        totals.append(record.sum(dim=(-1, -2), keepdim=True))
+    total = torch.stack(totals) + 1e-12
+    corrected = torch.relu(symmetric - (torch.stack(rows) * torch.stack(columns)) / total)
+    result = torch.stack([_aligned_record(record).mean(dim=0) for record in corrected.unbind()])
+    if minimum_separation > 0:
+        result = result.masked_fill(near_diagonal_mask(length, minimum_separation, result.device), 0)
+    result.diagonal(dim1=-2, dim2=-1).fill_(0)
+    return result.to(storage_dtype) if storage_dtype is not None else result
+
+
+_APC_GROUP_ELEMENTS = 4 * 1024 ** 2
+
+
+def _equal_apc_groups(indices_by_record, heads, element_budget=_APC_GROUP_ELEMENTS):
+    """Consecutive equal token spans, bounded independently of ESM batch size."""
+    start = 0
+    while start < len(indices_by_record):
+        indices, span = indices_by_record[start]
+        stop = start + 1
+        if span is not None:
+            capacity = min(8, max(1, element_budget // (heads * len(indices) ** 2)))
+            while stop < min(start + capacity, len(indices_by_record)):
+                if indices_by_record[stop][1] != span:
+                    break
+                stop += 1
+        yield start, stop
+        start = stop
+
+
+def _grouped_apc_jobs(attentions, layers, indices_by_record, separation, dtype, stream=None):
+    """Yield one device map per layer and protein, or the scalar singleton path."""
+    heads = attentions[layers[0]].shape[1]
+    for start, stop in _equal_apc_groups(indices_by_record, heads):
+        if stop == start + 1:
+            yield start, None
+            continue
+        indices, span = indices_by_record[start]
+        # The producer thread must issue grouped work on the consumer's stream
+        # after the wait_event() for this capture.
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            maps = {
+                layer: _equal_length_apc(attentions[layer][start:stop], len(indices), separation, dtype, span)
+                for layer in layers
+            }
+        for offset in range(stop - start):
+            yield start + offset, {layer: maps[layer][offset] for layer in layers}
+
+
 def _checked_attention_matrix(result, sequence_length):
     if result.shape != (sequence_length, sequence_length) or not result.size:
         raise ValueError("cropped attention matrix does not match sequence length")
@@ -322,12 +387,12 @@ def _record_hidden_states(state, batch_position, indices, residue_slice):
     return row[residue_slice].to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
 
 
-def _ordered_readouts(function, count, executor, width):
+def _ordered_readouts(function, count, executor, width, items=None):
     """Keep at most width records in flight and deliver results in input order."""
+    positions = iter(range(count) if items is None else items)
     if executor is None or width == 1:
-        yield from map(function, range(count))
+        yield from map(function, positions)
         return
-    positions = iter(range(count))
     pending = deque()
     try:
         for _ in range(min(width, count)):
@@ -816,6 +881,7 @@ class TaleaPredictor:
         record_workers: int = 1,
         prefetch_forward: bool = False,
         fused_rotary: bool = False,
+        group_equal_apc: bool = False,
         teacher_cuda_graph: bool = False,
         postprocess_mode: str = "process",
     ) -> Iterator[dict]:
@@ -1120,6 +1186,10 @@ class TaleaPredictor:
                 required = _prefetch_memory_required(
                     current, following, next(iter(attention.values())), next(iter(hidden.values())), width,
                 )
+                if group_equal_apc and self.device.type == "cuda":
+                    # Grouped correction temporaries can outgrow scalar scratch
+                    # for a single record. Include six group-sized fp32 buffers.
+                    required += 6 * 4 * _APC_GROUP_ELEMENTS
                 return required <= _prefetch_headroom(self.device)
 
             next_forward = None
@@ -1146,15 +1216,18 @@ class TaleaPredictor:
                 compact = []
                 pooled_rows = []
                 @torch.inference_mode()
-                def readout(batch_position):
+                def readout(batch_position, grouped=None):
                     record = batch[batch_position]
                     indices, residue_slice = residue_indices[batch_position]
                     matrices = {}
                     for layer in self.expected_layers:
-                        tensor = _apc_head_mean_tensor(
-                            attentions[layer][batch_position], indices, record.length,
-                            minimum_separation, device_storage_dtype, residue_slice,
-                        )
+                        if grouped is None:
+                            tensor = _apc_head_mean_tensor(
+                                attentions[layer][batch_position], indices, record.length,
+                                minimum_separation, device_storage_dtype, residue_slice,
+                            )
+                        else:
+                            tensor = grouped[layer]
                         if attention_staging is None:
                             host = tensor.to("cpu", dtype=torch.float32).numpy()
                             matrices[layer] = _checked_attention_matrix(host, record.length)
@@ -1182,12 +1255,19 @@ class TaleaPredictor:
                 # Bound concurrent quadratic APC scratch as records get longer.
                 width = min(record_workers, max(1, 1024 ** 2 // batch[-1].length ** 2))
 
-                def stream_readout(position):
+                def stream_readout(*args):
                     with torch.cuda.stream(readout_stream):
-                        return readout(position)
+                        return readout(*args)
 
                 read = readout if readout_stream is None else stream_readout
-                readouts = _ordered_readouts(read, len(batch), record_pool, width)
+                if group_equal_apc and self.device.type == "cuda":
+                    items = _grouped_apc_jobs(
+                        attentions, self.expected_layers, residue_indices, minimum_separation,
+                        device_storage_dtype, readout_stream,
+                    )
+                    readouts = _ordered_readouts(lambda args: read(*args), len(batch), record_pool, width, items)
+                else:
+                    readouts = _ordered_readouts(read, len(batch), record_pool, width)
                 for record, outputs in zip(batch, readouts, strict=True):
                     pooled, matrices, probabilities, region_track, gate_logit, state_track, teacher_track = outputs
                     pooled_rows.append(pooled)

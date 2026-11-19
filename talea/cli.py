@@ -53,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fused-rotary", action="store_true", help="use fused fp16 ESM++ rotary embeddings on supported accelerators")
     parser.add_argument("--teacher-cuda-graph", action="store_true",
                         help="replay the teacher U-Net with CUDA graphs for one record worker")
+    parser.add_argument("--group-equal-apc", action="store_true",
+                        help="group CUDA attention correction for records with identical residue spans")
     parser.add_argument("--record-workers", type=int, default=1, help="threads for independent per-protein accelerator readouts")
     parser.add_argument(
         "--prefetch-forward", action="store_true",
@@ -240,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         "cache_clear_interval": args.cache_clear_interval,
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        "group_equal_apc": args.group_equal_apc,
         "prefetch_forward": args.prefetch_forward,
         "teacher_cuda_graph": args.teacher_cuda_graph,
         "postprocess_mode": args.postprocess_mode,
@@ -290,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         "postprocess_mode": args.postprocess_mode,
         "record_workers": args.record_workers,
         **({"fused_rotary": True} if args.fused_rotary else {}),
+        "group_equal_apc": args.group_equal_apc,
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
         "teacher_cuda_graph": args.teacher_cuda_graph,
         "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,

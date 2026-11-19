@@ -325,3 +325,26 @@ def test_device_autocast_matches_cpu_context():
         assert not _device_autocast_enabled("cpu")
     with torch.autocast("cpu", dtype=torch.bfloat16):
         assert _device_autocast_enabled("cpu")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_dense_apc_grouping_preserves_reduction_bits_and_record_order(dtype):
+    from talea.inference import _apc_head_mean_tensor, _equal_apc_groups, _grouped_apc_jobs
+    lengths = [63] * 11 + [64] * 5 + [65]
+    positions = [(torch.arange(1, n + 1), slice(1, n + 1)) for n in lengths]
+    positions[9] = (torch.cat((torch.arange(1, 63), torch.tensor([64]))), None)
+    groups = list(_equal_apc_groups(positions, 18))
+    assert groups == [(0, 8), (8, 9), (9, 10), (10, 11), (11, 16), (16, 17)]
+    generator = torch.Generator().manual_seed(78)
+    maps = {k: torch.rand(len(lengths), 18, 68, 68, generator=generator, dtype=dtype) / 68 for k in (13, 35)}
+    jobs = _grouped_apc_jobs(maps, (13, 35), positions, 4, torch.float16)
+    with concurrent.futures.ThreadPoolExecutor(3) as pool:
+        delivered = list(_ordered_readouts(lambda item: item, len(lengths), pool, width=3, items=jobs))
+    assert [n for n, _ in delivered] == list(range(len(lengths)))
+    for n, grouped in delivered:
+        if grouped is None:
+            continue
+        ix, span = positions[n]
+        for k in maps:
+            scalar = _apc_head_mean_tensor(maps[k][n], ix, len(ix), 4, torch.float16, span)
+            assert torch.equal(grouped[k].view(torch.int16), scalar.view(torch.int16))
