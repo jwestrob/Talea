@@ -11,6 +11,7 @@ inside the candidate interval.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from functools import lru_cache
 
 import numpy as np
 
@@ -422,6 +423,48 @@ def _wedge_start_scores_reference(
     return scores / denominator
 
 
+@lru_cache(maxsize=4096)
+def _wedge_members(period: float, width: int, maximum: int, missing: frozenset[int], settings: tuple):
+    """The reference's member offsets, weights and variance for one template."""
+    tolerance, max_harmonics, min_harmonics, interharmonic_controls = settings
+    offsets_out: list[int] = []
+    weights_out: list[float] = []
+    variance = 0.0
+    retained_harmonics = 0
+
+    def add_offsets(offsets: Iterable[int], weight: float) -> bool:
+        nonlocal variance
+        members = tuple(
+            separation
+            for separation in offsets
+            if separation not in missing
+        )
+        if not members:
+            return False
+        member_weight = weight / len(members)
+        for separation in members:
+            offsets_out.append(separation)
+            weights_out.append(member_weight)
+            variance += (member_weight**2) * (width - separation)
+        return True
+
+    for harmonic in range(1, max_harmonics + 1):
+        center = harmonic * period
+        if center > maximum + tolerance:
+            break
+        weight = 1.0 / np.sqrt(harmonic)
+        if add_offsets(_offsets(center, tolerance, maximum), weight):
+            retained_harmonics += 1
+        if interharmonic_controls:
+            control_center = (harmonic + 0.5) * period
+            if control_center <= maximum + tolerance:
+                add_offsets(_offsets(control_center, tolerance, maximum), -weight)
+
+    if retained_harmonics < min_harmonics:
+        return None
+    return tuple(offsets_out), tuple(weights_out), np.sqrt(np.maximum(variance, 1e-12))
+
+
 class WedgePlan:
     """Every template of a wedge search, laid out for evaluation together.
 
@@ -460,9 +503,17 @@ class WedgePlan:
         self.requested_widths = tuple(sorted({int(value) for value in widths if value > 0}))
         self.settings = (int(tolerance), int(max_harmonics), int(min_harmonics), bool(interharmonic_controls))
         self.layouts = {}
+        missing = frozenset(
+            d for d in range(1, len(self.track_lengths))
+            if self.track_lengths[d] != self.protein_length - d
+        )
         separations = set()
         for width in sorted({min(value, self.protein_length) for value in self.requested_widths}):
-            members = {period: self._members(period, width) for period in self.periods}
+            maximum = min(len(self.track_lengths) - 1, width - 1)
+            members = {
+                period: _wedge_members(period, width, maximum, missing, self.settings)
+                for period in self.periods
+            }
             valid = sorted(
                 (period for period in self.periods if members[period] is not None),
                 key=lambda period: -len(members[period][0]),
@@ -490,50 +541,6 @@ class WedgePlan:
             }
             separations.update(int(value) for value in used)
         self.separations = np.array(sorted(separations), dtype=np.int64)
-
-    def _members(self, period: float, width: int):
-        """The reference's member offsets, weights and variance for one template."""
-        tolerance, max_harmonics, min_harmonics, interharmonic_controls = self.settings
-        lengths, protein_length = self.track_lengths, self.protein_length
-        maximum = min(len(lengths) - 1, width - 1)
-        offsets_out: list[int] = []
-        weights_out: list[float] = []
-        variance = 0.0
-        retained_harmonics = 0
-
-        def add_offsets(offsets: Iterable[int], weight: float) -> bool:
-            nonlocal variance
-            members = tuple(
-                separation
-                for separation in offsets
-                if separation < width
-                and separation < len(lengths)
-                and lengths[separation] == protein_length - separation
-            )
-            if not members:
-                return False
-            member_weight = weight / len(members)
-            for separation in members:
-                offsets_out.append(separation)
-                weights_out.append(member_weight)
-                variance += (member_weight**2) * (width - separation)
-            return True
-
-        for harmonic in range(1, max_harmonics + 1):
-            center = harmonic * period
-            if center > maximum + tolerance:
-                break
-            weight = 1.0 / np.sqrt(harmonic)
-            if add_offsets(_offsets(center, tolerance, maximum), weight):
-                retained_harmonics += 1
-            if interharmonic_controls:
-                control_center = (harmonic + 0.5) * period
-                if control_center <= maximum + tolerance:
-                    add_offsets(_offsets(control_center, tolerance, maximum), -weight)
-
-        if retained_harmonics < min_harmonics:
-            return None
-        return offsets_out, weights_out, np.sqrt(np.maximum(variance, 1e-12))
 
     def matches(self, tracks: Sequence[np.ndarray], protein_length: int, periods, widths, settings) -> bool:
         return (
