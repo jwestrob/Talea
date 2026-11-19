@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import gc
+from functools import lru_cache
 import hashlib
 import json
 import multiprocessing
@@ -171,25 +172,19 @@ def postprocess_pool_context():
     return multiprocessing.get_context("spawn")
 
 
-_SEPARATION_MASK_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+@lru_cache(maxsize=16)
+def _separation_mask_block(capacity: int, minimum_separation: int, device: torch.device):
+    positions = torch.arange(capacity, device=device)
+    return (positions[:, None] - positions[None, :]).abs() < minimum_separation
 
 
+@lru_cache(maxsize=32)
 def near_diagonal_mask(
     sequence_length: int, minimum_separation: int, device: torch.device
 ) -> torch.Tensor:
-    """Cached boolean mask selecting residue pairs closer than the minimum.
-
-    Rebuilding this per call allocated two int64 ``L x L`` temporaries -- 64 MB
-    at L=2046 -- on every layer of every record. The mask depends only on
-    (length, separation, device), so it is built once and reused.
-    """
-    key = (int(sequence_length), int(minimum_separation), str(device))
-    cached = _SEPARATION_MASK_CACHE.get(key)
-    if cached is None:
-        positions = torch.arange(sequence_length, device=device)
-        cached = (positions[:, None] - positions[None, :]).abs() < minimum_separation
-        _SEPARATION_MASK_CACHE[key] = cached
-    return cached
+    """Reuse the same distance mask for all lengths in a power-of-two bucket."""
+    capacity = 1 << max(0, (int(sequence_length) - 1).bit_length())
+    return _separation_mask_block(capacity, minimum_separation, device)[:sequence_length, :sequence_length]
 
 
 def apc_head_mean(
