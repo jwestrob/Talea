@@ -11,6 +11,9 @@ from typing import Iterable
 from talea.sequence import normalize_fasta_protein_sequence
 
 
+MINIMUM_CALL_LENGTH = 21
+
+
 @dataclass(frozen=True)
 class SequenceRecord:
     record_id: str
@@ -27,6 +30,19 @@ class SequenceRecord:
             "length": self.length,
             "sequence_sha256": self.sequence_sha256,
         }
+
+
+def below_minimum_prediction(record: SequenceRecord) -> dict:
+    """Retain the protein in the output denominator while skipping inference."""
+    return {
+        **record.metadata(),
+        "status": "below_minimum_length",
+        "primary_score_field": "talea_discovery_score",
+        "talea_discovery_score": None,
+        "talea_discovery_score_ungated": None,
+        "wedge_call": None,
+        "repeat_regions": [],
+    }
 
 
 def _record(record_id: str, parts: list[str], maximum_length: int) -> SequenceRecord:

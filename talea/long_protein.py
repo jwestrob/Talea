@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Iterator, Sequence
 
-from talea.io import SequenceRecord
+from talea.io import MINIMUM_CALL_LENGTH, SequenceRecord
 from talea.regions import union_window_regions
 
 DEFAULT_WINDOW_LENGTH = 2000
@@ -214,12 +214,18 @@ def iter_windowed_predictions(
     parents: dict[str, SequenceRecord] = {}
     spans_by_parent: dict[str, list[tuple[int, int]]] = {}
     owners: dict[str, tuple[str, int]] = {}
+    identifiers: set[str] = set()
     for record in records:
+        if record.record_id in identifiers:
+            raise ValueError(f"duplicate record ID: {record.record_id}")
+        identifiers.add(record.record_id)
         if record.length <= maximum:
             scored.append(record)
             continue
-        if record.record_id in parents:
-            raise ValueError(f"duplicate record ID: {record.record_id}")
+        if window_length < MINIMUM_CALL_LENGTH:
+            raise ValueError(
+                f"windows used to score a long protein must span at least {MINIMUM_CALL_LENGTH} residues"
+            )
         spans = window_spans(record.length, window_length, window_stride)
         parents[record.record_id] = record
         spans_by_parent[record.record_id] = spans

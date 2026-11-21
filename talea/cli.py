@@ -18,7 +18,7 @@ import transformers
 from talea import __version__
 from talea.artifacts import load_deployment, sha256_file
 from talea.inference import TaleaPredictor, resolve_postprocess_workers
-from talea.io import read_fasta
+from talea.io import MINIMUM_CALL_LENGTH, below_minimum_prediction, read_fasta
 from talea.long_protein import (
     DEFAULT_WINDOW_LENGTH,
     DEFAULT_WINDOW_STRIDE,
@@ -239,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         if not 1 <= args.window_stride <= args.window_length:
             raise ValueError("--window-stride must be between 1 and --window-length")
+    if long_records and args.window_length < MINIMUM_CALL_LENGTH:
+        raise ValueError(
+            f"windows used to score a long protein must span at least {MINIMUM_CALL_LENGTH} residues"
+        )
     if args.input.resolve() == args.output.resolve():
         raise ValueError("input FASTA and output JSONL must be different files")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -254,15 +258,18 @@ def main(argv: list[str] | None = None) -> int:
             path.unlink()
 
     started = time.time()
-    predictor = TaleaPredictor(
-        device=args.device,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        local_files_only=args.local_files_only,
-        deterministic=args.deterministic,
-        unit_placement=args.unit_placement,
-        primary_extent=args.primary_extent,
-    )
+    below_minimum = sum(record.length < MINIMUM_CALL_LENGTH for record in records)
+    predictor = None
+    if below_minimum < len(records):
+        predictor = TaleaPredictor(
+            device=args.device,
+            dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=args.local_files_only,
+            deterministic=args.deterministic,
+            unit_placement=args.unit_placement,
+            primary_extent=args.primary_extent,
+        )
     prediction_options = {
         "square_budget": args.square_budget,
         "shared_attention_mib": args.shared_attention_mib,
@@ -294,7 +301,10 @@ def main(argv: list[str] | None = None) -> int:
         **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
         "postprocess_mode": args.postprocess_mode,
     }
-    if args.long_proteins == "window":
+    if predictor is None:
+        ordered = sorted(records, key=lambda record: (record.length, record.record_id))
+        rows = (below_minimum_prediction(record) for record in ordered)
+    elif args.long_proteins == "window":
         rows = iter_windowed_predictions(
             predictor,
             records,
@@ -319,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise
     finally:
-        predictor.close()
+        if predictor is not None:
+            predictor.close()
 
     audit = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -327,14 +338,17 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": deployment["schema_version"],
         "primary_score_field": deployment["reporting_contract"]["rank_by"],
         "records": completed,
+        "below_minimum_length": below_minimum,
+        "minimum_call_length": MINIMUM_CALL_LENGTH,
+        "scored_records": completed - below_minimum,
         "input_fasta": str(args.input),
         "output_jsonl": str(args.output),
         "input_sha256": sha256_file(args.input),
         "output_sha256": sha256_file(args.output),
         "model": deployment["esmplusplus"]["model"],
         "model_revision": deployment["esmplusplus"]["revision"],
-        "device": str(predictor.device),
-        "dtype": predictor.dtype_name,
+        "device": str(predictor.device) if predictor is not None else None,
+        "dtype": predictor.dtype_name if predictor is not None else None,
         "capture_mode": args.capture_mode,
         "postprocess_workers": args.postprocess_workers,
         "postprocess_mode": args.postprocess_mode,
@@ -346,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
         **({"readout_square_budget": args.readout_square_budget} if args.readout_square_budget != 1024 ** 2 else {}),
         **({"teacher_owner_thread": True} if args.teacher_owner_thread else {}),
         **({"teacher_readback_records": args.teacher_readback_records} if args.teacher_readback_records != 1 else {}),
-        **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active}
+        **({"teacher_quantile_histogram": True, "teacher_quantile_histogram_active": predictor.teacher_quantile_histogram_active if predictor is not None else False}
            if args.teacher_quantile_histogram else {}),
         **({"fused_rotary": True} if args.fused_rotary else {}),
         **({"early_gate": args.early_gate} if args.early_gate != "off" else {}),
@@ -356,15 +370,15 @@ def main(argv: list[str] | None = None) -> int:
         **({"fused_swiglu": True} if args.fused_swiglu else {}),
         **({"skip_all_valid_mask": True} if args.skip_all_valid_mask else {}),
         **({"batched_apc_reductions": args.batched_apc_reductions} if args.batched_apc_reductions else {}),
-        **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active}
+        **({"fused_apc": args.fused_apc, "apc_fusion_active": predictor.apc_fusion_active if predictor is not None else False}
            if args.fused_apc != "off" else {}),
-        **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats}
+        **({"group_equal_apc": True, "apc_group_stats": predictor.apc_group_stats if predictor is not None else None}
            if args.group_equal_apc else {}),
         **({"prefetch_forward": True} if args.prefetch_forward else {}),
         "teacher_cuda_graph": args.teacher_cuda_graph or args.teacher_graph_tracks,
         **({"teacher_graph_tracks": True} if args.teacher_graph_tracks else {}),
-        "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active,
-        **({"fused_rotary_calls": predictor.fused_rotary_calls} if args.fused_rotary else {}),
+        "teacher_cuda_graph_active": predictor.teacher_cuda_graph_active if predictor is not None else False,
+        **({"fused_rotary_calls": predictor.fused_rotary_calls if predictor is not None else 0} if args.fused_rotary else {}),
         "deterministic": args.deterministic,
         "unit_placement": args.unit_placement,
         "primary_extent": args.primary_extent,
@@ -376,11 +390,11 @@ def main(argv: list[str] | None = None) -> int:
             len(window_spans(record.length, args.window_length, args.window_stride))
             for record in long_records
         ),
-        "model_loaded_seconds": predictor.loaded_seconds,
+        "model_loaded_seconds": predictor.loaded_seconds if predictor is not None else 0.0,
         "elapsed_seconds": time.time() - started,
         "canonical_amino_acid_alphabet": "ACDEFGHIKLMNPQRSTVWY",
-        "maximum_length": predictor.maximum_length,
-        "runtime_artifact_sha256": predictor.assets.sha256,
+        "maximum_length": maximum_residues,
+        "runtime_artifact_sha256": predictor.assets.sha256 if predictor is not None else {},
         "software": {
             "python": platform.python_version(),
             "numpy": np.__version__,

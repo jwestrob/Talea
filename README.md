@@ -332,6 +332,11 @@ Talea validates the complete FASTA before loading ESM++.
 - FASTA record identifiers—the first whitespace-delimited header token—must be
   unique.
 - Empty sequences are errors.
+- Solenoid calls require a full protein length of at least **21 residues**.
+  Shorter proteins retain one output row with status `below_minimum_length`,
+  null discovery scores, and an empty repeat-region list. They count in
+  proteome incidence denominators. Runs containing only these proteins skip model loading.
+  When scoring long proteins, each inference window must span at least 21 residues.
 - The frozen v2 maximum is 2,046 residues.
 - Sequences longer than the evaluation maximum of 1,732 residues are accepted
   through 2,046 aa but explicitly marked as length extrapolations.
@@ -357,7 +362,7 @@ All residue coordinates are zero-based and half-open: `start` is included and
 | `global_probability` | Frozen global-head probability |
 | `global_z` | Control-standardized logit of the global probability |
 | `topology_development_control_z` | Auxiliary attention-topology score |
-| `status` | `ok` when a wedge was localized; otherwise `no_wedge_call` |
+| `status` | `ok` for a localized wedge, `no_wedge_call` for a scored protein with no localized wedge, or `below_minimum_length` for an unscored short protein |
 | `candidate_periods` | Period hypotheses in residues, including plausible aliases |
 | `wedge_call` | Highest-scoring candidate interval, period, and wedge score |
 | `secondary_wedge_calls` | Further wedge calls after the primary one; those the residue-state track supports are registered into units as the primary call is (see Repeat regions) |
@@ -388,7 +393,8 @@ To make a simple ranked TSV:
 
 ```bash
 jq -r \
-  '[.record_id, .length, .talea_discovery_score, .teacher_state_z, .global_z,
+  'select(.talea_discovery_score != null) |
+   [.record_id, .length, .talea_discovery_score, .teacher_state_z, .global_z,
     (.wedge_call.start // ""), (.wedge_call.end // ""),
     (.wedge_call.period // "")] | @tsv' \
   predictions.jsonl |

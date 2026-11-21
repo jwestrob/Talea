@@ -27,7 +27,7 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from talea.artifacts import RuntimeAssets, load_deployment, verified_runtime_assets
 from talea.capture import selective_capture
-from talea.io import SequenceRecord
+from talea.io import MINIMUM_CALL_LENGTH, SequenceRecord, below_minimum_prediction
 from talea.long_protein import (
     DEFAULT_WINDOW_LENGTH,
     DEFAULT_WINDOW_STRIDE,
@@ -1190,12 +1190,23 @@ class TaleaPredictor:
         if not values:
             return
         self._validate_records(values)
+        ordered = sorted(values, key=lambda record: (record.length, record.record_id))
+        first_eligible = 0
+        for record in ordered:
+            if record.length >= MINIMUM_CALL_LENGTH:
+                break
+            yield below_minimum_prediction(record)
+            first_eligible += 1
+        if first_eligible:
+            del ordered[:first_eligible]
+            if not ordered:
+                return
         if capture_mode == "auto":
             # sdpa is faster and fine on CUDA; on Apple MPS its kernels grow the
             # driver's allocation over many long, variable-length batches until
             # the process runs out of memory, so MPS and CPU keep manual capture.
             capture_mode = "sdpa" if self.device.type == "cuda" else "manual"
-        if postprocess_mode == "process" and len(values) == 1:
+        if postprocess_mode == "process" and len(ordered) == 1:
             # One protein: the worker round trip (pickling its matrices) costs
             # more than the postprocessing itself, so run it in this process.
             # Output is identical in both modes.
@@ -1204,7 +1215,6 @@ class TaleaPredictor:
         postprocess_workers = resolve_postprocess_workers(
             postprocess_workers, postprocess_mode
         )
-        ordered = sorted(values, key=lambda value: (value.length, value.record_id))
         batches = list(make_batches(ordered, square_budget, maximum_batch))
         completed = 0
         window_sizes = (64, 96, 128, 192, 256, 384, 512)
